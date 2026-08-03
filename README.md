@@ -17,25 +17,25 @@ A private, paper-first crypto trading system built around strict risk controls, 
 
 ## Safety status
 
-Live trading is blocked unless all three settings are deliberately changed:
+The default configuration is paper-only and dry-run:
 
 ```env
-PAPER_TRADING=false
-ALLOW_LIVE_TRADING=true
-DRY_RUN=false
+PAPER_TRADING=true
+DRY_RUN=true
+ALLOW_LIVE_TRADING=false
 ```
 
-Even then, the execution layer refuses live mode unless an explicit acknowledgement is present. Do not enable live trading until backtests and a meaningful paper-trading period are complete.
+Do not enable live trading until backtests and a meaningful paper-trading period are complete.
 
 ## Setup on macOS
 
 ```bash
 git clone https://github.com/sorrymoney010/Dublin-.git
 cd Dublin-
-git checkout build/paper-trading-core
+git checkout main
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e '.[dev]'
+python -m pip install -e '.[dev]'
 cp .env.example .env
 ```
 
@@ -53,10 +53,11 @@ Run one paper/dry cycle:
 dublin-bot run-once
 ```
 
-Run tests:
+Run lint and tests:
 
 ```bash
-pytest
+ruff check .
+pytest -q
 ```
 
 ## Important
