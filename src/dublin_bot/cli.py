@@ -5,6 +5,7 @@ import json
 
 from .config import Settings
 from .engine import TradingEngine
+from .gateway import build_gateway
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -14,20 +15,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def doctor(settings: Settings) -> int:
-    result = {
+    result: dict[str, object] = {
+        "exchange": settings.exchange,
         "paper_trading": settings.paper_trading,
         "dry_run": settings.dry_run,
         "live_allowed": settings.allow_live_trading,
+        "live_execution_enabled": settings.live_execution_enabled,
         "credentials_present": settings.has_credentials,
         "symbol": settings.symbol,
         "strategy_equity_usd": settings.strategy_equity_usd,
     }
-    print(json.dumps(result, indent=2))
-    if not settings.paper_trading:
-        print("WARNING: live endpoint selected")
-    if not settings.has_credentials:
-        print("Paper order submission is unavailable until local credentials are configured.")
-    return 0
+    exit_code = 0
+    try:
+        result["gateway"] = build_gateway(settings).diagnostic()
+        gateway = result["gateway"]
+        if isinstance(gateway, dict) and gateway.get("withdraw_permission_detected") is True:
+            result["safety_error"] = "Remove withdrawal permission from the Kraken API key"
+            exit_code = 2
+    except Exception as exc:
+        result["gateway_error"] = f"{type(exc).__name__}: {exc}"
+        exit_code = 1
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return exit_code
 
 
 def main() -> int:
