@@ -30,7 +30,9 @@ class AlpacaGateway:
 
     def get_bars(self) -> pd.DataFrame:
         end = datetime.now(timezone.utc)
-        start = end - timedelta(minutes=self.settings.timeframe_minutes * self.settings.lookback_bars * 2)
+        start = end - timedelta(
+            minutes=self.settings.timeframe_minutes * self.settings.lookback_bars * 2
+        )
         request = CryptoBarsRequest(
             symbol_or_symbols=[self.settings.symbol],
             timeframe=TimeFrame(self.settings.timeframe_minutes, TimeFrameUnit.Minute),
@@ -42,7 +44,9 @@ class AlpacaGateway:
         frame = response.df
         if isinstance(frame.index, pd.MultiIndex):
             frame = frame.xs(self.settings.symbol)
-        return frame[["open", "high", "low", "close", "volume"]].tail(self.settings.lookback_bars)
+        return frame[["open", "high", "low", "close", "volume"]].tail(
+            self.settings.lookback_bars
+        )
 
     def account_equity(self) -> float:
         if self.trading is None:
@@ -53,7 +57,10 @@ class AlpacaGateway:
         if self.trading is None:
             return False
         normalized = self.settings.symbol.replace("/", "")
-        return any(position.symbol.replace("/", "") == normalized for position in self.trading.get_all_positions())
+        return any(
+            position.symbol.replace("/", "") == normalized
+            for position in self.trading.get_all_positions()
+        )
 
     def buy_notional(self, notional_usd: float) -> str:
         if self.settings.dry_run:
@@ -75,3 +82,18 @@ class AlpacaGateway:
             raise RuntimeError("Trading credentials are required to close a position")
         normalized = self.settings.symbol.replace("/", "")
         return str(self.trading.close_position(normalized).id)
+
+    def diagnostic(self) -> dict[str, object]:
+        bars = self.get_bars()
+        result: dict[str, object] = {
+            "exchange": "alpaca",
+            "public_market_data": not bars.empty,
+            "latest_close": float(bars.iloc[-1]["close"]),
+            "credentials_present": self.settings.has_credentials,
+            "private_api": False,
+        }
+        if self.trading is not None:
+            account = self.trading.get_account()
+            result["private_api"] = True
+            result["account_status"] = str(account.status)
+        return result

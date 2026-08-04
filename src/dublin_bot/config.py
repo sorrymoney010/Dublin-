@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -8,8 +9,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
+    exchange: str = "alpaca"
+
     alpaca_api_key: str = ""
     alpaca_api_secret: str = ""
+
+    kraken_api_key: str = ""
+    kraken_api_secret: str = ""
+    kraken_base_url: str = "https://api.kraken.com"
+    kraken_pair: str = "XBTUSD"
+
     paper_trading: bool = True
     allow_live_trading: bool = False
     dry_run: bool = True
@@ -41,7 +50,12 @@ class Settings(BaseSettings):
     journal_path: Path = Path("logs/decisions.jsonl")
 
     @model_validator(mode="after")
-    def validate_safety(self) -> "Settings":
+    def validate_safety(self) -> Settings:
+        self.exchange = self.exchange.lower().strip()
+        if self.exchange not in {"alpaca", "kraken"}:
+            raise ValueError("EXCHANGE must be either alpaca or kraken")
+        if self.exchange == "kraken" and self.paper_trading and not self.dry_run:
+            raise ValueError("Kraken has no Spot paper endpoint; PAPER_TRADING requires DRY_RUN=true")
         if not self.paper_trading:
             if not self.allow_live_trading:
                 raise ValueError("Live mode blocked: ALLOW_LIVE_TRADING must be true")
@@ -55,4 +69,15 @@ class Settings(BaseSettings):
 
     @property
     def has_credentials(self) -> bool:
+        if self.exchange == "kraken":
+            return bool(self.kraken_api_key and self.kraken_api_secret)
         return bool(self.alpaca_api_key and self.alpaca_api_secret)
+
+    @property
+    def live_execution_enabled(self) -> bool:
+        return (
+            not self.paper_trading
+            and not self.dry_run
+            and self.allow_live_trading
+            and self.live_risk_acknowledgement == "I_ACCEPT_LIVE_TRADING_RISK"
+        )

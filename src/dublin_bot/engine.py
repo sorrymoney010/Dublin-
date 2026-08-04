@@ -3,8 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .alpaca_gateway import AlpacaGateway
 from .config import Settings
+from .gateway import build_gateway
 from .journal import Journal
 from .models import Action, DecisionRecord, RiskDecision
 from .risk import RiskManager
@@ -15,7 +15,7 @@ from .strategy import TrendBreakoutStrategy
 class TradingEngine:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.gateway = AlpacaGateway(settings)
+        self.gateway = build_gateway(settings)
         self.strategy = TrendBreakoutStrategy(settings)
         self.risk = RiskManager(settings)
         self.journal = Journal(settings.journal_path)
