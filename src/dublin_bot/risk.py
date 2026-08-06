@@ -14,6 +14,7 @@ class SessionState:
     current_equity: float
     realized_pnl_today: float = 0.0
     orders_today: int = 0
+    consecutive_losses: int = 0
     last_order_at: datetime | None = None
 
 
@@ -27,6 +28,8 @@ class RiskManager:
             return RiskDecision(False, "No entry order requested")
         if state.realized_pnl_today <= -(s.strategy_equity_usd * s.max_daily_loss_fraction):
             return RiskDecision(False, "Daily loss circuit breaker is active")
+        if state.consecutive_losses >= s.max_consecutive_losses:
+            return RiskDecision(False, "Consecutive-loss circuit breaker is active")
         if state.current_equity < s.strategy_equity_usd:
             return RiskDecision(False, "Available strategy equity is below configured budget")
         drawdown = 1 - (state.current_equity / max(state.peak_equity, 0.01))
@@ -41,7 +44,7 @@ class RiskManager:
         if signal.stop_price is None or signal.price <= signal.stop_price:
             return RiskDecision(False, "Invalid stop distance")
 
-        risk_budget = s.strategy_equity_usd * s.risk_per_trade
+        risk_budget = min(s.strategy_equity_usd * s.risk_per_trade, s.max_planned_loss_usd)
         stop_fraction = (signal.price - signal.stop_price) / signal.price
         risk_sized_notional = risk_budget / stop_fraction
         allocation_cap = s.strategy_equity_usd * s.max_position_fraction
@@ -49,4 +52,6 @@ class RiskManager:
         if notional < s.min_order_notional_usd:
             return RiskDecision(False, "Calculated order is below minimum notional")
         planned_loss = notional * stop_fraction
+        if planned_loss > s.max_planned_loss_usd + 1e-9:
+            return RiskDecision(False, "Planned loss exceeds hard dollar cap")
         return RiskDecision(True, "Risk checks passed", round(notional, 2), round(planned_loss, 2))
