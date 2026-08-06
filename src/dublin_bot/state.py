@@ -31,6 +31,7 @@ class StateStore:
             current_equity=equity,
             realized_pnl_today=float(data.get("realized_pnl_today", 0.0)),
             orders_today=int(data.get("orders_today", 0)),
+            consecutive_losses=int(data.get("consecutive_losses", 0)),
             last_order_at=datetime.fromisoformat(last_order) if last_order else None,
         )
 
