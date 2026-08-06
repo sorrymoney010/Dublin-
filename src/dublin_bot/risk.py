@@ -14,8 +14,8 @@ class SessionState:
     current_equity: float
     realized_pnl_today: float = 0.0
     orders_today: int = 0
-    consecutive_losses: int = 0
     last_order_at: datetime | None = None
+    consecutive_losses: int = 0
 
 
 class RiskManager:
