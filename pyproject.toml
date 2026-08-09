@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dublin-trading-os"
-version = "0.2.0-ceo"
+version = "0.2.0"
 description = "Paper-first crypto trading engine with strict risk controls"
 requires-python = ">=3.11"
 dependencies = [
