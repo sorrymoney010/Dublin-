@@ -33,11 +33,13 @@ from .errors import (
     SafetyLockError,
     StaleDataError,
 )
+from .fills import FillModel
 from .idempotency import IdempotencyLedger, make_intent_key
 from .journal import Journal
 from .kraken_gateway import KrakenGateway
 from .market_quality import MarketGuard, MarketQuality
 from .models import Action, DecisionRecord, RiskDecision
+from .paper import PaperPortfolio
 from .risk import RiskManager
 from .state import StateStore
 from .strategy import TrendBreakoutStrategy
@@ -92,6 +94,8 @@ class TradingEngine:
             max_spread_bps=settings.max_spread_bps,
             min_dollar_volume=settings.min_dollar_volume,
         )
+        self.fill_model = FillModel(settings)
+        self.paper_portfolio = PaperPortfolio(Path("logs/paper_portfolio.json"))
 
     # ── gate 1: safety ───────────────────────────────────────
 
@@ -170,6 +174,14 @@ class TradingEngine:
 
         # Restart recovery before any new intent can be formed.
         gates["recovery"] = self.recover()
+
+        # Paper portfolio sync for display and realistic accounting.
+        equity = min(self.gateway.account_equity(), self.settings.strategy_equity_usd)
+        state = self.state_store.load(equity)
+        state.current_equity = equity
+        state.peak_equity = max(state.peak_equity, equity)
+        state.realized_pnl_today = equity - state.start_equity
+        self.paper_portfolio.load(equity=equity, cash=equity)
 
         # Gate 2 — market data
         try:
@@ -287,8 +299,49 @@ class TradingEngine:
         try:
             if side == "buy":
                 order_id = self.gateway.buy_notional(notional, userref=record.userref)
+                if self.settings.paper_trading or self.settings.dry_run:
+                    ticker = self.gateway.get_ticker()
+                    sized = self.gateway.size_buy(notional, price=float(ticker["ask"]))
+                    fill = self.fill_model.buy(
+                        price=float(sized.price),
+                        volume=float(sized.volume),
+                        bid=float(ticker.get("bid", 0.0)) if ticker.get("bid") else None,
+                        ask=float(ticker.get("ask", 0.0)) if ticker.get("ask") else None,
+                    )
+                    self.paper_portfolio.record_buy(
+                        symbol=self.settings.symbol,
+                        quantity=float(sized.volume),
+                        fill_price=fill.price,
+                        fee=fill.fee,
+                        when=datetime.now(timezone.utc).isoformat(),
+                    )
+                    portfolio = self.paper_portfolio.snapshot()
+                    state.current_equity = portfolio.equity
+                    state.peak_equity = max(state.peak_equity, state.current_equity)
             else:
                 order_id = self.gateway.close_position(userref=record.userref)
+                if self.settings.paper_trading or self.settings.dry_run:
+                    ticker = self.gateway.get_ticker()
+                    portfolio = self.paper_portfolio.snapshot()
+                    position = portfolio.positions.get(self.settings.symbol)
+                    quantity = float(position.quantity) if position else 0.0
+                    if quantity > 1e-12:
+                        fill = self.fill_model.sell(
+                            price=float(ticker["last"]),
+                            volume=quantity,
+                            bid=float(ticker.get("bid", 0.0)) if ticker.get("bid") else None,
+                            ask=float(ticker.get("ask", 0.0)) if ticker.get("ask") else None,
+                        )
+                        realized = self.paper_portfolio.record_sell(
+                            symbol=self.settings.symbol,
+                            quantity=quantity,
+                            fill_price=fill.price,
+                            fee=fill.fee,
+                            when=datetime.now(timezone.utc).isoformat(),
+                        )
+                        state.realized_pnl_today += realized
+                        state.current_equity = self.paper_portfolio.snapshot().equity
+                        state.peak_equity = max(state.peak_equity, state.current_equity)
         except PrecisionError as exc:
             self.ledger.fail(key, f"precision: {exc}")
             self.audit.record(AuditEvent.ORDER_REJECTED,

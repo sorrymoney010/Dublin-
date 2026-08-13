@@ -227,33 +227,28 @@ def market_snapshot(settings: Settings) -> dict[str, object]:
 
 
 def portfolio_snapshot(settings: Settings) -> dict[str, object]:
-    from .engine import build_gateway
-    if not settings.has_credentials:
-        return {"equity": settings.strategy_equity_usd, "positions": [], "orders": [],
-                "cash": 0.0, "unrealized_pl": 0.0,
-                "message": f"Add {settings.broker.upper()} credentials on the Mac to load paper positions."}
+    from .engine import TradingEngine
     try:
-        gateway = build_gateway(settings)
-        positions = gateway.positions()
-        orders = gateway.orders()
-        equity = gateway.account_equity()
-        balances = gateway.balances()
-        cash = sum(float(v.get("free", "0")) for v in balances.values())
-        unrealized = sum(
-            float(p.get("unrealized_pl", p.get("unrealized_pnl", 0))) for p in positions
-        ) if positions else 0.0
+        engine = TradingEngine(settings)
+        portfolio = engine.paper_portfolio.snapshot()
+        state = engine.state_store.load(settings.strategy_equity_usd)
+        if portfolio.positions and settings.symbol in portfolio.positions:
+            portfolio = engine.paper_portfolio.mark_to_market({settings.symbol: engine.gateway.get_ticker()["last"]})
+        realized = round(state.realized_pnl_today, 2)
+        positions = portfolio.to_dict()["positions"] or []
+        unrealized = round(sum(float(p.get("unrealized_pl", 0.0)) for p in positions), 2)
         return {
-            "equity": equity,
+            "equity": round(portfolio.equity, 2),
+            "cash": round(portfolio.cash, 2),
             "positions": positions,
-            "orders": orders,
-            "cash": round(cash, 2),
-            "unrealized_pl": round(unrealized, 2),
+            "orders": engine.gateway.orders() if settings.has_credentials else [],
+            "unrealized_pl": unrealized,
+            "realized_pl": realized,
             "message": None,
         }
     except Exception as exc:
         return {"equity": settings.strategy_equity_usd, "positions": [], "orders": [],
-                "cash": 0.0, "unrealized_pl": 0.0,
-                "message": str(exc)}
+                "cash": 0.0, "unrealized_pl": 0.0, "realized_pl": 0.0, "message": str(exc)}
 
 
 def risk_state_snapshot(settings: Settings) -> dict[str, object]:
@@ -1170,17 +1165,17 @@ function renderHealth(h,a){
 async function load(){
   try{
     let r=await fetch('/api/overview'),d=await r.json();
-    let s=d.status,p=d.portfolio,m=d.market,mon=d.monitor;
+    let s=d.status,p=d.portfolio,dm=d.market,mon=d.monitor;
     $('#notice').textContent=s.safe?'Safety lock active · Paper-only execution':'Execution blocked: safety lock inactive';
     $('#notice').className=s.safe?'notice green':'notice red';
     $('#safety').textContent=s.safe?'Locked':'Blocked';
     $('#brokerPill').textContent=s.broker?.toUpperCase()||'KRAKEN';
-    $('#price').textContent=m.price?money(m.price):'—';
-    let c=m.change_percent;
+    $('#price').textContent=dm.price?money(dm.price):'—';
+    let c=dm.change_percent;
     $('#change').textContent=c==null?'Market unavailable':`${c>=0?'+':''}${c.toFixed(2)}% last bar`;
     $('#change').className=c>=0?'green':'red';
-    draw(m.closes||[],$('#line'),$('#fill'));
-    $('#marketMessage').textContent=m.error||(m.delayed?`Feed delayed · last bar ${m.last_timestamp}`:'Live feed connected');
+    draw(dm.closes||[],$('#line'),$('#fill'));
+    $('#marketMessage').textContent=dm.error||(dm.delayed?`Feed delayed · last bar ${dm.last_timestamp}`:'Live feed connected');
     $('#portfolioValue').textContent=money(p.equity);
     $('#cashValue').textContent=money(p.cash);
     $('#engine').textContent=mon.running?'Monitoring hourly':(mon.last_action||'Ready');
@@ -1191,7 +1186,7 @@ async function load(){
     $('#riskTrade').textContent=`${(s.risk_per_trade*100).toFixed(1)}%`;
     $('#run').disabled=!s.safe;
     $('#monitorStart').disabled=!s.safe||mon.running;
-    $('#monitorStop').disabled=!mon.running;
+    $('#monitorStop').disabled=mon.running;
     renderHealth(d.health,d.audit);
   }catch(e){
     $('#refresh').textContent='Offline';
@@ -1201,7 +1196,20 @@ async function load(){
 }
 async function loadExtended(){
   try{
-    let [riskR, stratR, aiR, healthR, equityR, learningR] = await Promise.all([\n      fetch('/api/risk').then(r=>r.json()),\n      fetch('/api/strategy').then(r=>r.json()),\n      fetch('/api/ai').then(r=>r.json()),\n      fetch('/api/system-health').then(r=>r.json()),\n      fetch('/api/equity-curve').then(r=>r.json()),\n      fetch('/api/learning').then(r=>r.json()),\n    ]);\n    let [reconR, stopMonR, emergencyR] = await Promise.all([\n      fetch('/api/reconciliation').then(r=>r.json()),\n      fetch('/api/stop-monitor').then(r=>r.json()),\n      fetch('/api/emergency-stop').then(r=>r.json()),\n    ]);\n    let risk=riskR, strat=stratR, ai=aiR, sys=healthR, eq=equityR, learn=learningR, recon=reconR, stop=stopMonR, emerg=emergencyR;
+    let [riskR, stratR, aiR, healthR, equityR, learningR] = await Promise.all([
+      fetch('/api/risk').then(r=>r.json()),
+      fetch('/api/strategy').then(r=>r.json()),
+      fetch('/api/ai').then(r=>r.json()),
+      fetch('/api/system-health').then(r=>r.json()),
+      fetch('/api/equity-curve').then(r=>r.json()),
+      fetch('/api/learning').then(r=>r.json()),
+    ]);
+    let [reconR, stopMonR, emergencyR] = await Promise.all([
+      fetch('/api/reconciliation').then(r=>r.json()),
+      fetch('/api/stop-monitor').then(r=>r.json()),
+      fetch('/api/emergency-stop').then(r=>r.json()),
+    ]);
+    let risk=riskR, strat=stratR, ai=aiR, sys=healthR, eq=equityR, learn=learningR, recon=reconR, stop=stopMonR, emerg=emergencyR;
 
     // Risk section
     $('#drawdownVal').textContent=`${risk.drawdown_percent}%`;
@@ -1237,20 +1245,30 @@ async function loadExtended(){
     $('#pendingOrders').textContent='0';
 
     // AI section
-    $('#regime').textContent=learn.regime||ai.regime;
-    $('#regimeDesc').textContent=learn.regime_description||ai.regime_description;
-    $('#confidence').textContent=learn.confidence_score!=null?learn.confidence_score:ai.confidence;
-    $('#confidenceLevel').textContent=learn.confidence_score>70?'High signal quality':(learn.confidence_score>40?'Moderate':'Low');
-    $('#signalQuality').textContent=learn.confidence_score>60?'Strong':(learn.confidence_score>40?'Moderate':'Weak');
-    $('#todaySignals').textContent=learn.today_signals||strat.total_signals;
+    const learnConf = learn.confidence_score != null ? learn.confidence_score : (ai.confidence_score || ai.confidence || 0);
+    const learnRegime = learn.regime || ai.regime || 'unknown';
+    const learnDesc = learn.regime_description || ai.regime_description || 'No data';
+    const learnCommentary = learn.market_commentary || ai.market_commentary || 'Loading market analysis...';
+    const learnActions = learn.suggested_actions || ai.suggested_actions || [];
+    const learnSignals = learn.today_signals || strat.total_signals || 0;
+    const learnWinRate = learn.win_rate_estimate || 0;
+
+    $('#regime').textContent=learnRegime;
+    $('#regimeDesc').textContent=learnDesc;
+    $('#confidence').textContent=learnConf;
+    $('#confidenceLevel').textContent=learnConf>70?'High signal quality':(learnConf>40?'Moderate':'Low');
+    $('#signalQuality').textContent=learnConf>60?'Strong':(learnConf>40?'Moderate':'Weak');
+    $('#todaySignals').textContent=learnSignals;
     $('#dailyBrief').innerHTML=`<div class="row"><span><b>Daily Brief</b></span><span class="pill purple">AI</span></div>`+
-      `<div class="muted" style="padding:8px 0">${learn.market_commentary||ai.market_commentary}</div>`+
-      rows(learn.suggested_actions||ai.suggested_actions, x=>`<div class="row"><span>• ${x}</span></div>`,'')
-      +`<div class="row" style="margin-top:8px"><span class="muted">Win rate est: ${learn.win_rate_estimate||0}%</span></div>`;
+      `<div class="muted" style="padding:8px 0">${learnCommentary}</div>`+
+      rows(learnActions, x=>`<div class="row"><span>• ${x}</span></div>`,'')
+      +`<div class="row" style="margin-top:8px"><span class="muted">Win rate est: ${learnWinRate}%</span></div>`;
     // Learning suggestions
-    if(learn.suggestions){
-      $('#newsAlerts').innerHTML=rows(learn.suggestions, x=>`<div class="row"><span><b>${x.parameter}</b></span><span class="pill amber">Suggest</span></div>`+'<div class="muted" style="padding:4px 0">'+
-        learn.suggestions[0].rationale+'</div>','No suggestions');
+    const allSuggestions = (learn.suggestions || []).concat(ai.suggestions || []);
+    if(allSuggestions.length){
+      $('#newsAlerts').innerHTML=rows(allSuggestions, x=>`<div class="row"><span><b>${x.parameter}</b></span><span class="pill amber">Suggest</span></div>`+'<div class="muted" style="padding:4px 0">'+
+        (x.rationale||x.reason||'Parameter adjustment suggested')+'</div>',
+        'No suggestions');
     }else{
       $('#newsAlerts').innerHTML='<div class="empty">No active alerts</div>';
     }
