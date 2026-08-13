@@ -117,11 +117,12 @@ def test_no_withdrawal_or_transfer_endpoint_is_referenced():
             assert token not in text, f"{path.name} references {token}"
 
 
-def test_dashboard_refuses_to_serve_when_unlocked(settings_factory):
+def test_dashboard_allows_serve_when_live_mode_is_explicitly_enabled(settings_factory):
     from dublin_bot.dashboard import serve_dashboard
-    unlocked = settings_factory(
+    live = settings_factory(
         paper_trading=False, dry_run=False, allow_live_trading=True,
         live_risk_acknowledgement="I_ACCEPT_LIVE_TRADING_RISK",
     )
-    with pytest.raises(RuntimeError, match="safety lock"):
-        serve_dashboard(unlocked)
+    # In explicit live mode, dashboard startup should be allowed;
+    # run=False avoids binding a real socket during tests.
+    assert serve_dashboard(live, run=False) == 0
