@@ -51,6 +51,7 @@ def build_gateway(settings: Settings, **kwargs):
     Only Kraken Spot is supported.  Alpaca has been removed — see SAFETY.md.
     """
     if settings.broker == "kraken":
+        kwargs.setdefault("allow_order_submission", bool(settings.allow_live_trading and not settings.paper_trading and not settings.dry_run))
         return KrakenGateway(settings, **kwargs)
     raise ValueError(
         f"Unsupported broker: {settings.broker!r}. "
