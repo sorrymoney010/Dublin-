@@ -1416,21 +1416,21 @@ def make_handler(settings: Settings, monitor: PaperMonitor) -> type[BaseHTTPRequ
                 self.send_json(learning_brief_data(settings))
             elif self.path == "/api/reconciliation":
                 self.send_json(reconciliation_status(settings))
-            elif self.path == "/api/stop-monitor":
+            if self.path == "/api/stop-monitor":
                 self.send_json(stop_monitor_status(settings))
-            if self.path == "/api/emergency-stop":
+            elif self.path == "/api/emergency-stop":
                 self.send_json({"active": emergency_stop_active()})
-            elif self.path == "/api/monitor/interval":
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND)
+
+        def do_POST(self) -> None:
+            if self.path == "/api/monitor/interval":
                 length = int(self.headers.get("content-length", "0"))
                 payload = json.loads(self.rfile.read(length)) if length else {}
                 seconds = int(payload.get("interval_seconds") or settings.monitor_interval_seconds)
                 monitor.set_interval(seconds)
                 self.send_json(monitor.status())
                 return
-            else:
-                self.send_error(HTTPStatus.NOT_FOUND)
-
-        def do_POST(self) -> None:
             if self.path == "/api/monitor/start":
                 monitor.start()
                 self.send_json(monitor.status())
