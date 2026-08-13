@@ -21,7 +21,7 @@ class RiskManager:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    def evaluate(self, signal: Signal, state: SessionState) -> RiskDecision:
+    def evaluate(self, signal: Signal, state: SessionState, open_exposure_usd: float = 0.0) -> RiskDecision:
         s = self.settings
         if signal.action is not Action.BUY:
             return RiskDecision(False, "No entry order requested")
@@ -41,11 +41,17 @@ class RiskManager:
         if signal.stop_price is None or signal.price <= signal.stop_price:
             return RiskDecision(False, "Invalid stop distance")
 
+        exposure_cap = s.strategy_equity_usd * s.max_exposure_fraction
+        if open_exposure_usd >= exposure_cap:
+            return RiskDecision(False, f"Exposure cap reached: {open_exposure_usd:.2f} >= {exposure_cap:.2f}")
+
         risk_budget = s.strategy_equity_usd * s.risk_per_trade
         stop_fraction = (signal.price - signal.stop_price) / signal.price
         risk_sized_notional = risk_budget / stop_fraction
         allocation_cap = s.strategy_equity_usd * s.max_position_fraction
         notional = min(risk_sized_notional, allocation_cap, state.current_equity)
+        if open_exposure_usd + notional > exposure_cap:
+            notional = max(0.0, exposure_cap - open_exposure_usd)
         if notional < s.min_order_notional_usd:
             return RiskDecision(False, "Calculated order is below minimum notional")
         planned_loss = notional * stop_fraction

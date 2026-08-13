@@ -12,6 +12,7 @@ from time import monotonic
 
 from .audit import AuditLog
 from .config import Settings
+from .emergency import activate_emergency_stop, clear_emergency_stop, emergency_stop_active
 from .engine import TradingEngine
 from .state import StateStore
 
@@ -76,9 +77,9 @@ def suggestions_to_actions(suggestions: list) -> list[dict]:
 
 
 class PaperMonitor:
-    def __init__(self, settings: Settings, interval_seconds: int = 3600) -> None:
+    def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.interval_seconds = interval_seconds
+        self.interval_seconds = int(getattr(settings, "monitor_interval_seconds", 3600))
         self.stop_event = Event()
         self.thread: Thread | None = None
         self.last_run: str | None = None
@@ -115,6 +116,12 @@ class PaperMonitor:
                 self.last_error = str(exc)
                 self.last_run = datetime.now(timezone.utc).isoformat()
             self.stop_event.wait(self.interval_seconds)
+
+    def set_interval(self, seconds: int) -> None:
+        self.interval_seconds = max(60, int(seconds))
+        if self.thread is not None and self.thread.is_alive():
+            self.stop_event.set()
+            self.start()
 
 
 def safety_status(settings: Settings) -> dict[str, object]:
@@ -651,29 +658,7 @@ def stop_monitor_status(settings: Settings) -> dict[str, object]:
                 "monitored_stops": 0}
 
 
-_MANUAL_STOP_FILE = Path("logs/MANUAL_STOP_ACTIVE")
 
-
-def emergency_stop_active() -> bool:
-    """Check if manual emergency stop has been triggered."""
-    return _MANUAL_STOP_FILE.exists()
-
-
-def activate_emergency_stop() -> bool:
-    """Activate emergency stop — blocks all order submission."""
-    _MANUAL_STOP_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _MANUAL_STOP_FILE.write_text(json.dumps({
-        "activated_at": datetime.now(timezone.utc).isoformat(),
-        "by": "dashboard",
-    }), encoding="utf-8")
-    return True
-
-
-def clear_emergency_stop() -> bool:
-    """Clear emergency stop — requires restart and safety re-verification."""
-    if _MANUAL_STOP_FILE.exists():
-        _MANUAL_STOP_FILE.unlink()
-    return True
 
 
 MANIFEST = {"name": "Dublin Bot Terminal", "short_name": "Dublin",
@@ -846,7 +831,8 @@ button:active{transform:scale(0.98)}
   <article class="card metric">
     <div class="label">Risk per trade</div>
     <div class="value purple" id="riskTrade">—</div>
-    <div class="muted">Max exposure</div>
+    <div class="muted">Max exposure <span id="maxExposure">—</span></div>
+    <div class="muted">Open exposure <span id="openExposure">—</span></div>
   </article>
   <article class="card wide">
     <div class="label">Market pulse · 60 bars</div>
@@ -867,14 +853,22 @@ button:active{transform:scale(0.98)}
   <article class="card side">
     <div class="label">Paper engine</div>
     <div class="value" id="engine">Ready</div>
-    <div class="row"><span class="row-label">Paper mode</span><span class="pill green">ON</span></div>
-    <div class="row"><span class="row-label">Dry run</span><span class="pill green">ON</span></div>
-    <div class="row"><span class="row-label">Live orders</span><span class="pill red">OFF</span></div>
+    <div class="row"><span class="row-label">Paper mode</span><span class="pill green" id="paperPill">ON</span></div>
+    <div class="row"><span class="row-label">Dry run</span><span class="pill green" id="dryRunPill">ON</span></div>
+    <div class="row"><span class="row-label">Live orders</span><span class="pill red" id="liveOrdersPill">OFF</span></div>
     <div class="row"><span class="row-label">Broker</span><span class="pill purple" id="brokerPill">KRAKEN</span></div>
     <button id="run" class="primary">Run paper cycle</button>
     <div class="actions">
       <button id="monitorStart" class="secondary">Start monitor</button>
       <button id="monitorStop" class="secondary">Stop</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <span class="row-label">Monitor interval</span>
+      <span class="pill purple" id="intervalPill">60m</span>
+    </div>
+    <div class="actions">
+      <button id="intervalDown" class="secondary">-15m</button>
+      <button id="intervalUp" class="secondary">+15m</button>
     </div>
   </article>
 </section>
@@ -1424,8 +1418,15 @@ def make_handler(settings: Settings, monitor: PaperMonitor) -> type[BaseHTTPRequ
                 self.send_json(reconciliation_status(settings))
             elif self.path == "/api/stop-monitor":
                 self.send_json(stop_monitor_status(settings))
-            elif self.path == "/api/emergency-stop":
+            if self.path == "/api/emergency-stop":
                 self.send_json({"active": emergency_stop_active()})
+            elif self.path == "/api/monitor/interval":
+                length = int(self.headers.get("content-length", "0"))
+                payload = json.loads(self.rfile.read(length)) if length else {}
+                seconds = int(payload.get("interval_seconds") or settings.monitor_interval_seconds)
+                monitor.set_interval(seconds)
+                self.send_json(monitor.status())
+                return
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
 

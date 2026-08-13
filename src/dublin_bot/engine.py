@@ -43,6 +43,7 @@ from .paper import PaperPortfolio
 from .risk import RiskManager
 from .state import StateStore
 from .strategy import TrendBreakoutStrategy
+from .emergency import emergency_stop_active
 
 
 def build_gateway(settings: Settings, **kwargs):
@@ -172,6 +173,8 @@ class TradingEngine:
             self.audit.record(AuditEvent.SAFETY_VIOLATION, {"error": str(exc)},
                               severity="critical")
             return CycleResult(None, "safety", str(exc), gates)
+        if emergency_stop_active():
+            return CycleResult(None, "emergency_stop", "Manual emergency stop is active", gates)
 
         # Restart recovery before any new intent can be formed.
         gates["recovery"] = self.recover()
@@ -235,7 +238,15 @@ class TradingEngine:
         state.current_equity = equity
         state.peak_equity = max(state.peak_equity, equity)
         state.realized_pnl_today = equity - state.start_equity
-        risk = self.risk.evaluate(signal, state)
+        open_exposure = 0.0
+        try:
+            if hasattr(self.gateway, "positions"):
+                open_exposure = float(sum(
+                    p.get("market_value", 0.0) for p in self.gateway.positions()
+                ))
+        except BrokerError:
+            open_exposure = 0.0
+        risk = self.risk.evaluate(signal, state, open_exposure_usd=open_exposure)
 
         # An entry requires healthy market quality; an exit must never be
         # blocked by a wide spread — being trapped in a position is worse.

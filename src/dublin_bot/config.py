@@ -44,10 +44,12 @@ class Settings(BaseSettings):
     strategy_equity_usd: float = Field(default=25.0, ge=25.0)
     risk_per_trade: float = Field(default=0.01, gt=0, le=0.02)
     max_position_fraction: float = Field(default=0.25, gt=0, le=0.5)
+    max_exposure_fraction: float = Field(default=0.5, gt=0, le=1.0)
     max_daily_loss_fraction: float = Field(default=0.03, gt=0, le=0.05)
     max_drawdown_fraction: float = Field(default=0.10, gt=0, le=0.20)
     max_orders_per_day: int = Field(default=3, ge=1, le=10)
     cooldown_minutes: int = Field(default=90, ge=0)
+    monitor_interval_seconds: int = Field(default=3600, ge=60, le=86400)
 
     fast_ema: int = Field(default=20, ge=2)
     slow_ema: int = Field(default=50, ge=3)
