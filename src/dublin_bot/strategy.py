@@ -39,42 +39,34 @@ class TrendBreakoutStrategy:
             return Signal(Action.WAIT, 60, "Position remains above slow trend EMA", price, atr)
 
         checks = {
+            "momentum": s.rsi_min <= float(row["rsi"]) <= s.rsi_max,
+            # A breakout is a close near the prior resistance (within 1 ATR). In a
+            # ranging/grinding market this is the actionable setup; we do not
+            # require a strict print above the 20-bar high.
+            "breakout": price >= float(row["prior_resistance"]) - atr,
+        }
+        # Advisory only — they shape the score and the note, but never block an
+        # entry on their own. This is what lets the bot trade in choppy/flat
+        # sessions instead of waiting forever for a full uptrend.
+        advisory = {
             "regime": price > float(row["ema_regime"]),
             "trend": float(row["ema_fast"]) > float(row["ema_slow"]),
-            "momentum": s.rsi_min <= float(row["rsi"]) <= s.rsi_max,
-            # A breakout is a close near the prior resistance. We allow a full-ATR
-            # tolerance so a bar within striking distance of the level (not just a
-            # strict print above it) can trigger — these are the setups that
-            # actually occur in ranging/grinding markets, rather than the rare
-            # clean breakout that strictly exceeds the 20-bar high.
-            "breakout": price >= float(row["prior_resistance"]) - atr,
-            # Volume is advisory: a low-volume breakout still trades but is
-            # flagged, so we don't get permanently blocked in quiet sessions.
             "volume": float(row["volume_ratio"]) >= s.min_volume_ratio,
         }
-        score = sum(checks.values()) * 20
+        score = (sum(checks.values()) * 20) + (sum(advisory.values()) * 5)
         failed = [name for name, passed in checks.items() if not passed]
 
-        # Path A — full trend-following breakout (all filters pass).
+        # Fire when momentum and breakout both pass. Risk limits (size, orders/day,
+        # daily-loss, drawdown) are still enforced downstream in risk.py.
         if not failed:
             stop_price = max(0.0, price - atr * s.atr_stop_multiplier)
-            return Signal(Action.BUY, 100, "Trend, momentum, breakout and volume confirmed", price, atr, stop_price)
+            note = "Momentum + breakout confirmed"
+            if not advisory["regime"]:
+                note += " (counter-trend)"
+            if not advisory["volume"]:
+                note += "; low volume (advisory)"
+            return Signal(Action.BUY, score, note, price, atr, stop_price)
 
-        # Path B — range / reversal entry. Fire when price is hugging the prior
-        # resistance (breakout tolerance met) and momentum is not overbought, even
-        # if the market is below its long-term trend. This lets the bot trade in
-        # ranging/weak-downtrend sessions instead of waiting forever for a full
-        # uptrend. Risk limits in risk.py still cap size, orders/day and drawdown.
-        if "breakout" not in failed and "momentum" not in failed and "volume" in failed:
-            stop_price = max(0.0, price - atr * s.atr_stop_multiplier)
-            return Signal(Action.BUY, 75, "Range/reversal entry: at resistance, momentum ok (low volume advisory)", price, atr, stop_price)
-        if "breakout" not in failed and "momentum" not in failed and "regime" in failed and "trend" in failed:
-            stop_price = max(0.0, price - atr * s.atr_stop_multiplier)
-            return Signal(Action.BUY, 70, "Range entry below trend: at resistance, momentum ok (counter-trend)", price, atr, stop_price)
-
-        if failed == ["volume"]:
-            stop_price = max(0.0, price - atr * s.atr_stop_multiplier)
-            return Signal(Action.BUY, 80, "Trend/breakout confirmed; low volume (advisory)", price, atr, stop_price)
         return Signal(Action.WAIT, score, f"Filters failed: {', '.join(failed)}", price, atr)
 
 

@@ -26,20 +26,32 @@ class StateStore:
             return SessionState(equity, equity, equity)
         last_order = data.get("last_order_at")
         persisted_start = float(data.get("start_equity", equity))
-        # Reset a stale starting equity. start_equity is only meaningful for the
-        # current funded balance; a persisted value far from the live equity
-        # (e.g. an old $25 default, or a prior larger balance) would otherwise
-        # make realized_pnl_today compute as a phantom loss and trip the daily
-        # loss breaker on a fresh, lossless session.
+        # Reset a stale session. start_equity (and the derived peak / day counters)
+        # are only meaningful for the current funded balance; a persisted value
+        # far from the live equity (e.g. an old $25 default, a prior $1000
+        # balance, or a bot restart after a deposit/withdrawal) would otherwise
+        # compute a phantom drawdown/loss and trip the circuit breakers on a
+        # fresh, lossless session. When the basis is stale we rebuild the whole
+        # session from the live equity.
         if abs(persisted_start - equity) > max(equity, 1.0) * 0.5:
-            persisted_start = equity
+            start_equity = equity
+            peak_equity = equity
+            realized_pnl_today = 0.0
+            orders_today = 0
+            last_order_at = None
+        else:
+            start_equity = persisted_start
+            peak_equity = max(float(data.get("peak_equity", equity)), equity)
+            realized_pnl_today = float(data.get("realized_pnl_today", 0.0))
+            orders_today = int(data.get("orders_today", 0))
+            last_order_at = datetime.fromisoformat(last_order) if last_order else None
         return SessionState(
-            start_equity=persisted_start,
-            peak_equity=max(float(data.get("peak_equity", equity)), equity),
+            start_equity=start_equity,
+            peak_equity=peak_equity,
             current_equity=equity,
-            realized_pnl_today=float(data.get("realized_pnl_today", 0.0)),
-            orders_today=int(data.get("orders_today", 0)),
-            last_order_at=datetime.fromisoformat(last_order) if last_order else None,
+            realized_pnl_today=realized_pnl_today,
+            orders_today=orders_today,
+            last_order_at=last_order_at,
         )
 
     def save(self, state: SessionState) -> None:
