@@ -610,23 +610,22 @@ class KrakenGateway:
                 "acknowledgement, and allow_order_submission=true on the gateway."
             )
 
-    def buy_notional(self, notional_usd: float, *, userref: int | None = None) -> str:
+    def buy_notional(self, notional_usd: float, *, userref: int | None = None,
+                     leverage: float | None = None) -> str:
         """Buy ``notional_usd`` of the configured pair.
 
-        In dry-run the order is fully sized and validated against real exchange
-        metadata — the only step skipped is the network call.  That keeps the
-        simulated path honest about precision and minimum-size rejections.
+        When ``leverage`` is given (and the gateway is in margin mode) the order
+        is submitted as a margin order; otherwise it is a plain spot order.  In
+        dry-run the order is fully sized and validated against real exchange
+        metadata — the only step skipped is the network call.
         """
         sized = self.size_buy(notional_usd)
         if not self.order_submission_enabled:
             self._log(AuditEvent.ORDER_INTENT, {
-                "mode": "dry_run",
-                "pair": sized.pair,
-                "side": "buy",
-                "volume": sized.volume_str,
-                "price": sized.price_str,
-                "notional": str(sized.notional),
-                "userref": userref,
+                "mode": "dry_run", "pair": sized.pair, "side": "buy",
+                "volume": sized.volume_str, "price": sized.price_str,
+                "notional": str(sized.notional), "userref": userref,
+                "leverage": leverage,
             })
             return f"kraken-dry-buy-{userref or int(time.time())}"
 
@@ -637,15 +636,49 @@ class KrakenGateway:
             "ordertype": "market",
             "volume": sized.volume_str,
         }
+        if leverage is not None:
+            params["leverage"] = str(leverage)
         if userref is not None:
             params["userref"] = str(userref)
         result = self._private("AddOrder", params)
         order_id = (result.get("txid") or ["unknown"])[0]
         self._log(AuditEvent.ORDER_SUBMITTED, {
             "pair": sized.pair, "side": "buy", "volume": sized.volume_str,
-            "order_id": order_id, "userref": userref,
+            "order_id": order_id, "userref": userref, "leverage": leverage,
         }, severity="warning")
         return order_id
+
+    def margin_positions(self) -> list[dict]:
+        """Open margin positions (Kraken ``OpenPositions`` endpoint).
+
+        Returns [] when the account has no margin positions or the call fails.
+        Each entry carries the pair, side, volume, leverage, and margin total so
+        the engine can enforce the margin exposure cap and the liquidation guard.
+        """
+        if not self.has_credentials:
+            return []
+        try:
+            result = self._private("OpenPositions")
+        except BrokerError as exc:
+            self._log(AuditEvent.BROKER_ERROR,
+                      {"operation": "margin_positions", "error": str(exc)},
+                      severity="warning")
+            return []
+        positions = []
+        for pair, p in (result.get("open") or {}).items():
+            try:
+                positions.append({
+                    "pair": pair,
+                    "side": "long" if float(p.get("vol", 0)) > 0 else "short",
+                    "volume": abs(float(p.get("vol", 0))),
+                    "leverage": float(p.get("leverage", 0) or 0),
+                    "margin_total": float(p.get("margin", 0)),
+                    "cost": float(p.get("cost", 0)),
+                    "pnl": float(p.get("net", 0)),
+                })
+            except (TypeError, ValueError):
+                continue
+        return positions
 
     def close_position(self, *, userref: int | None = None) -> str:
         """Sell the entire base-asset balance of the configured pair."""

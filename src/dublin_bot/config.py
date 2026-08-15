@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     # at the minimum notional, automatically fall back to a cheaper allowed coin.
     auto_cheaper_symbol: bool = Field(default=True)
     fallback_symbols: list[str] = Field(default_factory=lambda: ["XRP/USD", "ADA/USD", "DOGE/USD", "SOL/USD", "TRX/USD", "HYPE/USD"])
+    # Margin (leveraged) trading. OFF by default — spot only. When enabled the
+    # gateway submits margin orders and tracks positions via OpenPositions. Kraken
+    # can force-liquidate a margin position, so the exposure cap is tightened and
+    # a hard leverage ceiling is enforced; leverage is never auto-raised above it.
+    margin_enabled: bool = Field(default=False)
+    max_leverage: float = Field(default=2.0, gt=0, le=5.0)
+    margin_exposure_fraction: float = Field(default=0.25, gt=0, le=0.5)
     risk_per_trade: float = Field(default=0.01, gt=0, le=0.02)
     max_position_fraction: float = Field(default=0.25, gt=0, le=0.5)
     max_exposure_fraction: float = Field(default=0.5, gt=0, le=1.0)

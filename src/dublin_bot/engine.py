@@ -282,12 +282,21 @@ class TradingEngine:
         state.realized_pnl_today = equity - state.start_equity
         open_exposure = 0.0
         try:
-            if hasattr(self.gateway, "positions"):
+            s = self.settings
+            if s.margin_enabled and hasattr(self.gateway, "margin_positions"):
+                # Margin exposure is measured by collateral committed, not notional.
+                open_exposure = float(sum(
+                    p.get("margin_total", 0.0) for p in self.gateway.margin_positions()
+                ))
+            elif hasattr(self.gateway, "positions"):
                 open_exposure = float(sum(
                     p.get("market_value", 0.0) for p in self.gateway.positions()
                 ))
         except BrokerError:
             open_exposure = 0.0
+        leverage = self.settings.max_leverage if self.settings.margin_enabled else None
+        if leverage is not None:
+            leverage = min(leverage, self.settings.max_leverage)
         risk = self.risk.evaluate(signal, state, open_exposure_usd=open_exposure)
 
         # An entry requires healthy market quality; an exit must never be
@@ -310,12 +319,14 @@ class TradingEngine:
             order_id, risk = self._execute(
                 side="buy", notional=risk.notional_usd, risk=risk,
                 bar_timestamp=bar_timestamp, state=state, gates=gates,
+                leverage=leverage,
             )
         elif signal.action is Action.SELL and in_position:
             order_id, risk = self._execute(
                 side="sell", notional=0.0,
                 risk=RiskDecision(True, "Exit signal approved"),
                 bar_timestamp=bar_timestamp, state=state, gates=gates,
+                leverage=leverage,
             )
 
         self.state_store.save(state)
@@ -333,7 +344,7 @@ class TradingEngine:
         return CycleResult(record, None, None, gates)
 
     def _execute(self, *, side: str, notional: float, risk: RiskDecision,
-                 bar_timestamp: str, state, gates: dict) -> tuple[str | None, RiskDecision]:
+                 bar_timestamp: str, state, gates: dict, leverage: float | None = None) -> tuple[str | None, RiskDecision]:
         """Reserve an idempotency key, then execute. Never resends on ambiguity."""
         key = make_intent_key(
             symbol=self.settings.symbol, side=side,
@@ -354,7 +365,7 @@ class TradingEngine:
         gates["idempotency"] = {"blocked": False, "key": key, "userref": record.userref}
         try:
             if side == "buy":
-                order_id = self.gateway.buy_notional(notional, userref=record.userref)
+                order_id = self.gateway.buy_notional(notional, userref=record.userref, leverage=leverage)
                 if self.settings.paper_trading or self.settings.dry_run:
                     ticker = self.gateway.get_ticker()
                     sized = self.gateway.size_buy(notional, price=float(ticker["ask"]))

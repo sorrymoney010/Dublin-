@@ -73,7 +73,7 @@ class RiskManager:
         if signal.stop_price is None or signal.price <= signal.stop_price:
             return RiskDecision(False, "Invalid stop distance")
 
-        exposure_cap = equity * s.max_exposure_fraction
+        exposure_cap = equity * (s.margin_exposure_fraction if s.margin_enabled else s.max_exposure_fraction)
         if open_exposure_usd >= exposure_cap:
             return RiskDecision(False, f"Exposure cap reached: {open_exposure_usd:.2f} >= {exposure_cap:.2f}")
 
