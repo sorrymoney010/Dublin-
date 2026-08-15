@@ -128,31 +128,12 @@ def _kraken_credentials(settings: Settings) -> tuple[str, str] | None:
 
 
 def _kraken_private(settings: Settings, path: str, data: dict[str, object] | None = None) -> dict:
-    creds = _kraken_credentials(settings)
-    if creds is None:
-        raise RuntimeError("Kraken credentials not found")
-    key, secret = creds
-    nonce = str(time.time_ns())
-    body = {"nonce": nonce, **(data or {})}
-    encoded = urllib.parse.urlencode(body)
-    digest = hashlib.sha256((nonce + encoded).encode()).digest()
-    message = path.encode() + digest
-    signature = base64.b64encode(
-        hmac.new(base64.b64decode(secret), message, hashlib.sha512).digest()
-    ).decode()
-    req = urllib.request.Request(
-        f"{KRAKEN_API_BASE}{path}",
-        data=encoded.encode(),
-        headers={"API-Key": key, "API-Sign": signature,
-                 "Content-Type": "application/x-www-form-urlencoded",
-                 "User-Agent": "Dublin-Terminal/2.0"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        payload = json.loads(resp.read().decode())
-    if payload.get("error"):
-        raise RuntimeError("; ".join(payload["error"]))
-    return payload["result"]
+    """Delegates to the gateway's signed private call (shares the persisted,
+    monotonic NonceGenerator so the server-side watermark is never regressed)."""
+    from .engine import build_gateway
+    gateway = build_gateway(settings)
+    endpoint = path.rsplit("/", 1)[-1]
+    return gateway._private(endpoint, dict(data or {}))
 
 
 def _kraken_public(path: str, params: dict[str, object] | None = None) -> dict:
@@ -533,9 +514,44 @@ def market_snapshot(settings: Settings) -> dict[str, object]:
 
 
 def portfolio_snapshot(settings: Settings) -> dict[str, object]:
-    from .engine import TradingEngine
+    from .engine import TradingEngine, build_gateway
     try:
         engine = TradingEngine(settings)
+        # Live account truth: report real Kraken equity + balances when a
+        # key is present, falling back to the paper portfolio otherwise.
+        if settings.has_credentials:
+            try:
+                gateway = build_gateway(settings)
+                equity = round(float(gateway.account_equity()), 2)
+                balances = gateway.balances()
+                base = engine.gateway.resolve_symbol().base if settings.has_credentials else ""
+                positions = []
+                if base and float(balances.get(base, 0.0)) > 0:
+                    try:
+                        price = float(engine.gateway.get_ticker()["last"])
+                    except Exception:
+                        price = 0.0
+                    qty = float(balances[base])
+                    positions = [{
+                        "symbol": settings.symbol,
+                        "quantity": qty,
+                        "market_value": round(qty * price, 2),
+                        "unrealized_pl": 0.0,
+                    }]
+                return {
+                    "equity": equity,
+                    "cash": round(float(balances.get("ZUSD", 0.0)), 2),
+                    "positions": positions,
+                    "orders": gateway.orders(),
+                    "unrealized_pl": 0.0,
+                    "realized_pl": 0.0,
+                    "message": None,
+                    "live": True,
+                }
+            except Exception as exc:
+                return {"equity": 0.0, "positions": [], "orders": [],
+                        "cash": 0.0, "unrealized_pl": 0.0, "realized_pl": 0.0,
+                        "message": f"Kraken read error: {exc}"}
         portfolio = engine.paper_portfolio.snapshot()
         state = engine.state_store.load(settings.strategy_equity_usd)
         if portfolio.positions and settings.symbol in portfolio.positions:
@@ -551,6 +567,7 @@ def portfolio_snapshot(settings: Settings) -> dict[str, object]:
             "unrealized_pl": unrealized,
             "realized_pl": realized,
             "message": None,
+            "live": False,
         }
     except Exception as exc:
         return {"equity": settings.strategy_equity_usd, "positions": [], "orders": [],
