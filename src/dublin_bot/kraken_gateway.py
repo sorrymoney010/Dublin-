@@ -640,7 +640,23 @@ class KrakenGateway:
             params["leverage"] = str(leverage)
         if userref is not None:
             params["userref"] = str(userref)
-        result = self._private("AddOrder", params)
+        try:
+            result = self._private("AddOrder", params)
+        except BrokerError as exc:
+            # A pair that does not support margin trading rejects the `leverage`
+            # argument outright ("Invalid arguments:leverage"). When margin mode
+            # is on but the chosen symbol is a spot-only pair, retry once as a
+            # plain spot order so the trade can still go through.
+            if leverage is not None and "leverage" in str(exc):
+                self._log(AuditEvent.BROKER_ERROR,
+                          {"operation": "AddOrder", "error": str(exc),
+                           "fallback": "retry without leverage (spot)"},
+                          severity="warning")
+                params.pop("leverage", None)
+                result = self._private("AddOrder", params)
+                leverage = None
+            else:
+                raise
         order_id = (result.get("txid") or ["unknown"])[0]
         self._log(AuditEvent.ORDER_SUBMITTED, {
             "pair": sized.pair, "side": "buy", "volume": sized.volume_str,
