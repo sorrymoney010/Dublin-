@@ -39,28 +39,31 @@ class TrendBreakoutStrategy:
             return Signal(Action.WAIT, 60, "Position remains above slow trend EMA", price, atr)
 
         checks = {
+            # Momentum is the hard gate: RSI must sit inside the tradable band
+            # (not overbought, not washed out). In a range-bound / grinding market
+            # this is the actionable mean-reversion trigger.
             "momentum": s.rsi_min <= float(row["rsi"]) <= s.rsi_max,
-            # A breakout is a close near the prior resistance (within 1 ATR). In a
-            # ranging/grinding market this is the actionable setup; we do not
-            # require a strict print above the 20-bar high.
-            "breakout": price >= float(row["prior_resistance"]) - atr,
         }
         # Advisory only — they shape the score and the note, but never block an
         # entry on their own. This is what lets the bot trade in choppy/flat
-        # sessions instead of waiting forever for a full uptrend.
+        # sessions instead of waiting forever for a clean trend or a print at
+        # the prior resistance.
         advisory = {
             "regime": price > float(row["ema_regime"]),
             "trend": float(row["ema_fast"]) > float(row["ema_slow"]),
+            "breakout": price >= float(row["prior_resistance"]) - atr,
             "volume": float(row["volume_ratio"]) >= s.min_volume_ratio,
         }
         score = (sum(checks.values()) * 20) + (sum(advisory.values()) * 5)
         failed = [name for name, passed in checks.items() if not passed]
 
-        # Fire when momentum and breakout both pass. Risk limits (size, orders/day,
-        # daily-loss, drawdown) are still enforced downstream in risk.py.
+        # Fire when momentum passes. Risk limits (size, orders/day, daily-loss,
+        # drawdown) are still enforced downstream in risk.py.
         if not failed:
             stop_price = max(0.0, price - atr * s.atr_stop_multiplier)
-            note = "Momentum + breakout confirmed"
+            note = "Momentum confirmed"
+            if advisory["breakout"]:
+                note += " + at resistance"
             if not advisory["regime"]:
                 note += " (counter-trend)"
             if not advisory["volume"]:
