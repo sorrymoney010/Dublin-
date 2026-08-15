@@ -1168,24 +1168,24 @@ nav button.on{color:var(--cyan)}
 <!-- ============ BOT ============ -->
 <section class="view" id="v-bot">
   <div class="grid">
-    <div class="card m6">
-      <div class="label">Trading Monitor</div>
+    <div class="card m12">
+      <div class="label">Trading Bot — Live Control</div>
       <div class="row"><span class="rl">Mode</span><span class="rv" id="monMode">live</span></div>
       <div class="row"><span class="rl">Status</span><span class="rv" id="monStatus">—</span></div>
       <div class="row"><span class="rl">Last run</span><span class="rv" id="monLast">—</span></div>
       <div class="row"><span class="rl">Last action</span><span class="rv" id="monAction">—</span></div>
+      <div class="row"><span class="rl">Symbol</span><span class="rv" id="monSymbol">—</span></div>
+      <div id="monError" class="sub red" style="margin-top:8px;display:none"></div>
       <div class="ivl">
         <button class="secondary" onclick="setIvl(-900)">−15m</button>
         <span class="val" id="monIvl">—</span>
         <button class="secondary" onclick="setIvl(900)">+15m</button>
       </div>
-      <div class="actions">
-        <button class="primary" onclick="post('/api/monitor/start')">Start monitor</button>
-        <button class="secondary" onclick="post('/api/monitor/stop')">Stop</button>
+      <div class="actions" style="grid-template-columns:1fr 1fr">
+        <button class="primary" id="btnStart" onclick="toggleMonitor()">▶ Start Trading</button>
+        <button class="secondary" onclick="runOnce(this)">⚡ Run Cycle Now</button>
       </div>
-      <div class="actions" style="grid-template-columns:1fr">
-        <button class="secondary" onclick="runOnce(this)">▶ Run cycle now</button>
-      </div>
+      <div class="sub muted" style="margin-top:8px">Start = auto-cycle every interval and trade on signals. Run Cycle Now = single manual trade check.</div>
     </div>
 
     <div class="card m6">
@@ -1327,6 +1327,11 @@ async function runOnce(btn){
     btn.disabled = false; btn.textContent = label;
   }
 }
+function toggleMonitor(){
+  const running = ($("monStatus").textContent||"").toUpperCase().includes("RUNNING");
+  post(running ? "/api/monitor/stop" : "/api/monitor/start");
+  toast(running ? "Monitor stopped" : "Monitor started — trading enabled");
+}
 function estop(on){
   const msg = on ? "Activate emergency stop? Bot order intents will halt." : "Clear emergency stop?";
   if (confirm(msg)) post("/api/emergency-stop/" + (on?"activate":"clear"));
@@ -1402,13 +1407,21 @@ function renderOverview(d){
       <span class="rv ${s.action==="BUY"?"lime":s.action==="SELL"?"red":""}">${s.action||"—"} · ${s.score??""}</span></div>`;
   }).join("") : '<div class="empty">no decisions logged yet — run a cycle</div>';
   // monitor
-  const m=d.monitor||{};
-  $("monStatus").innerHTML = m.running?'<span class="pill lime">RUNNING</span>':'<span class="pill">STOPPED</span>';
-  $("monLast").textContent = shortTs(m.last_run);
-  $("monAction").textContent = m.last_action||"—";
-  const sec = m.interval_seconds||3600;
-  $("monIvl").textContent = (sec/60)+"m";
-  $("monIvl").dataset.sec = sec;
+  try {
+    const m=d.monitor||{};
+    const running = !!m.running;
+    const ms=$("monStatus");
+    if (ms) ms.innerHTML = running?'<span class="pill lime">RUNNING</span>':'<span class="pill">STOPPED</span>';
+    if ($("monLast")) $("monLast").textContent = shortTs(m.last_run);
+    if ($("monAction")) $("monAction").textContent = m.last_action||"—";
+    if ($("monSymbol")) $("monSymbol").textContent = (d.status&&d.status.symbol)||"—";
+    const sec = m.interval_seconds||3600;
+    if ($("monIvl")){ $("monIvl").textContent = (sec/60)+"m"; $("monIvl").dataset.sec = sec; }
+    const errEl=$("monError");
+    if (errEl){ if(m.last_error){ errEl.style.display="block"; errEl.textContent="last cycle error: "+m.last_error; } else { errEl.style.display="none"; } }
+    const btn=$("btnStart");
+    if (btn) btn.textContent = running ? "■ Stop Trading" : "▶ Start Trading";
+  } catch(e){ console.error("monitor render failed", e); }
 }
 
 function renderKraken(b){
