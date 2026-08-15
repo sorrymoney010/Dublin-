@@ -57,7 +57,7 @@ class RiskManager:
         equity = max(state.current_equity, 0.0) or s.strategy_equity_usd
         if signal.action is not Action.BUY:
             return RiskDecision(False, "No entry order requested")
-        if state.realized_pnl_today <= -(s.strategy_equity_usd * s.max_daily_loss_fraction):
+        if state.realized_pnl_today <= -(equity * s.max_daily_loss_fraction):
             return RiskDecision(False, "Daily loss circuit breaker is active")
         if equity < s.min_order_notional_usd:
             return RiskDecision(False, f"Account equity {equity:.2f} below minimum order notional")

@@ -25,8 +25,16 @@ class StateStore:
         if data.get("session_date") != today:
             return SessionState(equity, equity, equity)
         last_order = data.get("last_order_at")
+        persisted_start = float(data.get("start_equity", equity))
+        # Reset a stale starting equity. start_equity is only meaningful for the
+        # current funded balance; a persisted value far from the live equity
+        # (e.g. an old $25 default, or a prior larger balance) would otherwise
+        # make realized_pnl_today compute as a phantom loss and trip the daily
+        # loss breaker on a fresh, lossless session.
+        if abs(persisted_start - equity) > max(equity, 1.0) * 0.5:
+            persisted_start = equity
         return SessionState(
-            start_equity=float(data.get("start_equity", equity)),
+            start_equity=persisted_start,
             peak_equity=max(float(data.get("peak_equity", equity)), equity),
             current_equity=equity,
             realized_pnl_today=float(data.get("realized_pnl_today", 0.0)),

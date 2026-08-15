@@ -170,36 +170,48 @@ class TradingEngine:
         what the account can afford, so the risk manager would never approve a
         trade.  When ``auto_cheaper_symbol`` is on, we scan the fallback list and
         switch to the cheapest coin whose minimum order is affordable, so the bot
-        can still trade.  Resets to the configured symbol whenever it becomes
-        affordable again.
+        can still trade.  If even the preferred symbol can't be afforded at the
+        position cap, we drop it and pick the first fallback that fits.
         """
         s = self.settings
         equity = self.gateway.account_equity()
+        cap = equity * s.max_position_fraction
         candidates = [s.symbol] + list(s.fallback_symbols)
         chosen = s.symbol
-        for sym in candidates:
-            try:
-                meta = self.gateway.resolve_symbol(sym)
-            except Exception:
-                continue
-            min_notional = float(meta.order_min) * float(meta.cost_min if meta.cost_min else 1.0)
-            # Fall back to price × min lot when cost_min is zero/uninformative.
-            if min_notional <= 0:
-                try:
-                    last = float(self.gateway.get_ticker_for(sym)["last"])
-                    min_notional = float(meta.order_min) * last
-                except Exception:
-                    min_notional = 0.0
-            if min_notional <= equity * s.max_position_fraction:
-                chosen = sym
-                if sym == s.symbol:
-                    break  # preferred symbol is affordable; keep it
+        affordable = [sym for sym in candidates if self._min_notional(sym) <= cap]
+        if affordable:
+            # Prefer the configured symbol when it fits; otherwise the cheapest
+            # affordable fallback (so a small account trades XRP, not BTC).
+            chosen = s.symbol if s.symbol in affordable else affordable[0]
         if chosen != s.symbol:
             s.symbol = chosen
             self.audit.record(
                 AuditEvent.SIGNAL,
                 {"event": "symbol_switch", "symbol": chosen, "equity": round(equity, 2)},
             )
+
+    def _min_notional(self, symbol: str) -> float:
+        """Estimated minimum order notional (USD) for ``symbol``.
+
+        Kraken's ``cost_min`` is often a small placeholder (~$0.5) and does not
+        reflect the real floor, which is driven by the **lot-size** minimum
+        (``order_min``) times price.  We therefore use ``order_min * last`` as the
+        effective minimum notional; ``cost_min`` is only a fallback when no price
+        is available.
+        """
+        try:
+            meta = self.gateway.resolve_symbol(symbol)
+        except Exception:
+            return float("inf")
+        try:
+            last = float(self.gateway.get_ticker_for(symbol)["last"])
+        except Exception:
+            last = 0.0
+        min_qty = float(meta.order_min)
+        if last > 0:
+            return min_qty * last
+        cost_min = float(meta.cost_min) if meta.cost_min else 0.0
+        return cost_min if cost_min > 0 else float("inf")
 
     def run_cycle(self) -> CycleResult:
         gates: dict[str, object] = {}

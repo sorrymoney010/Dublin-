@@ -108,26 +108,31 @@ class PaperPortfolio:
 
     def save(self) -> None:
         with self._lock:
-            self._portfolio.updated_at = datetime.now(timezone.utc).isoformat()
-            payload = {
-                "equity": self._portfolio.equity,
-                "cash": self._portfolio.cash,
-                "updated_at": self._portfolio.updated_at,
-                "positions": [
-                    {
-                        "symbol": p.symbol,
-                        "quantity": p.quantity,
-                        "entry_price": p.entry_price,
-                        "fees_paid": p.fees_paid,
-                        "opened_at": p.opened_at,
-                        "trades": p.trades,
-                    }
-                    for p in self._portfolio.positions.values()
-                ],
-            }
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-            tmp.replace(self.path)
+            self._save_unlocked()
+
+    def _save_unlocked(self) -> None:
+        self._portfolio.updated_at = datetime.now(timezone.utc).isoformat()
+        payload = {
+            "equity": self._portfolio.equity,
+            "cash": self._portfolio.cash,
+            "updated_at": self._portfolio.updated_at,
+            "positions": [
+                {
+                    "symbol": p.symbol,
+                    "quantity": p.quantity,
+                    "entry_price": p.entry_price,
+                    "fees_paid": p.fees_paid,
+                    "opened_at": p.opened_at,
+                    "trades": p.trades,
+                }
+                for p in self._portfolio.positions.values()
+            ],
+        }
+        path = self.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(path)
 
     def snapshot(self) -> Portfolio:
         with self._lock:
@@ -195,7 +200,7 @@ class PaperPortfolio:
             position.trades += 1
             self._portfolio.equity -= (quantity * fill_price + fee)
             self._portfolio.cash -= (quantity * fill_price + fee)
-            self.save()
+            self._save_unlocked()
 
     def record_sell(self, symbol: str, quantity: float, fill_price: float, fee: float, when: str) -> float:
         with self._lock:
@@ -213,5 +218,5 @@ class PaperPortfolio:
             self._portfolio.cash += proceeds
             if position.quantity <= 1e-12:
                 del self._portfolio.positions[symbol]
-            self.save()
+            self._save_unlocked()
             return realized_pl
