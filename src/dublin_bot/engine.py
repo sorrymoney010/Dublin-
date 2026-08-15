@@ -98,8 +98,35 @@ class TradingEngine:
         )
         self.fill_model = FillModel(settings)
         self.paper_portfolio = PaperPortfolio(Path("logs/paper_portfolio.json"))
+        self._rotation = 0  # round-robin pointer across affordable small-cap coins
 
     # ── gate 1: safety ───────────────────────────────────────
+
+    def _select_symbol(self) -> None:
+        """Pick the next tradeable symbol (basket rotation) for this cycle.
+
+        With a small balance the configured symbol (e.g. BTC) may be unaffordable,
+        so we scan the fallback list and rotate through every *affordable* coin,
+        one per cycle, building a small-cap basket over time instead of always
+        trading the same cheapest pair.  Round-robin spreads buys across coins.
+        """
+        s = self.settings
+        equity = self.gateway.account_equity()
+        cap = equity * s.max_position_fraction
+        candidates = [s.symbol] + list(s.fallback_symbols)
+        affordable = [sym for sym in candidates if self._min_notional(sym) <= cap]
+        if not affordable:
+            affordable = candidates  # nothing fits the cap; let risk reject downstream
+        # Round-robin: advance the pointer so successive cycles pick different coins.
+        self._rotation = (self._rotation + 1) % len(affordable)
+        chosen = affordable[self._rotation % len(affordable)]
+        if chosen != s.symbol:
+            s.symbol = chosen
+            self.audit.record(
+                AuditEvent.SIGNAL,
+                {"event": "symbol_switch", "symbol": chosen, "equity": round(equity, 2),
+                 "rotation": self._rotation, "affordable": affordable},
+            )
 
     def assert_safety_locks(self) -> dict:
         """Verify the declared safety posture is internally consistent.
@@ -162,33 +189,6 @@ class TradingEngine:
         return summary
 
     # ── main cycle ───────────────────────────────────────────
-
-    def _select_symbol(self) -> None:
-        """Pick the tradeable symbol whose minimum order fits the real balance.
-
-        With a small balance, BTC's minimum notional (price × min lot) can exceed
-        what the account can afford, so the risk manager would never approve a
-        trade.  When ``auto_cheaper_symbol`` is on, we scan the fallback list and
-        switch to the cheapest coin whose minimum order is affordable, so the bot
-        can still trade.  If even the preferred symbol can't be afforded at the
-        position cap, we drop it and pick the first fallback that fits.
-        """
-        s = self.settings
-        equity = self.gateway.account_equity()
-        cap = equity * s.max_position_fraction
-        candidates = [s.symbol] + list(s.fallback_symbols)
-        chosen = s.symbol
-        affordable = [sym for sym in candidates if self._min_notional(sym) <= cap]
-        if affordable:
-            # Prefer the configured symbol when it fits; otherwise the cheapest
-            # affordable fallback (so a small account trades XRP, not BTC).
-            chosen = s.symbol if s.symbol in affordable else affordable[0]
-        if chosen != s.symbol:
-            s.symbol = chosen
-            self.audit.record(
-                AuditEvent.SIGNAL,
-                {"event": "symbol_switch", "symbol": chosen, "equity": round(equity, 2)},
-            )
 
     def _min_notional(self, symbol: str) -> float:
         """Estimated minimum order notional (USD) for ``symbol``.
