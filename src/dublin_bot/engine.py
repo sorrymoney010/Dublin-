@@ -102,21 +102,40 @@ class TradingEngine:
 
     # ── gate 1: safety ───────────────────────────────────────
 
+    def _can_size(self, symbol: str, notional: float) -> bool:
+        """True if the gateway can actually place a ``notional`` order for ``symbol``.
+
+        Uses the real ``size_buy`` (precision/lot rules) rather than an estimate,
+        so a coin whose lot minimum rounds above ``notional`` is excluded instead
+        of throwing ``PrecisionError`` mid-execution on a small account.
+        """
+        try:
+            saved = self.settings.symbol
+            self.settings.symbol = symbol
+            self.gateway.size_buy(notional)
+            self.settings.symbol = saved
+            return True
+        except Exception:
+            return False
+
     def _select_symbol(self) -> None:
         """Pick the next tradeable symbol (basket rotation) for this cycle.
 
-        With a small balance the configured symbol (e.g. BTC) may be unaffordable,
-        so we scan the fallback list and rotate through every *affordable* coin,
-        one per cycle, building a small-cap basket over time instead of always
-        trading the same cheapest pair.  Round-robin spreads buys across coins.
+        With a small balance the configured symbol (e.g. BTC) and most altcoins
+        may be unaffordable — their lot minimum rounds above what the risk model
+        allows.  We scan the fallback list and rotate through every coin that can
+        *actually* be sized at the sized notional, one per cycle, building a
+        small-cap basket over time.  Coins that cannot be sized at this balance
+        (e.g. ADA/DOGE need a bigger ticket) are skipped until the account grows.
         """
         s = self.settings
         equity = self.gateway.account_equity()
         cap = equity * s.max_position_fraction
         candidates = [s.symbol] + list(s.fallback_symbols)
-        affordable = [sym for sym in candidates if self._min_notional(sym) <= cap]
+        # Only coins the gateway can truly size at the position cap.
+        affordable = [sym for sym in candidates if self._can_size(sym, cap)]
         if not affordable:
-            affordable = candidates  # nothing fits the cap; let risk reject downstream
+            affordable = candidates  # nothing fits; let risk reject downstream
         # Round-robin: advance the pointer so successive cycles pick different coins.
         self._rotation = (self._rotation + 1) % len(affordable)
         chosen = affordable[self._rotation % len(affordable)]
