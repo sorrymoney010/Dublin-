@@ -1169,7 +1169,8 @@ nav button.on{color:var(--cyan)}
 <section class="view" id="v-bot">
   <div class="grid">
     <div class="card m6">
-      <div class="label">Paper Monitor</div>
+      <div class="label">Trading Monitor</div>
+      <div class="row"><span class="rl">Mode</span><span class="rv" id="monMode">live</span></div>
       <div class="row"><span class="rl">Status</span><span class="rv" id="monStatus">—</span></div>
       <div class="row"><span class="rl">Last run</span><span class="rv" id="monLast">—</span></div>
       <div class="row"><span class="rl">Last action</span><span class="rv" id="monAction">—</span></div>
@@ -1183,7 +1184,7 @@ nav button.on{color:var(--cyan)}
         <button class="secondary" onclick="post('/api/monitor/stop')">Stop</button>
       </div>
       <div class="actions" style="grid-template-columns:1fr">
-        <button class="secondary" onclick="runOnce(this)">▶ Run paper cycle now</button>
+        <button class="secondary" onclick="runOnce(this)">▶ Run cycle now</button>
       </div>
     </div>
 
@@ -1295,10 +1296,15 @@ async function post(url, body){
     const r = await fetch(url, {method:"POST",
       headers:{"Content-Type":"application/json"},
       body: body ? JSON.stringify(body) : "{}"});
-    const j = await r.json();
+    if (!r.ok) throw new Error(url + " → HTTP " + r.status);
+    const j = await r.json().catch(()=>null);
     refresh();
     return j;
-  }catch(e){ connFail(); }
+  }catch(e){
+    connFail();
+    toast("⚠ " + e.message);
+    return null;
+  }
 }
 function setIvl(d){
   const cur = parseInt(($("monIvl").dataset.sec||"3600"),10);
@@ -1306,11 +1312,19 @@ function setIvl(d){
   post("/api/monitor/interval", {interval_seconds: next});
 }
 async function runOnce(btn){
+  const label = btn.textContent;
   btn.disabled = true; btn.textContent = "running…";
-  const j = await post("/api/run-once");
-  btn.disabled = false; btn.textContent = "▶ Run paper cycle now";
-  if (j && j.signal){
-    toast(`Signal: ${j.signal.action} · score ${j.signal.score} · ${j.signal.reason}`);
+  try {
+    const j = await post("/api/run-once");
+    if (j && j.signal){
+      toast(`Signal: ${j.signal.action} · score ${j.signal.score} · ${j.signal.reason}`);
+    } else if (j && j.error) {
+      toast("⚠ " + j.error);
+    } else {
+      toast("⚠ No response from engine");
+    }
+  } finally {
+    btn.disabled = false; btn.textContent = label;
   }
 }
 function estop(on){
