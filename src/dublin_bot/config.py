@@ -42,6 +42,18 @@ class Settings(BaseSettings):
     timeframe_minutes: int = Field(default=60, ge=1)
     lookback_bars: int = Field(default=500, ge=220)
     strategy_equity_usd: float = Field(default=25.0, ge=25.0)
+    # Auto-scale risk per trade based on session win/loss streak. The base risk
+    # (risk_per_trade) is multiplied by this factor, which the engine moves
+    # between min_risk_scale and max_risk_scale as the bot wins/loses — so a
+    # winning streak compounds allocation up, a losing streak tightens it down.
+    adaptive_risk: bool = Field(default=True)
+    min_risk_scale: float = Field(default=0.5, gt=0, le=1.0)
+    max_risk_scale: float = Field(default=2.0, gt=1.0)
+    risk_step: float = Field(default=0.15, gt=0, le=0.5)
+    # When the real account balance is too small to trade the configured symbol
+    # at the minimum notional, automatically fall back to a cheaper allowed coin.
+    auto_cheaper_symbol: bool = Field(default=True)
+    fallback_symbols: list[str] = Field(default_factory=lambda: ["XRP/USD", "ADA/USD", "DOGE/USD", "SOL/USD"])
     risk_per_trade: float = Field(default=0.01, gt=0, le=0.02)
     max_position_fraction: float = Field(default=0.25, gt=0, le=0.5)
     max_exposure_fraction: float = Field(default=0.5, gt=0, le=1.0)

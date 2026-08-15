@@ -415,6 +415,11 @@ class KrakenGateway:
 
     def get_ticker(self) -> dict:
         meta = self.resolve_symbol()
+        return self.get_ticker_for(meta.altname)
+
+    def get_ticker_for(self, symbol: str) -> dict:
+        """Ticker for an arbitrary symbol (used by symbol auto-selection)."""
+        meta = self.resolve_symbol(symbol)
         result = self._public("Ticker", {"pair": meta.key})
         raw = result.get(meta.key) or result.get(meta.altname)
         if raw is None and result:

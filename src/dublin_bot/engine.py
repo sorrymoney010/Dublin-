@@ -163,6 +163,44 @@ class TradingEngine:
 
     # ── main cycle ───────────────────────────────────────────
 
+    def _select_symbol(self) -> None:
+        """Pick the tradeable symbol whose minimum order fits the real balance.
+
+        With a small balance, BTC's minimum notional (price × min lot) can exceed
+        what the account can afford, so the risk manager would never approve a
+        trade.  When ``auto_cheaper_symbol`` is on, we scan the fallback list and
+        switch to the cheapest coin whose minimum order is affordable, so the bot
+        can still trade.  Resets to the configured symbol whenever it becomes
+        affordable again.
+        """
+        s = self.settings
+        equity = self.gateway.account_equity()
+        candidates = [s.symbol] + list(s.fallback_symbols)
+        chosen = s.symbol
+        for sym in candidates:
+            try:
+                meta = self.gateway.resolve_symbol(sym)
+            except Exception:
+                continue
+            min_notional = float(meta.order_min) * float(meta.cost_min if meta.cost_min else 1.0)
+            # Fall back to price × min lot when cost_min is zero/uninformative.
+            if min_notional <= 0:
+                try:
+                    last = float(self.gateway.get_ticker_for(sym)["last"])
+                    min_notional = float(meta.order_min) * last
+                except Exception:
+                    min_notional = 0.0
+            if min_notional <= equity * s.max_position_fraction:
+                chosen = sym
+                if sym == s.symbol:
+                    break  # preferred symbol is affordable; keep it
+        if chosen != s.symbol:
+            s.symbol = chosen
+            self.audit.record(
+                AuditEvent.SIGNAL,
+                {"event": "symbol_switch", "symbol": chosen, "equity": round(equity, 2)},
+            )
+
     def run_cycle(self) -> CycleResult:
         gates: dict[str, object] = {}
 
@@ -176,11 +214,15 @@ class TradingEngine:
         if emergency_stop_active():
             return CycleResult(None, "emergency_stop", "Manual emergency stop is active", gates)
 
+        # Gate 2 — symbol selection (adaptive to balance)
+        self._select_symbol()
+        gates["symbol"] = self.settings.symbol
+
         # Restart recovery before any new intent can be formed.
         gates["recovery"] = self.recover()
 
         # Paper portfolio sync for display and realistic accounting.
-        equity = min(self.gateway.account_equity(), self.settings.strategy_equity_usd)
+        equity = self.gateway.account_equity()
         state = self.state_store.load(equity)
         state.current_equity = equity
         state.peak_equity = max(state.peak_equity, equity)
@@ -233,7 +275,7 @@ class TradingEngine:
         })
 
         # Gate 6 — risk
-        equity = min(self.gateway.account_equity(), self.settings.strategy_equity_usd)
+        equity = self.gateway.account_equity()
         state = self.state_store.load(equity)
         state.current_equity = equity
         state.peak_equity = max(state.peak_equity, equity)
@@ -277,6 +319,8 @@ class TradingEngine:
             )
 
         self.state_store.save(state)
+        # Adapt risk scaling from the session's realized P&L streak.
+        self.risk.update_scale(state)
         record = DecisionRecord(
             symbol=self.settings.symbol,
             signal=signal,
