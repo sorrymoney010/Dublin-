@@ -60,9 +60,18 @@ class NonceGenerator:
                 os.unlink(tmp_name)
 
     def next(self) -> int:
-        """Return a nonce strictly greater than every nonce previously issued."""
+        """Return a nonce strictly greater than every nonce previously issued.
+
+        Uses **nanosecond** resolution.  Kraken tracks the maximum nonce ever
+        seen for an API key and rejects anything lower, so once a higher value
+        has been observed the counter must stay above it.  Microsecond-scale
+        values are unsafe because a single high-resolution call (e.g. a raw
+        diagnostic using ``time()*1e9``) permanently raises the server's
+        watermark above every microsecond nonce the bot would otherwise issue,
+        producing a permanent ``EAPI:Invalid nonce`` lockout.
+        """
         with self._lock:
-            candidate = int(time.time() * 1_000_000)
+            candidate = int(time.time() * 1_000_000_000)
             if candidate <= self._last:
                 candidate = self._last + 1
             self._last = candidate
