@@ -9,6 +9,9 @@ def test_safe_defaults_are_paper_and_dry_run():
     assert settings.dry_run is True
     assert settings.allow_live_trading is False
     assert settings.strategy_equity_usd == 25.0
+    assert settings.timeframe_minutes == 30
+    assert settings.monitor_interval_seconds == 1800
+    assert settings.cooldown_minutes == 60
 
 
 def test_live_mode_requires_explicit_acknowledgement():
@@ -19,4 +22,3 @@ def test_live_mode_requires_explicit_acknowledgement():
             allow_live_trading=True,
             live_risk_acknowledgement="",
         )
-

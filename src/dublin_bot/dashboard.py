@@ -239,10 +239,14 @@ def kraken_trades_data(settings: Settings, limit: int = 50) -> dict[str, object]
         return data
 
 
-WATCHLIST_DEFAULT = "BTC/USD,ETH/USD,SOL/USD,XRP/USD,DOGE/USD"
+# Full tradeable basket (BTC/SOL/XRP explicitly enabled alongside the
+# small-cap rotation of ADA/DOGE/TRX/HYPE). ETH is kept for market context
+# but is not part of the trading basket.
+WATCHLIST_DEFAULT = "BTC/USD,ETH/USD,SOL/USD,XRP/USD,ADA/USD,DOGE/USD,TRX/USD,HYPE/USD"
 KRAKEN_ALTNAMES = {
     "BTC/USD": "XBTUSD", "ETH/USD": "ETHUSD", "SOL/USD": "SOLUSD",
     "XRP/USD": "XRPUSD", "DOGE/USD": "DOGEUSD", "ADA/USD": "ADAUSD",
+    "TRX/USD": "TRXUSD", "HYPE/USD": "HYPEUSD",
     "LINK/USD": "LINKUSD", "AVAX/USD": "AVAXUSD", "DOT/USD": "DOTUSD",
     "LTC/USD": "LTCUSD", "ATOM/USD": "ATOMUSD", "PEPE/USD": "PEPEUSD",
 }
@@ -350,7 +354,7 @@ def suggestions_to_actions(suggestions: list) -> list[dict]:
 class PaperMonitor:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.interval_seconds = int(getattr(settings, "monitor_interval_seconds", 3600))
+        self.interval_seconds = int(getattr(settings, "monitor_interval_seconds", 1800))
         self.stop_event = Event()
         self.thread: Thread | None = None
         self.last_run: str | None = None
@@ -1415,7 +1419,7 @@ function renderOverview(d){
     if ($("monLast")) $("monLast").textContent = shortTs(m.last_run);
     if ($("monAction")) $("monAction").textContent = m.last_action||"—";
     if ($("monSymbol")) $("monSymbol").textContent = (d.status&&d.status.symbol)||"—";
-    const sec = m.interval_seconds||3600;
+    const sec = m.interval_seconds||1800;
     if ($("monIvl")){ $("monIvl").textContent = (sec/60)+"m"; $("monIvl").dataset.sec = sec; }
     const errEl=$("monError");
     if (errEl){ if(m.last_error){ errEl.style.display="block"; errEl.textContent="last cycle error: "+m.last_error; } else { errEl.style.display="none"; } }
@@ -1653,7 +1657,7 @@ def make_handler(settings: Settings, monitor: PaperMonitor) -> type[BaseHTTPRequ
                     length = int(self.headers.get("content-length", "0"))
                     payload = json.loads(self.rfile.read(length)) if length else {}
                     seconds = int(payload.get("interval_seconds")
-                                  or getattr(settings, "monitor_interval_seconds", 3600))
+                                  or getattr(settings, "monitor_interval_seconds", 1800))
                     monitor.set_interval(seconds)
                     self.send_json(monitor.status())
                 elif path == "/api/monitor/start":

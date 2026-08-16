@@ -515,3 +515,40 @@ def test_all_safety_gates_required_for_live_orders():
     # Removing any single gate → blocked
     gw._allow_order_submission = False
     assert gw.order_submission_enabled is False
+
+
+def test_live_enabled_buy_routes_canonical_add_order_payload_without_network():
+    """A fully enabled buy reaches AddOrder with a Kraken-ready payload.
+
+    ``_private`` is mocked, so this proves routing without contacting Kraken or
+    placing a real order.
+    """
+    settings = make_settings(
+        dry_run=False,
+        paper_trading=False,
+        allow_live_trading=True,
+        live_risk_acknowledgement="I_ACCEPT_LIVE_TRADING_RISK",
+    )
+    gw = _make_gateway_with_creds(settings)
+    gw._allow_order_submission = True
+    sized = MagicMock(
+        pair="XXBTZUSD",
+        volume_str="0.00050000",
+        price_str="50000.0",
+        notional=25.0,
+    )
+
+    with (
+        patch.object(gw, "size_buy", return_value=sized),
+        patch.object(gw, "_private", return_value={"txid": ["TEST-ORDER-ID"]}) as private,
+    ):
+        order_id = gw.buy_notional(25.0, userref=42)
+
+    assert order_id == "TEST-ORDER-ID"
+    private.assert_called_once_with("AddOrder", {
+        "pair": "XXBTZUSD",
+        "type": "buy",
+        "ordertype": "market",
+        "volume": "0.00050000",
+        "userref": "42",
+    })

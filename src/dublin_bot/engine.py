@@ -109,14 +109,15 @@ class TradingEngine:
         so a coin whose lot minimum rounds above ``notional`` is excluded instead
         of throwing ``PrecisionError`` mid-execution on a small account.
         """
+        saved = self.settings.symbol
         try:
-            saved = self.settings.symbol
             self.settings.symbol = symbol
             self.gateway.size_buy(notional)
-            self.settings.symbol = saved
             return True
         except Exception:
             return False
+        finally:
+            self.settings.symbol = saved
 
     def _select_symbol(self) -> None:
         """Pick the next tradeable symbol (basket rotation) for this cycle.
