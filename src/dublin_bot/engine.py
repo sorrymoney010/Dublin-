@@ -20,6 +20,7 @@ window of "unknown outcome" is as small as possible.
 
 from __future__ import annotations
 
+import pandas as pd
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -339,7 +340,13 @@ class TradingEngine:
         leverage = self.settings.max_leverage if self.settings.margin_enabled else None
         if leverage is not None:
             leverage = min(leverage, self.settings.max_leverage)
-        risk = self.risk.evaluate(signal, state, open_exposure_usd=open_exposure)
+        returns = bars["close"].pct_change().dropna() if len(bars) > 1 else None
+        risk = self.risk.evaluate(
+            signal,
+            state,
+            open_exposure_usd=open_exposure,
+            returns=pd.Series(returns) if returns is not None else None,
+        )
 
         # An entry requires healthy market quality; an exit must never be
         # blocked by a wide spread — being trapped in a position is worse.

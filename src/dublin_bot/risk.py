@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+import pandas as pd
+
 from .config import Settings
 from .models import Action, RiskDecision, Signal
+from .sizing import EdgeEstimate, PositionSizer, SizingConfig
 
 
 @dataclass
@@ -24,6 +27,14 @@ class SessionState:
 class RiskManager:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.sizer = PositionSizer(
+            SizingConfig(
+                target_vol=settings.target_vol,
+                kelly_fraction=settings.kelly_fraction,
+                max_risk_per_trade=settings.risk_per_trade,
+                max_leverage=settings.max_leverage,
+            )
+        )
 
     def effective_risk_per_trade(self) -> float:
         """Base risk scaled by the session's win/loss adaptation factor."""
@@ -52,7 +63,13 @@ class RiskManager:
             self._last_scale = max(s.min_risk_scale, self._last_scale - s.risk_step)
         state.risk_scale = self._last_scale
 
-    def evaluate(self, signal: Signal, state: SessionState, open_exposure_usd: float = 0.0) -> RiskDecision:
+    def evaluate(
+        self,
+        signal: Signal,
+        state: SessionState,
+        open_exposure_usd: float = 0.0,
+        returns: pd.Series | None = None,
+    ) -> RiskDecision:
         s = self.settings
         equity = max(state.current_equity, 0.0) or s.strategy_equity_usd
         # Exits (SELL) from an existing position are gated only by the signal
@@ -88,8 +105,25 @@ class RiskManager:
         if stop_fraction <= 0:
             return RiskDecision(False, "Invalid stop distance")
         risk_sized_notional = risk_budget / stop_fraction
+
+        # Vol-target + fractional-Kelly sizing (the durable edge). When we have
+        # a returns series we let the sizer scale by live volatility; otherwise
+        # we fall back to the static allocation cap so behavior is unchanged.
+        stop_distance = signal.price - signal.stop_price
+        if returns is not None and len(returns) > 0:
+            sizing = self.sizer.size(
+                equity=equity,
+                current_price=signal.price,
+                returns=returns,
+                stop_distance=stop_distance,
+            )
+            sizer_notional = sizing.notional
+        else:
+            sizer_notional = equity * s.max_position_fraction
+
+        # The sizer's output is one input; hard risk limits still bind.
         allocation_cap = equity * s.max_position_fraction
-        notional = min(risk_sized_notional, allocation_cap, equity)
+        notional = min(risk_sized_notional, sizer_notional, allocation_cap, equity)
         if open_exposure_usd + notional > exposure_cap:
             notional = max(0.0, exposure_cap - open_exposure_usd)
         if notional < s.min_order_notional_usd:
