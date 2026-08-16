@@ -54,12 +54,12 @@ def _meta_btc() -> SymbolMeta:
     )
 
 
-def _meta_sol() -> SymbolMeta:
+def _meta_kaito() -> SymbolMeta:
     return SymbolMeta(
-        key="SOLUSD", altname="SOLUSD", wsname="SOL/USD",
-        base="SOL", quote="ZUSD",
-        lot_decimals=5, pair_decimals=3,
-        order_min=Decimal("0.1"), cost_min=Decimal("0.5"), status="online",
+        key="KAITOZUSD", altname="KAITOUSD", wsname="KAITO/USD",
+        base="KAITO", quote="ZUSD",
+        lot_decimals=2, pair_decimals=4,
+        order_min=Decimal("1"), cost_min=Decimal("0.5"), status="online",
     )
 
 
@@ -86,12 +86,14 @@ def _gateway_with_meta(settings: Settings, meta: dict[str, SymbolMeta]) -> Krake
 def test_btc_is_primary_symbol_and_full_basket_enabled():
     s = make_settings()
     assert s.symbol == "BTC/USD"
-    # Small-cap rotation preserved; BTC/SOL/XRP all present.
+    # Small-cap rotation preserved; BTC is master, new alts enabled.
     assert "XRP/USD" in s.fallback_symbols
-    assert "SOL/USD" in s.fallback_symbols
-    assert "ADA/USD" in s.fallback_symbols
-    assert "DOGE/USD" in s.fallback_symbols
     assert "TRX/USD" in s.fallback_symbols
+    assert "DOGE/USD" in s.fallback_symbols
+    assert "PUMP/USD" in s.fallback_symbols
+    assert "KAITO/USD" in s.fallback_symbols
+    assert "UNI/USD" in s.fallback_symbols
+    assert "JTO/USD" in s.fallback_symbols
     assert "HYPE/USD" in s.fallback_symbols
 
 
@@ -107,13 +109,13 @@ def test_btc_usd_alias_resolves_to_xbtusd():
     assert meta.base == "XBT"
 
 
-def test_sol_usd_resolves_to_kraken_pair():
-    s = make_settings(symbol="SOL/USD")
-    gw = _gateway_with_meta(s, {"SOLUSD": _meta_sol()})
+def test_kaito_usd_resolves_to_kraken_pair():
+    s = make_settings(symbol="KAITO/USD")
+    gw = _gateway_with_meta(s, {"KAITOZUSD": _meta_kaito()})
     meta = gw.resolve_symbol()
-    assert meta.key == "SOLUSD"
-    assert meta.altname == "SOLUSD"
-    assert meta.base == "SOL"
+    assert meta.key == "KAITOZUSD"
+    assert meta.altname == "KAITOUSD"
+    assert meta.base == "KAITO"
 
 
 def test_xrp_usd_resolves_to_kraken_pair():
@@ -129,11 +131,11 @@ def test_all_basket_symbols_resolve_against_loaded_metadata():
     """Every enabled basket symbol resolves to authoritative metadata."""
     meta = {
         "XXBTZUSD": _meta_btc(),
-        "SOLUSD": _meta_sol(),
+        "KAITOZUSD": _meta_kaito(),
         "XRPZUSD": _meta_xrp(),
     }
-    for display in ["BTC/USD", "SOL/USD", "XRP/USD",
-                    "ADA/USD", "DOGE/USD", "TRX/USD", "HYPE/USD"]:
+    for display in ["BTC/USD", "KAITO/USD", "XRP/USD",
+                    "PUMP/USD", "DOGE/USD", "TRX/USD", "HYPE/USD"]:
         s = make_settings(symbol=display)
         gw = _gateway_with_meta(s, meta)
         # Unconfigured symbols have no metadata here; only the three with
@@ -155,11 +157,11 @@ def test_per_asset_precision_and_minimum_sizing():
     assert btc.volume == Decimal("0.00050000")
     assert btc.volume >= _meta_btc().order_min
 
-    # SOL: $25 / $150 = 0.1667 SOL, rounded down to 5 lot decimals.
-    sol = size_order(25.0, 150.0, _meta_sol().to_precision())
-    assert sol.pair == "SOLUSD"
-    assert sol.volume == Decimal("0.16666")
-    assert sol.volume >= _meta_sol().order_min
+    # KAITO: $25 / $1.50 = 16.67 KAITO, rounded down to 2 lot decimals.
+    kaito = size_order(25.0, 1.50, _meta_kaito().to_precision())
+    assert kaito.pair == "KAITOZUSD"
+    assert kaito.volume == Decimal("16.66")
+    assert kaito.volume >= _meta_kaito().order_min
 
     # XRP: $25 / $0.50 = 50 XRP, rounded down to 6 lot decimals.
     xrp = size_order(25.0, 0.50, _meta_xrp().to_precision())
@@ -176,11 +178,11 @@ def test_per_asset_minimum_enforced_below_ordermin():
 
 def test_gateway_size_buy_uses_canonical_pair_precision():
     """Gateway sizes against the resolved pair's precision, not string rules."""
-    s = make_settings(symbol="SOL/USD")
-    gw = _gateway_with_meta(s, {"SOLUSD": _meta_sol()})
-    sized = gw.size_buy(25.0, price=150.0)
-    assert sized.pair == "SOLUSD"
-    assert sized.volume >= _meta_sol().order_min
+    s = make_settings(symbol="KAITO/USD")
+    gw = _gateway_with_meta(s, {"KAITOZUSD": _meta_kaito()})
+    sized = gw.size_buy(25.0, price=1.50)
+    assert sized.pair == "KAITOZUSD"
+    assert sized.volume >= _meta_kaito().order_min
 
 
 def test_affordability_probe_restores_symbol_after_sizing_failure(tmp_path):
@@ -195,7 +197,7 @@ def test_affordability_probe_restores_symbol_after_sizing_failure(tmp_path):
     gateway.size_buy.side_effect = PrecisionError("below Kraken minimum")
     engine = TradingEngine(s, gateway=gateway)
 
-    assert engine._can_size("SOL/USD", 2.0) is False
+    assert engine._can_size("KAITO/USD", 2.0) is False
     assert s.symbol == "BTC/USD"
 
 
@@ -211,14 +213,14 @@ def test_risk_manager_is_symbol_agnostic_single_budget():
     )
 
     decisions = {}
-    for sym in ["BTC/USD", "SOL/USD", "XRP/USD"]:
+    for sym in ["BTC/USD", "KAITO/USD", "XRP/USD"]:
         s = make_settings(symbol=sym)
         rm = RiskManager(s)
         decisions[sym] = rm.evaluate(signal, state, open_exposure_usd=0.0)
 
     budget = {sym: d.notional_usd for sym, d in decisions.items()}
     # All three resolve to the identical aggregate notional.
-    assert budget["BTC/USD"] == budget["SOL/USD"] == budget["XRP/USD"]
+    assert budget["BTC/USD"] == budget["KAITO/USD"] == budget["XRP/USD"]
     assert decisions["BTC/USD"].approved is True
 
 

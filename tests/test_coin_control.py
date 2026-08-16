@@ -65,8 +65,8 @@ def test_allowed_symbols_is_canonical_basket_ignoring_current_selection(tmp_path
     allowed = settings.allowed_symbols
     # canonical order preserved, deduped
     assert allowed == [
-        "BTC/USD", "SOL/USD", "XRP/USD", "ADA/USD",
-        "DOGE/USD", "TRX/USD", "HYPE/USD",
+        "BTC/USD", "XRP/USD", "TRX/USD", "DOGE/USD",
+        "PUMP/USD", "KAITO/USD", "UNI/USD", "JTO/USD", "HYPE/USD",
     ]
     assert len(allowed) == len(set(allowed))
     # BTC/USD is in the basket even though it is not a "fallback" coin and is
@@ -74,18 +74,18 @@ def test_allowed_symbols_is_canonical_basket_ignoring_current_selection(tmp_path
     assert "BTC/USD" in allowed
 
 
-def test_selecting_sol_keeps_btc_allowed(tmp_path):
-    """Regression: pinning SOL/USD must not drop BTC/USD from the basket."""
+def test_selecting_kaito_keeps_btc_allowed(tmp_path):
+    """Regression: pinning KAITO/USD must not drop BTC/USD from the basket."""
     settings = make_settings(tmp_path)
-    result = apply_coin_control(settings, {"symbol": "SOL/USD"})
+    result = apply_coin_control(settings, {"symbol": "KAITO/USD"})
     assert result["ok"] is True
-    assert settings.symbol == "SOL/USD"
+    assert settings.symbol == "KAITO/USD"
     assert "BTC/USD" in settings.allowed_symbols
-    assert "SOL/USD" in settings.allowed_symbols
+    assert "KAITO/USD" in settings.allowed_symbols
     # basket is unchanged by selection
     assert settings.allowed_symbols == [
-        "BTC/USD", "SOL/USD", "XRP/USD", "ADA/USD",
-        "DOGE/USD", "TRX/USD", "HYPE/USD",
+        "BTC/USD", "XRP/USD", "TRX/USD", "DOGE/USD",
+        "PUMP/USD", "KAITO/USD", "UNI/USD", "JTO/USD", "HYPE/USD",
     ]
 
 
@@ -124,10 +124,10 @@ def test_valid_selection_places_no_order(tmp_path, monkeypatch):
 
 def test_manual_selection_disables_rotation_and_toggle_reenables(tmp_path):
     settings = make_settings(tmp_path)
-    manual = apply_coin_control(settings, {"symbol": "SOL/USD"})
+    manual = apply_coin_control(settings, {"symbol": "KAITO/USD"})
     assert manual["auto_rotation"] is False
     assert manual["mode"] == "manual"
-    assert settings.preferred_symbol == "SOL/USD"
+    assert settings.preferred_symbol == "KAITO/USD"
 
     auto = apply_coin_control(settings, {"auto_rotation": True})
     assert auto["auto_rotation"] is True

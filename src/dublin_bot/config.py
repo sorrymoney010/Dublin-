@@ -6,16 +6,18 @@ from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Canonical tradeable basket. Fixed and independent of the *currently selected*
-# coin: BTC/USD is always allowed even though it is not a "fallback" coin, so it
-# never disappears when the operator pins SOL/USD (or any other coin). Order is
-# stable; ``allowed_symbols`` dedupes but preserves this canonical ordering.
+# coin: BTC/USD is the master coin (always first/allowed) so it never disappears
+# when the operator pins another coin. Order is stable; ``allowed_symbols``
+# dedupes but preserves this canonical ordering.
 DEFAULT_COIN_BASKET: tuple[str, ...] = (
-    "BTC/USD",
-    "SOL/USD",
+    "BTC/USD",       # master coin
     "XRP/USD",
-    "ADA/USD",
-    "DOGE/USD",
     "TRX/USD",
+    "DOGE/USD",
+    "PUMP/USD",
+    "KAITO/USD",
+    "UNI/USD",       # Uniswap
+    "JTO/USD",       # Jito
     "HYPE/USD",
 )
 
@@ -70,7 +72,7 @@ class Settings(BaseSettings):
     # When the real account balance is too small to trade the configured symbol
     # at the minimum notional, automatically fall back to a cheaper allowed coin.
     auto_cheaper_symbol: bool = Field(default=True)
-    fallback_symbols: list[str] = Field(default_factory=lambda: ["XRP/USD", "ADA/USD", "DOGE/USD", "SOL/USD", "TRX/USD", "HYPE/USD"])
+    fallback_symbols: list[str] = Field(default_factory=lambda: ["XRP/USD", "TRX/USD", "DOGE/USD", "PUMP/USD", "KAITO/USD", "UNI/USD", "JTO/USD", "HYPE/USD"])
     # Canonical, always-allowed basket. Defaults to DEFAULT_COIN_BASKET and is
     # intentionally independent of the mutable ``symbol`` selection, so BTC/USD
     # (and the rest of the basket) is never lost when a different coin is pinned.
