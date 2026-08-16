@@ -130,6 +130,16 @@ class TradingEngine:
         (e.g. ADA/DOGE need a bigger ticket) are skipped until the account grows.
         """
         s = self.settings
+        if not getattr(s, "auto_symbol_rotation", True):
+            # Manual mode: the operator pinned a coin — never rotate away from it.
+            preferred = str(getattr(s, "preferred_symbol", "") or s.symbol).strip().upper()
+            if preferred and preferred in s.allowed_symbols and preferred != s.symbol:
+                s.symbol = preferred
+                self.audit.record(
+                    AuditEvent.SIGNAL,
+                    {"event": "symbol_manual_lock", "symbol": preferred},
+                )
+            return
         equity = self.gateway.account_equity()
         cap = equity * s.max_position_fraction
         candidates = [s.symbol] + list(s.fallback_symbols)

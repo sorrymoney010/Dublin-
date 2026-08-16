@@ -1,8 +1,23 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Canonical tradeable basket. Fixed and independent of the *currently selected*
+# coin: BTC/USD is always allowed even though it is not a "fallback" coin, so it
+# never disappears when the operator pins SOL/USD (or any other coin). Order is
+# stable; ``allowed_symbols`` dedupes but preserves this canonical ordering.
+DEFAULT_COIN_BASKET: tuple[str, ...] = (
+    "BTC/USD",
+    "SOL/USD",
+    "XRP/USD",
+    "ADA/USD",
+    "DOGE/USD",
+    "TRX/USD",
+    "HYPE/USD",
+)
 
 
 class Settings(BaseSettings):
@@ -54,6 +69,16 @@ class Settings(BaseSettings):
     # at the minimum notional, automatically fall back to a cheaper allowed coin.
     auto_cheaper_symbol: bool = Field(default=True)
     fallback_symbols: list[str] = Field(default_factory=lambda: ["XRP/USD", "ADA/USD", "DOGE/USD", "SOL/USD", "TRX/USD", "HYPE/USD"])
+    # Canonical, always-allowed basket. Defaults to DEFAULT_COIN_BASKET and is
+    # intentionally independent of the mutable ``symbol`` selection, so BTC/USD
+    # (and the rest of the basket) is never lost when a different coin is pinned.
+    coin_basket: list[str] = Field(default_factory=lambda: list(DEFAULT_COIN_BASKET))
+    # ── Coin control (user-selected coin / rotation mode) ───
+    # preferred_symbol is the coin the operator pinned from the dashboard. When
+    # auto_symbol_rotation is False the engine keeps it and never rotates away.
+    preferred_symbol: str = "BTC/USD"
+    auto_symbol_rotation: bool = Field(default=True)
+    coin_control_path: Path = Path("logs/coin_control.json")
     # Margin (leveraged) trading. OFF by default — spot only. When enabled the
     # gateway submits margin orders and tracks positions via OpenPositions. Kraken
     # can force-liquidate a margin position, so the exposure cap is tightened and
@@ -100,6 +125,54 @@ class Settings(BaseSettings):
     @property
     def has_credentials(self) -> bool:
         return bool(self.kraken_api_key and self.kraken_api_secret)
+
+    @property
+    def allowed_symbols(self) -> list[str]:
+        """Deduplicated tradeable basket — fixed and independent of selection.
+
+        Derived from the canonical ``coin_basket`` (which always contains
+        BTC/USD, SOL/USD, XRP/USD, ADA/USD, DOGE/USD, TRX/USD, HYPE/USD) so the
+        basket never changes when the operator pins a different coin.
+        """
+        ordered: list[str] = []
+        for sym in self.coin_basket:
+            sym = str(sym).strip().upper()
+            if sym and sym not in ordered:
+                ordered.append(sym)
+        return ordered
+
+    # ── coin-control persistence (non-secret only) ──────────
+
+    def coin_control_state(self) -> dict[str, object]:
+        return {
+            "preferred_symbol": self.preferred_symbol,
+            "auto_symbol_rotation": self.auto_symbol_rotation,
+        }
+
+    def save_coin_control(self) -> dict[str, object]:
+        """Persist ONLY the non-secret coin-control preferences to disk."""
+        state = self.coin_control_state()
+        path = Path(self.coin_control_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        return state
+
+    def load_coin_control(self) -> dict[str, object]:
+        """Restore persisted coin-control preferences, ignoring unknown coins."""
+        path = Path(self.coin_control_path)
+        if not path.exists():
+            return self.coin_control_state()
+        try:
+            stored = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return self.coin_control_state()
+        symbol = str(stored.get("preferred_symbol", "")).strip().upper()
+        if symbol and symbol in self.allowed_symbols:
+            self.preferred_symbol = symbol
+            self.symbol = symbol
+        if isinstance(stored.get("auto_symbol_rotation"), bool):
+            self.auto_symbol_rotation = stored["auto_symbol_rotation"]
+        return self.coin_control_state()
 
     @property
     def safety_locked(self) -> bool:
