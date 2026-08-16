@@ -54,7 +54,9 @@ class Settings(BaseSettings):
     live_risk_acknowledgement: str = ""
 
     symbol: str = "BTC/USD"
-    timeframe_minutes: int = Field(default=30, ge=1)
+    # Rapid mode: 15-minute bars, 15-minute monitor cadence, and a 15-minute
+    # cooldown between entries. Strategy RSI/momentum gates are NOT loosened.
+    timeframe_minutes: int = Field(default=15, ge=1)
     lookback_bars: int = Field(default=500, ge=220)
     strategy_equity_usd: float = Field(default=25.0, ge=25.0)
     # Auto-scale risk per trade based on session win/loss streak. The base risk
@@ -92,8 +94,11 @@ class Settings(BaseSettings):
     max_daily_loss_fraction: float = Field(default=0.03, gt=0, le=0.05)
     max_drawdown_fraction: float = Field(default=0.10, gt=0, le=0.20)
     max_orders_per_day: int = Field(default=3, ge=1, le=10)
-    cooldown_minutes: int = Field(default=60, ge=0)
-    monitor_interval_seconds: int = Field(default=1800, ge=60, le=86400)
+    cooldown_minutes: int = Field(default=15, ge=0)
+    monitor_interval_seconds: int = Field(default=900, ge=60, le=86400)
+    # Rapid mode flag (status only). Does not loosen strategy RSI/momentum or
+    # any risk/loss/exposure threshold — it only selects the faster cadence above.
+    rapid_mode: bool = Field(default=True)
 
     fast_ema: int = Field(default=20, ge=2)
     slow_ema: int = Field(default=50, ge=3)
@@ -178,6 +183,13 @@ class Settings(BaseSettings):
     def safety_locked(self) -> bool:
         """True when all three independent locks forbid real-money execution."""
         return self.paper_trading and self.dry_run and not self.allow_live_trading
+
+    @property
+    def active_mode(self) -> str:
+        """Human-readable active execution mode: 'live' or 'paper'."""
+        if self.allow_live_trading and not self.paper_trading and not self.dry_run:
+            return "live"
+        return "paper"
 
     def safety_report(self) -> dict[str, object]:
         """Credential-free summary suitable for logs, audit, and the dashboard."""

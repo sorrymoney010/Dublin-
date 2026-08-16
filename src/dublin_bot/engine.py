@@ -363,10 +363,12 @@ class TradingEngine:
                 bar_timestamp=bar_timestamp, state=state, gates=gates,
                 leverage=leverage,
             )
-        elif signal.action is Action.SELL and in_position:
+        elif signal.action is Action.SELL and in_position and risk.approved:
+            # Exits use the risk manager's verdict (approved for SELL, never
+            # blocked by entry breakers). Position existence, idempotency,
+            # precision, and gateway safety are still enforced in _execute.
             order_id, risk = self._execute(
-                side="sell", notional=0.0,
-                risk=RiskDecision(True, "Exit signal approved"),
+                side="sell", notional=0.0, risk=risk,
                 bar_timestamp=bar_timestamp, state=state, gates=gates,
                 leverage=leverage,
             )

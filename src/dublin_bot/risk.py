@@ -55,6 +55,12 @@ class RiskManager:
     def evaluate(self, signal: Signal, state: SessionState, open_exposure_usd: float = 0.0) -> RiskDecision:
         s = self.settings
         equity = max(state.current_equity, 0.0) or s.strategy_equity_usd
+        # Exits (SELL) from an existing position are gated only by the signal
+        # action and the engine's position/idempotency/gateway checks — NOT by
+        # the entry breakers below. A trapped position must always be free to
+        # exit regardless of cooldown, daily order cap, daily-loss, or drawdown.
+        if signal.action is Action.SELL:
+            return RiskDecision(True, "Exit signal approved")
         if signal.action is not Action.BUY:
             return RiskDecision(False, "No entry order requested")
         if state.realized_pnl_today <= -(equity * s.max_daily_loss_fraction):

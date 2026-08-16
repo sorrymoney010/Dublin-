@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from dublin_bot.config import Settings
 from dublin_bot.models import Action, Signal
 from dublin_bot.risk import RiskManager, SessionState
@@ -28,3 +30,60 @@ def test_daily_loss_breaker_blocks_entry():
     assert decision.approved is False
     assert "Daily loss" in decision.reason
 
+
+def test_sell_exit_approved_while_buy_blocked_by_cooldown():
+    """A SELL exit must NOT be blocked by the entry cooldown."""
+    settings = Settings(_env_file=None)
+    manager = RiskManager(settings)
+    sell = Signal(Action.SELL, 90, "Price closed below slow trend EMA", 100.0, 2.0)
+    buy = Signal(Action.BUY, 100, "test", price=100.0, atr=2.0, stop_price=98.0)
+    # Fresh order just happened → cooldown active now.
+    state = SessionState(
+        start_equity=25.0, peak_equity=25.0, current_equity=25.0,
+        orders_today=0,
+        last_order_at=datetime.now(timezone.utc),
+    )
+    blocked_buy = manager.evaluate(buy, state)
+    approved_sell = manager.evaluate(sell, state)
+    assert blocked_buy.approved is False
+    assert "cooldown" in blocked_buy.reason.lower()
+    assert approved_sell.approved is True
+    assert "Exit signal approved" in approved_sell.reason
+
+
+def test_sell_exit_approved_while_buy_blocked_by_order_cap():
+    """A SELL exit must NOT be blocked by the daily max-orders cap."""
+    settings = Settings(_env_file=None)
+    manager = RiskManager(settings)
+    sell = Signal(Action.SELL, 90, "Price closed below slow trend EMA", 100.0, 2.0)
+    buy = Signal(Action.BUY, 100, "test", price=100.0, atr=2.0, stop_price=98.0)
+    # Daily order cap already reached.
+    state = SessionState(
+        start_equity=25.0, peak_equity=25.0, current_equity=25.0,
+        orders_today=settings.max_orders_per_day,
+        last_order_at=None,
+    )
+    blocked_buy = manager.evaluate(buy, state)
+    approved_sell = manager.evaluate(sell, state)
+    assert blocked_buy.approved is False
+    assert "order limit" in blocked_buy.reason.lower()
+    assert approved_sell.approved is True
+    assert "Exit signal approved" in approved_sell.reason
+
+
+def test_sell_exit_approved_while_buy_blocked_by_daily_loss_and_drawdown():
+    """A SELL exit must NOT be blocked by daily-loss or drawdown breakers."""
+    settings = Settings(_env_file=None)
+    manager = RiskManager(settings)
+    sell = Signal(Action.SELL, 90, "Price closed below slow trend EMA", 100.0, 2.0)
+    buy = Signal(Action.BUY, 100, "test", price=100.0, atr=2.0, stop_price=98.0)
+    state = SessionState(
+        start_equity=25.0, peak_equity=100.0, current_equity=20.0,
+        realized_pnl_today=-5.0,  # > 3% daily-loss and > 10% drawdown
+        orders_today=0, last_order_at=None,
+    )
+    blocked_buy = manager.evaluate(buy, state)
+    approved_sell = manager.evaluate(sell, state)
+    assert blocked_buy.approved is False
+    assert approved_sell.approved is True
+    assert "Exit signal approved" in approved_sell.reason

@@ -100,8 +100,11 @@ Hard ceilings enforced by pydantic validators — configuration cannot exceed th
 | Orders per day | 3 | 10 |
 | Strategy equity | $25 | floor $25 |
 
-Plus: 60-minute cooldown between entries, and a stop-distance requirement
-(an entry with no valid stop is rejected).
+Plus: 15-minute cooldown between entries (rapid mode), and a stop-distance
+requirement (an entry with no valid stop is rejected). Risk/loss/exposure
+ceilings are unchanged. SELL exits from an existing position are never blocked
+by the cooldown, daily order cap, daily-loss, or drawdown entry breakers — a
+trapped position is always free to exit.
 
 ---
 

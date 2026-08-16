@@ -184,10 +184,12 @@ def test_engine_rotates_when_auto_rotation_enabled(tmp_path):
 def test_coin_control_reports_speed_and_risk_posture(tmp_path):
     settings = make_settings(tmp_path)
     data = coin_control_data(settings)
-    assert data["timeframe_minutes"] == 30
-    assert data["cadence_minutes"] == 30
-    assert data["cooldown_minutes"] == 60
+    assert data["timeframe_minutes"] == 15
+    assert data["cadence_minutes"] == 15
+    assert data["cooldown_minutes"] == 15
     assert data["max_orders_per_day"] == 3
+    assert data["rapid_mode"] is True
+    assert data["active_mode"] == "paper"
     assert data["risk_per_trade"] == pytest.approx(0.01)
     assert data["allowed_symbols"] == settings.allowed_symbols
 

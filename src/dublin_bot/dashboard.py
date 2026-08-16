@@ -351,10 +351,18 @@ def suggestions_to_actions(suggestions: list) -> list[dict]:
     return [{"text": s.rationale, "parameter": s.parameter} for s in suggestions]
 
 
-class PaperMonitor:
+class TradingMonitor:
+    """The auto-cycling decision loop (formerly ``PaperMonitor``).
+
+    Runs the engine on a cadence and fires alerts on BUY/SELL. Executes only
+    what the engine permits for the active mode — nothing here places an order
+    on its own. The ``PaperMonitor`` name is retained as a backwards-compatible
+    alias.
+    """
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.interval_seconds = int(getattr(settings, "monitor_interval_seconds", 1800))
+        self.interval_seconds = int(getattr(settings, "monitor_interval_seconds", 900))
         self.stop_event = Event()
         self.thread: Thread | None = None
         self.last_run: str | None = None
@@ -362,8 +370,17 @@ class PaperMonitor:
         self.last_error: str | None = None
 
     def status(self) -> dict[str, object]:
+        s = self.settings
+        live = bool(s.allow_live_trading and not s.paper_trading and not s.dry_run)
         return {
             "running": self.thread is not None and self.thread.is_alive(),
+            "mode": "live" if live else "paper",
+            "rapid_mode": bool(getattr(s, "rapid_mode", True)),
+            "order_submission_enabled": live,
+            "timeframe_minutes": int(getattr(s, "timeframe_minutes", 15)),
+            "cadence_minutes": int(self.interval_seconds // 60),
+            "cooldown_minutes": int(getattr(s, "cooldown_minutes", 15)),
+            "max_orders_per_day": int(getattr(s, "max_orders_per_day", 3)),
             "interval_seconds": self.interval_seconds,
             "last_run": self.last_run,
             "last_action": self.last_action,
@@ -374,7 +391,7 @@ class PaperMonitor:
         if self.thread is not None and self.thread.is_alive():
             return
         self.stop_event.clear()
-        self.thread = Thread(target=self._loop, daemon=True, name="dublin-paper-monitor")
+        self.thread = Thread(target=self._loop, daemon=True, name="dublin-trading-monitor")
         self.thread.start()
 
     def stop(self) -> None:
@@ -407,6 +424,10 @@ class PaperMonitor:
             self.start()
 
 
+# Backwards-compatible alias — callers importing PaperMonitor keep working.
+PaperMonitor = TradingMonitor
+
+
 def safety_status(settings: Settings) -> dict[str, object]:
     locked = settings.paper_trading and settings.dry_run and not settings.allow_live_trading
     return {
@@ -422,6 +443,8 @@ def safety_status(settings: Settings) -> dict[str, object]:
         "max_daily_loss_fraction": settings.max_daily_loss_fraction,
         "max_drawdown_fraction": settings.max_drawdown_fraction,
         "max_orders_per_day": settings.max_orders_per_day,
+        "active_mode": settings.active_mode,
+        "rapid_mode": bool(getattr(settings, "rapid_mode", True)),
     }
 
 
@@ -442,6 +465,8 @@ def coin_control_data(settings: Settings) -> dict[str, object]:
         "cadence_minutes": int(settings.monitor_interval_seconds // 60),
         "cooldown_minutes": settings.cooldown_minutes,
         "max_orders_per_day": settings.max_orders_per_day,
+        "rapid_mode": bool(getattr(settings, "rapid_mode", True)),
+        "active_mode": settings.active_mode,
         "risk_per_trade": settings.risk_per_trade,
         "max_position_fraction": settings.max_position_fraction,
         "max_daily_loss_fraction": settings.max_daily_loss_fraction,
@@ -552,6 +577,18 @@ def recent_activity(path, limit: int = 30) -> list[dict[str, object]]:
         except json.JSONDecodeError:
             continue
     return records
+
+
+def last_wait_reason(settings: Settings) -> str | None:
+    """Most recent WAIT signal reason from the decision journal, if any."""
+    try:
+        for entry in recent_activity(settings.journal_path, limit=50):
+            sig = entry.get("signal") or {}
+            if sig.get("action") == "WAIT" and sig.get("reason"):
+                return str(sig["reason"])
+    except Exception:
+        return None
+    return None
 
 
 def market_snapshot(settings: Settings) -> dict[str, object]:
@@ -1174,14 +1211,14 @@ nav button.on{color:var(--cyan)}
       <div class="sub" id="krakenAssets">real account · read-only</div>
     </div>
     <div class="card m4">
-      <div class="label">Paper Engine Equity</div>
-      <div class="value" id="paperEquity">—</div>
-      <div class="sub">cash <span id="paperCash">—</span> · sim only</div>
-    </div>
-    <div class="card m4">
       <div class="label">Realized P&amp;L (est.)</div>
       <div class="value" id="realizedPnl">—</div>
       <div class="sub" id="realizedNote">from Kraken trade history</div>
+    </div>
+    <div class="card m4">
+      <div class="label">Active Mode</div>
+      <div class="value" id="activeMode">—</div>
+      <div class="sub" id="rapidMode">—</div>
     </div>
 
     <div class="card m8">
@@ -1205,12 +1242,12 @@ nav button.on{color:var(--cyan)}
     </div>
 
     <div class="card m6">
-      <div class="label">Open Positions (paper)</div>
-      <div id="positions"><div class="empty">no open positions</div></div>
-    </div>
-    <div class="card m6">
       <div class="label">Open Orders (Kraken)</div>
       <div id="orders"><div class="empty">no open orders</div></div>
+    </div>
+    <div class="card m6">
+      <div class="label">Last WAIT Reason</div>
+      <div class="sub muted" id="waitReason" style="line-height:1.4">—</div>
     </div>
   </div>
 </section>
@@ -1238,6 +1275,21 @@ nav button.on{color:var(--cyan)}
       </table></div>
       <div class="empty" id="tradesEmpty" style="display:none">no trades found on this Kraken account</div>
     </div>
+  </div>
+</section>
+
+<!-- ============ SIMULATION ============ -->
+<section class="view" id="v-sim">
+  <div class="grid">
+    <div class="card m4">
+      <div class="label">Paper Engine Equity</div>
+      <div class="value" id="paperEquity">—</div>
+      <div class="sub">cash <span id="paperCash">—</span> · sim only</div>
+    </div>
+    <div class="card m8">
+      <div class="label">Open Positions (paper)</div>
+      <div id="positions"><div class="empty">no open positions</div></div>
+    </div>
     <div class="card m12">
       <div class="label">Bot Decision Journal (paper)</div>
       <div id="journal"><div class="empty">no decisions logged yet — run a cycle</div></div>
@@ -1249,7 +1301,7 @@ nav button.on{color:var(--cyan)}
 <section class="view" id="v-bot">
   <div class="grid">
     <div class="card m12">
-      <div class="label">Trading Bot — Live Control</div>
+      <div class="label">Trading Bot — Monitor Control</div>
       <div class="row"><span class="rl">Mode</span><span class="rv" id="monMode">live</span></div>
       <div class="row"><span class="rl">Status</span><span class="rv" id="monStatus">—</span></div>
       <div class="row"><span class="rl">Last run</span><span class="rv" id="monLast">—</span></div>
@@ -1353,6 +1405,7 @@ nav button.on{color:var(--cyan)}
   <button class="on" data-v="v-overview"><span class="ic">◧</span>Overview</button>
   <button data-v="v-markets"><span class="ic">⌗</span>Markets</button>
   <button data-v="v-trades"><span class="ic">⇄</span>Trades</button>
+  <button data-v="v-sim"><span class="ic">▦</span>Simulation</button>
   <button data-v="v-bot"><span class="ic">▶</span>Bot</button>
   <button data-v="v-coin"><span class="ic">◎</span>Coin</button>
   <button data-v="v-system"><span class="ic">⚙</span>System</button>
@@ -1518,9 +1571,10 @@ function priceChart(closes, volumes){
 /* --- renderers --- */
 function renderOverview(d){
   const st=d.status||{}, mk=d.market||{}, pf=d.portfolio||{};
-  // kraken real equity comes from separate endpoint; paper here
-  $("paperEquity").textContent = fmt$(pf.equity);
-  $("paperCash").textContent = fmt$(pf.cash);
+  // Active mode + last WAIT reason (exposed telemetry)
+  $("activeMode").textContent = (st.active_mode||"paper").toUpperCase();
+  $("rapidMode").textContent = st.rapid_mode ? "rapid mode · 15m bars" : "standard mode";
+  $("waitReason").textContent = d.last_wait_reason || "—";
   $("priceNow").textContent = fmt$(mk.price);
   $("chartPair").textContent = st.symbol || "—";
   const chg = mk.change_percent;
@@ -1528,40 +1582,45 @@ function renderOverview(d){
   pc.textContent = fmtP(chg);
   pc.className = "pill " + (chg>0?"lime":chg<0?"red":"cyan");
   $("priceChart").innerHTML = priceChart(mk.closes, mk.volumes);
-  // positions
-  const pos = pf.positions||[];
-  $("positions").innerHTML = pos.length ? pos.map(p=>
-    `<div class="row"><span class="rl">${p.symbol||""} · ${p.quantity??""}</span>
-     <span class="rv ${cls(p.unrealized_pl)}">${fmt$(p.unrealized_pl)}</span></div>`).join("")
-    : '<div class="empty">no open positions</div>';
   const ords = pf.orders||[];
   $("orders").innerHTML = ords.length ? ords.map(o=>
     `<div class="row"><span class="rl">${o.side||""} ${o.symbol||""}</span>
      <span class="rv">${o.status||""}</span></div>`).join("")
     : '<div class="empty">no open orders</div>';
-  // journal (trades tab)
-  const act = d.activity||[];
-  $("journal").innerHTML = act.length ? act.slice(0,15).map(a=>{
-    const s=a.signal||{};
-    return `<div class="row"><span class="rl">${shortTs(a.timestamp)}</span>
-      <span class="rv ${s.action==="BUY"?"lime":s.action==="SELL"?"red":""}">${s.action||"—"} · ${s.score??""}</span></div>`;
-  }).join("") : '<div class="empty">no decisions logged yet — run a cycle</div>';
   // monitor
   try {
     const m=d.monitor||{};
     const running = !!m.running;
     const ms=$("monStatus");
     if (ms) ms.innerHTML = running?'<span class="pill lime">RUNNING</span>':'<span class="pill">STOPPED</span>';
+    const mm=$("monMode");
+    if (mm) mm.textContent = (m.mode==="live"?"live":"paper");
     if ($("monLast")) $("monLast").textContent = shortTs(m.last_run);
     if ($("monAction")) $("monAction").textContent = m.last_action||"—";
     if ($("monSymbol")) $("monSymbol").textContent = (d.status&&d.status.symbol)||"—";
-    const sec = m.interval_seconds||1800;
+    const sec = m.interval_seconds||900;
     if ($("monIvl")){ $("monIvl").textContent = (sec/60)+"m"; $("monIvl").dataset.sec = sec; }
     const errEl=$("monError");
     if (errEl){ if(m.last_error){ errEl.style.display="block"; errEl.textContent="last cycle error: "+m.last_error; } else { errEl.style.display="none"; } }
     const btn=$("btnStart");
     if (btn) btn.textContent = running ? "■ Stop Trading" : "▶ Start Trading";
   } catch(e){ console.error("monitor render failed", e); }
+}
+
+function renderSimulation(d){
+  const pf=d.portfolio||{}, act=d.activity||[];
+  $("paperEquity").textContent = fmt$(pf.equity);
+  $("paperCash").textContent = fmt$(pf.cash);
+  const pos = pf.positions||[];
+  $("positions").innerHTML = pos.length ? pos.map(p=>
+    `<div class="row"><span class="rl">${p.symbol||""} · ${p.quantity??""}</span>
+     <span class="rv ${cls(p.unrealized_pl)}">${fmt$(p.unrealized_pl)}</span></div>`).join("")
+    : '<div class="empty">no open positions</div>';
+  $("journal").innerHTML = act.length ? act.slice(0,15).map(a=>{
+    const s=a.signal||{};
+    return `<div class="row"><span class="rl">${shortTs(a.timestamp)}</span>
+      <span class="rv ${s.action==="BUY"?"lime":s.action==="SELL"?"red":""}">${s.action||"—"} · ${s.score??""}</span></div>`;
+  }).join("") : '<div class="empty">no decisions logged yet — run a cycle</div>';
 }
 
 function renderKraken(b){
@@ -1687,6 +1746,7 @@ async function refresh(){
   try{
     ov = await getJSON("/api/overview");
     renderOverview(ov);
+    renderSimulation(ov);
     connOk();
   }catch(e){ connFail(); return; }
   const urls = ["/api/kraken/balances","/api/kraken/trades","/api/scanner","/api/strategy",
@@ -1732,6 +1792,7 @@ def make_handler(settings: Settings, monitor: PaperMonitor) -> type[BaseHTTPRequ
             "health": health_snapshot(settings),
             "audit": audit_summary(settings, limit=12),
             "coin_control": coin_control_data(settings),
+            "last_wait_reason": last_wait_reason(settings),
         }
 
     GET_ROUTES = {
@@ -1802,11 +1863,11 @@ def make_handler(settings: Settings, monitor: PaperMonitor) -> type[BaseHTTPRequ
                 elif path == "/api/monitor/start":
                     monitor.start()
                     ntfy_alert("Dublin monitor started",
-                               f"Paper cycle every {monitor.interval_seconds // 60}m on {settings.symbol}")
+                               f"Cycle every {monitor.interval_seconds // 60}m on {settings.symbol}")
                     self.send_json(monitor.status())
                 elif path == "/api/monitor/stop":
                     monitor.stop()
-                    ntfy_alert("Dublin monitor stopped", "Paper monitor halted from dashboard")
+                    ntfy_alert("Dublin monitor stopped", "Monitor halted from dashboard")
                     self.send_json(monitor.status())
                 elif path == "/api/emergency-stop/activate":
                     activate_emergency_stop()
@@ -1857,7 +1918,7 @@ def serve_dashboard(settings: Settings, run: bool = True) -> int:
     settings.load_coin_control()
     if not run:
         return 0
-    monitor = PaperMonitor(settings)
+    monitor = TradingMonitor(settings)
     server = ThreadingHTTPServer((HOST, PORT), make_handler(settings, monitor))
     print(f"Dublin Terminal v2: http://{HOST}:{PORT}")
     print("Press Control-C to stop.")
