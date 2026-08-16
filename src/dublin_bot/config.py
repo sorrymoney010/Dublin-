@@ -96,7 +96,9 @@ class Settings(BaseSettings):
     max_exposure_fraction: float = Field(default=0.5, gt=0, le=1.0)
     max_daily_loss_fraction: float = Field(default=0.03, gt=0, le=0.05)
     max_drawdown_fraction: float = Field(default=0.10, gt=0, le=0.20)
-    max_orders_per_day: int = Field(default=3, ge=1, le=10)
+    # Daily order cap. Set to 0 for unlimited orders per day (cooldown still
+    # applies between entries). Bounded at 10 when a cap is used.
+    max_orders_per_day: int = Field(default=0, ge=0, le=10)
     cooldown_minutes: int = Field(default=15, ge=0)
     monitor_interval_seconds: int = Field(default=900, ge=60, le=86400)
     # Rapid mode flag (status only). Does not loosen strategy RSI/momentum or

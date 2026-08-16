@@ -87,7 +87,7 @@ class RiskManager:
         drawdown = 1 - (equity / max(state.peak_equity, 0.01))
         if drawdown >= s.max_drawdown_fraction:
             return RiskDecision(False, "Maximum drawdown circuit breaker is active")
-        if state.orders_today >= s.max_orders_per_day:
+        if s.max_orders_per_day > 0 and state.orders_today >= s.max_orders_per_day:
             return RiskDecision(False, "Daily order limit reached")
         if state.last_order_at is not None:
             ready_at = state.last_order_at + timedelta(minutes=s.cooldown_minutes)

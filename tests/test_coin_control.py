@@ -4,8 +4,8 @@ Covers the requirements that a coin selection from the phone (a) rejects
 symbols outside ``allowed_symbols``, (b) never places an order, (c) persists
 only non-secret preferences to ``logs/coin_control.json``, (d) locks the engine
 to the chosen coin (no rotation) until Auto is explicitly re-enabled, and
-(e) reports the speed/risk posture (30m timeframe, 30m cadence, 60m cooldown,
-3 orders/day).
+(e) reports the speed/risk posture (15m timeframe, 15m cadence, 15m cooldown,
+unlimited orders/day).
 
 Fully offline: no HTTP, no private API calls, no orders.
 """
@@ -187,7 +187,7 @@ def test_coin_control_reports_speed_and_risk_posture(tmp_path):
     assert data["timeframe_minutes"] == 15
     assert data["cadence_minutes"] == 15
     assert data["cooldown_minutes"] == 15
-    assert data["max_orders_per_day"] == 3
+    assert data["max_orders_per_day"] == 0  # 0 = unlimited orders/day
     assert data["rapid_mode"] is True
     assert data["active_mode"] == "paper"
     assert data["risk_per_trade"] == pytest.approx(0.01)

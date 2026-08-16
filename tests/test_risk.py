@@ -52,8 +52,12 @@ def test_sell_exit_approved_while_buy_blocked_by_cooldown():
 
 
 def test_sell_exit_approved_while_buy_blocked_by_order_cap():
-    """A SELL exit must NOT be blocked by the daily max-orders cap."""
-    settings = Settings(_env_file=None)
+    """A SELL exit must NOT be blocked by the daily max-orders cap.
+
+    When a positive cap is configured, a BUY at the cap is blocked but a SELL
+    exit always passes. (max_orders_per_day=0 means unlimited — covered below.)
+    """
+    settings = Settings(_env_file=None, max_orders_per_day=3)
     manager = RiskManager(settings)
     sell = Signal(Action.SELL, 90, "Price closed below slow trend EMA", 100.0, 2.0)
     buy = Signal(Action.BUY, 100, "test", price=100.0, atr=2.0, stop_price=98.0)
@@ -69,6 +73,20 @@ def test_sell_exit_approved_while_buy_blocked_by_order_cap():
     assert "order limit" in blocked_buy.reason.lower()
     assert approved_sell.approved is True
     assert "Exit signal approved" in approved_sell.reason
+
+
+def test_unlimited_orders_when_cap_is_zero():
+    """max_orders_per_day=0 means no daily cap — buys are not blocked by count."""
+    settings = Settings(_env_file=None, max_orders_per_day=0)
+    manager = RiskManager(settings)
+    buy = Signal(Action.BUY, 100, "test", price=100.0, atr=2.0, stop_price=98.0)
+    state = SessionState(
+        start_equity=25.0, peak_equity=25.0, current_equity=25.0,
+        orders_today=999, last_order_at=None,
+    )
+    decision = manager.evaluate(buy, state)
+    assert decision.approved is True
+    assert "order limit" not in decision.reason.lower()
 
 
 def test_sell_exit_approved_while_buy_blocked_by_daily_loss_and_drawdown():
