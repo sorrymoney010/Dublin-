@@ -17,7 +17,7 @@ from dublin_bot.errors import SafetyLockError
 from dublin_bot.kraken_gateway import KrakenGateway
 from dublin_bot.models import Action
 from dublin_bot.ratelimit import KrakenRateLimiter, RateLimitTier
-from tests.conftest import ohlc_payload, ticker_payload, time_payload
+from .conftest import ohlc_payload, ticker_payload, time_payload
 
 
 def build_engine(settings, fake_session):
