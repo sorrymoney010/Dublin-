@@ -8,7 +8,7 @@ import pandas as pd
 from dublin_bot.config import Settings
 from dublin_bot.indicators import enrich
 from dublin_bot.models import Action
-from dublin_bot.strategy import MeanReversionStrategy, build_strategy
+from dublin_bot.strategy import MeanReversionStrategy, TrendBreakoutStrategy, build_strategy
 
 
 def _enriched(rsi_target: float) -> pd.DataFrame:
@@ -79,5 +79,6 @@ def test_mr_holds_in_position_when_still_oversold():
 
 def test_build_strategy_factory_selects_mr():
     assert isinstance(build_strategy(Settings(strategy="mean_reversion")), MeanReversionStrategy)
-    assert isinstance(build_strategy(Settings(strategy="momentum")),
-                      build_strategy(Settings()).__class__)  # default = momentum
+    # Default strategy is now mean_reversion (backtested best).
+    assert isinstance(build_strategy(Settings()), MeanReversionStrategy)
+    assert isinstance(build_strategy(Settings(strategy="momentum")), TrendBreakoutStrategy)
