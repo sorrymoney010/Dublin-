@@ -83,6 +83,11 @@ class Settings(BaseSettings):
     preferred_symbol: str = "BTC/USD"
     auto_symbol_rotation: bool = Field(default=True)
     coin_control_path: Path = Path("logs/coin_control.json")
+    # ── Sentiment agent (Stage 1) ──────────────────────────────
+    # When enabled, live news/Reddit sentiment acts as a confirmation filter:
+    # bearish mood blocks fresh BUYs, a collapse forces a protective SELL. It
+    # never originates a trade on its own.
+    sentiment_enabled: bool = Field(default=True)
     # Margin (leveraged) trading. OFF by default — spot only. When enabled the
     # gateway submits margin orders and tracks positions via OpenPositions. Kraken
     # can force-liquidate a margin position, so the exposure cap is tightened and

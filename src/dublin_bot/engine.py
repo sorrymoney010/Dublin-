@@ -27,6 +27,7 @@ from pathlib import Path
 
 from .audit import AuditEvent, AuditLog
 from .config import Settings
+from .sentiment import SentimentAgent
 from .errors import (
     BrokerError,
     DuplicateOrderError,
@@ -39,7 +40,7 @@ from .idempotency import IdempotencyLedger, make_intent_key
 from .journal import Journal
 from .kraken_gateway import KrakenGateway
 from .market_quality import MarketGuard, MarketQuality
-from .models import Action, DecisionRecord, RiskDecision
+from .models import Action, DecisionRecord, RiskDecision, Signal
 from .paper import PaperPortfolio
 from .risk import RiskManager
 from .state import StateStore
@@ -99,6 +100,7 @@ class TradingEngine:
         )
         self.fill_model = FillModel(settings)
         self.paper_portfolio = PaperPortfolio(Path("logs/paper_portfolio.json"))
+        self.sentiment = SentimentAgent()
         self._rotation = 0  # round-robin pointer across affordable small-cap coins
 
     # ── gate 1: safety ───────────────────────────────────────
@@ -316,6 +318,36 @@ class TradingEngine:
             "reason": signal.reason, "price": signal.price,
             "stop_price": signal.stop_price,
         })
+
+        # Gate 5.5 — sentiment confirmation filter (Stage 1).
+        # Sentiment never originates a trade; it only (a) blocks a fresh BUY when
+        # the coin's mood is bearish, and (b) forces a protective SELL when mood
+        # collapses while in a position. This is what stops the bot from buying
+        # into a coordinated dump / becoming reverse-pump exit liquidity.
+        if self.settings.sentiment_enabled:
+            sym = self.settings.symbol
+            idx = self.sentiment.index_for(sym)
+            if signal.action is Action.BUY and self.sentiment.should_block_buy(sym):
+                signal = Signal(
+                    Action.WAIT, signal.score,
+                    f"Sentiment filter: {idx.score:+.2f} bearish for {idx.coin} "
+                    f"(n={idx.sample_size})", signal.price, signal.atr,
+                    signal.stop_price,
+                )
+                self.audit.record(AuditEvent.SIGNAL, {
+                    "event": "sentiment_block_buy", "coin": idx.coin,
+                    "score": idx.score, "sample_size": idx.sample_size,
+                })
+            elif in_position and self.sentiment.should_force_exit(sym):
+                signal = Signal(
+                    Action.SELL, 95,
+                    f"Sentiment collapse: {idx.score:+.2f} for {idx.coin} "
+                    f"(n={idx.sample_size})", signal.price, signal.atr,
+                )
+                self.audit.record(AuditEvent.SIGNAL, {
+                    "event": "sentiment_force_sell", "coin": idx.coin,
+                    "score": idx.score, "sample_size": idx.sample_size,
+                })
 
         # Gate 6 — risk
         equity = self.gateway.account_equity()
