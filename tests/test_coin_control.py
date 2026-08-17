@@ -65,8 +65,7 @@ def test_allowed_symbols_is_canonical_basket_ignoring_current_selection(tmp_path
     allowed = settings.allowed_symbols
     # canonical order preserved, deduped
     assert allowed == [
-        "BTC/USD", "XRP/USD", "TRX/USD", "DOGE/USD",
-        "PUMP/USD", "KAITO/USD", "UNI/USD", "JTO/USD", "HYPE/USD",
+        "BTC/USD", "UNI/USD", "XRP/USD", "PUMP/USD",
     ]
     assert len(allowed) == len(set(allowed))
     # BTC/USD is in the basket even though it is not a "fallback" coin and is
@@ -74,18 +73,17 @@ def test_allowed_symbols_is_canonical_basket_ignoring_current_selection(tmp_path
     assert "BTC/USD" in allowed
 
 
-def test_selecting_kaito_keeps_btc_allowed(tmp_path):
-    """Regression: pinning KAITO/USD must not drop BTC/USD from the basket."""
+def test_selecting_pump_keeps_btc_allowed(tmp_path):
+    """Regression: pinning PUMP/USD must not drop BTC/USD from the basket."""
     settings = make_settings(tmp_path)
-    result = apply_coin_control(settings, {"symbol": "KAITO/USD"})
+    result = apply_coin_control(settings, {"symbol": "PUMP/USD"})
     assert result["ok"] is True
-    assert settings.symbol == "KAITO/USD"
+    assert settings.symbol == "PUMP/USD"
     assert "BTC/USD" in settings.allowed_symbols
-    assert "KAITO/USD" in settings.allowed_symbols
+    assert "PUMP/USD" in settings.allowed_symbols
     # basket is unchanged by selection
     assert settings.allowed_symbols == [
-        "BTC/USD", "XRP/USD", "TRX/USD", "DOGE/USD",
-        "PUMP/USD", "KAITO/USD", "UNI/USD", "JTO/USD", "HYPE/USD",
+        "BTC/USD", "UNI/USD", "XRP/USD", "PUMP/USD",
     ]
 
 
@@ -114,9 +112,9 @@ def test_valid_selection_places_no_order(tmp_path, monkeypatch):
         TradingEngine, "run_once",
         lambda self: calls.append("run_once"),
     )
-    result = apply_coin_control(settings, {"symbol": "DOGE/USD"})
+    result = apply_coin_control(settings, {"symbol": "PUMP/USD"})
     assert result["ok"] is True
-    assert result["active_symbol"] == "DOGE/USD"
+    assert result["active_symbol"] == "PUMP/USD"
     assert calls == []
 
 
@@ -124,10 +122,10 @@ def test_valid_selection_places_no_order(tmp_path, monkeypatch):
 
 def test_manual_selection_disables_rotation_and_toggle_reenables(tmp_path):
     settings = make_settings(tmp_path)
-    manual = apply_coin_control(settings, {"symbol": "KAITO/USD"})
+    manual = apply_coin_control(settings, {"symbol": "UNI/USD"})
     assert manual["auto_rotation"] is False
     assert manual["mode"] == "manual"
-    assert settings.preferred_symbol == "KAITO/USD"
+    assert settings.preferred_symbol == "UNI/USD"
 
     auto = apply_coin_control(settings, {"auto_rotation": True})
     assert auto["auto_rotation"] is True
@@ -139,20 +137,20 @@ def test_manual_selection_disables_rotation_and_toggle_reenables(tmp_path):
 
 def test_selection_persists_non_secret_state_and_reloads(tmp_path):
     settings = make_settings(tmp_path)
-    apply_coin_control(settings, {"symbol": "TRX/USD"})
+    apply_coin_control(settings, {"symbol": "XRP/USD"})
 
     path = tmp_path / "coin_control.json"
     assert path.exists()
     import json
     stored = json.loads(path.read_text())
-    assert stored == {"preferred_symbol": "TRX/USD", "auto_symbol_rotation": False}
+    assert stored == {"preferred_symbol": "XRP/USD", "auto_symbol_rotation": False}
     # no secrets are ever written
     assert "fake-secret" not in path.read_text()
 
     fresh = make_settings(tmp_path)
     fresh.load_coin_control()
-    assert fresh.preferred_symbol == "TRX/USD"
-    assert fresh.symbol == "TRX/USD"
+    assert fresh.preferred_symbol == "XRP/USD"
+    assert fresh.symbol == "XRP/USD"
     assert fresh.auto_symbol_rotation is False
 
 

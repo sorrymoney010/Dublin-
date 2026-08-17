@@ -11,14 +11,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # dedupes but preserves this canonical ordering.
 DEFAULT_COIN_BASKET: tuple[str, ...] = (
     "BTC/USD",       # master coin
-    "XRP/USD",
-    "TRX/USD",
-    "DOGE/USD",
-    "PUMP/USD",
-    "KAITO/USD",
     "UNI/USD",       # Uniswap
-    "JTO/USD",       # Jito
-    "HYPE/USD",
+    "XRP/USD",
+    "PUMP/USD",
 )
 
 
@@ -72,7 +67,7 @@ class Settings(BaseSettings):
     # When the real account balance is too small to trade the configured symbol
     # at the minimum notional, automatically fall back to a cheaper allowed coin.
     auto_cheaper_symbol: bool = Field(default=True)
-    fallback_symbols: list[str] = Field(default_factory=lambda: ["XRP/USD", "TRX/USD", "DOGE/USD", "PUMP/USD", "KAITO/USD", "UNI/USD", "JTO/USD", "HYPE/USD"])
+    fallback_symbols: list[str] = Field(default_factory=lambda: ["XRP/USD", "UNI/USD", "PUMP/USD", "BTC/USD"])
     # Canonical, always-allowed basket. Defaults to DEFAULT_COIN_BASKET and is
     # intentionally independent of the mutable ``symbol`` selection, so BTC/USD
     # (and the rest of the basket) is never lost when a different coin is pinned.

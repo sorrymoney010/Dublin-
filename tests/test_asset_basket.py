@@ -86,15 +86,16 @@ def _gateway_with_meta(settings: Settings, meta: dict[str, SymbolMeta]) -> Krake
 def test_btc_is_primary_symbol_and_full_basket_enabled():
     s = make_settings()
     assert s.symbol == "BTC/USD"
-    # Small-cap rotation preserved; BTC is master, new alts enabled.
-    assert "XRP/USD" in s.fallback_symbols
-    assert "TRX/USD" in s.fallback_symbols
-    assert "DOGE/USD" in s.fallback_symbols
-    assert "PUMP/USD" in s.fallback_symbols
-    assert "KAITO/USD" in s.fallback_symbols
+    # Small-cap rotation preserved; BTC is master, retained alts only.
+    assert "BTC/USD" in s.fallback_symbols
     assert "UNI/USD" in s.fallback_symbols
-    assert "JTO/USD" in s.fallback_symbols
-    assert "HYPE/USD" in s.fallback_symbols
+    assert "XRP/USD" in s.fallback_symbols
+    assert "PUMP/USD" in s.fallback_symbols
+    assert "TRX/USD" not in s.fallback_symbols
+    assert "DOGE/USD" not in s.fallback_symbols
+    assert "KAITO/USD" not in s.fallback_symbols
+    assert "JTO/USD" not in s.fallback_symbols
+    assert "HYPE/USD" not in s.fallback_symbols
 
 
 # ── symbol resolution (BTC via alias, SOL/XRP direct) ────────────
