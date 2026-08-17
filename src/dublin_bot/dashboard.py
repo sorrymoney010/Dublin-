@@ -873,7 +873,7 @@ def ai_brief_data(settings: Settings) -> dict[str, object]:
             suggestions.append("Check market data feed — delayed")
         if risk.get("cooldown_active"):
             suggestions.append(f"Cooldown active — {risk.get('cooldown_remaining_minutes')} min remaining")
-        if risk.get("orders_today", 0) >= settings.max_orders_per_day:
+        if settings.max_orders_per_day > 0 and risk.get("orders_today", 0) >= settings.max_orders_per_day:
             suggestions.append("Daily order limit reached")
         if not suggestions:
             suggestions.append("Monitor market conditions for entry signal")

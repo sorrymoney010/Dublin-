@@ -122,10 +122,46 @@ def sig_meanreversion_sentiment(df, in_position, sentiment=None):
     return "WAIT", f"rsi={rsi:.0f}"
 
 
+def sig_meanreversion_loose(df, in_position) -> tuple[str, str]:
+    """Looser MR: enter at RSI<=38 (was 32) to trade more often."""
+    row = df.iloc[-1]
+    price = float(row["close"])
+    rsi = float(row["rsi"])
+    slow = float(row["ema_slow"])
+    if in_position:
+        if rsi > 55 or price >= slow:
+            return "SELL", f"reversion rsi={rsi:.0f}"
+        return "WAIT", "hold"
+    if rsi < 38 and price < slow:
+        return "BUY", f"oversold rsi={rsi:.0f}"
+    return "WAIT", f"rsi={rsi:.0f}"
+
+
+def sig_combined(df, in_position) -> tuple[str, str]:
+    """MR entry OR momentum breakout entry; same exits. More activity."""
+    row = df.iloc[-1]
+    price = float(row["close"])
+    rsi = float(row["rsi"])
+    slow = float(row["ema_slow"])
+    if in_position:
+        if rsi > 55 or price < slow:
+            return "SELL", f"exit rsi={rsi:.0f}"
+        return "WAIT", "hold"
+    # MR: deep oversold
+    if rsi < 32 and price < slow:
+        return "BUY", f"MR rsi={rsi:.0f}"
+    # Momentum: RSI in band + price reclaiming slow EMA (uptrend)
+    if 45.0 <= rsi <= 68.0 and price > slow:
+        return "BUY", f"momentum rsi={rsi:.0f}"
+    return "WAIT", f"rsi={rsi:.0f}"
+
+
 STRATEGIES = {
     "current": sig_current,
     "mean_reversion": sig_meanreversion,
+    "mean_reversion_loose": sig_meanreversion_loose,
     "mean_reversion_sentiment": ("sig", sig_meanreversion_sentiment),
+    "combined_mr_momentum": sig_combined,
     "regime_trend": sig_regime_trend,
     "trend_follow": sig_trend_follow,
 }
