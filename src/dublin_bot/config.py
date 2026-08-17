@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     # When the real account balance is too small to trade the configured symbol
     # at the minimum notional, automatically fall back to a cheaper allowed coin.
     auto_cheaper_symbol: bool = Field(default=True)
-    fallback_symbols: list[str] = Field(default_factory=lambda: ["XRP/USD", "UNI/USD", "PUMP/USD", "BTC/USD"])
+    fallback_symbols: list[str] = Field(default_factory=lambda: ["PUMP/USD", "XRP/USD", "UNI/USD", "BTC/USD"])
     # Canonical, always-allowed basket. Defaults to DEFAULT_COIN_BASKET and is
     # intentionally independent of the mutable ``symbol`` selection, so BTC/USD
     # (and the rest of the basket) is never lost when a different coin is pinned.
@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     # ── Coin control (user-selected coin / rotation mode) ───
     # preferred_symbol is the coin the operator pinned from the dashboard. When
     # auto_symbol_rotation is False the engine keeps it and never rotates away.
-    preferred_symbol: str = "BTC/USD"
+    preferred_symbol: str = "PUMP/USD"  # rotation focus: MR has positive expectancy on PUMP
     auto_symbol_rotation: bool = Field(default=True)
     coin_control_path: Path = Path("logs/coin_control.json")
     # ── Sentiment agent (Stage 1) ──────────────────────────────
