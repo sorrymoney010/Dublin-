@@ -63,12 +63,12 @@ def sig_meanreversion(df: pd.DataFrame, in_position: bool) -> tuple[str, str]:
     row = df.iloc[-1]
     price = float(row["close"])
     rsi = float(row["rsi"])
+    slow = float(row["ema_slow"])
     if in_position:
-        # exit when RSI recovers above 55 or price back above slow EMA
-        if rsi > 55 or price >= float(row["ema_slow"]):
+        if rsi > 55 or price >= slow:
             return "SELL", f"reversion rsi={rsi:.0f}"
         return "WAIT", "hold"
-    if rsi < 32 and price < float(row["ema_slow"]):
+    if rsi < 32 and price < slow:
         return "BUY", f"oversold rsi={rsi:.0f}"
     return "WAIT", f"rsi={rsi:.0f}"
 
@@ -100,9 +100,32 @@ def sig_trend_follow(df: pd.DataFrame, in_position: bool) -> tuple[str, str]:
     return "WAIT", "no cross"
 
 
+def sig_meanreversion_sentiment(df, in_position, sentiment=None):
+    """Mean-reversion entry gated by live sentiment: skip BUY when bearish.
+
+    NOTE: real historical sentiment requires an archived news feed we don't have,
+    so this applies the *current* sentiment reading as a constant overlay to
+    demonstrate the filter's effect on entry frequency (not a true backtest).
+    """
+    row = df.iloc[-1]
+    price = float(row["close"])
+    rsi = float(row["rsi"])
+    slow = float(row["ema_slow"])
+    if in_position:
+        if rsi > 55 or price >= slow:
+            return "SELL", f"reversion rsi={rsi:.0f}"
+        return "WAIT", "hold"
+    if rsi < 32 and price < slow:
+        if sentiment is not None and sentiment <= -0.15:
+            return "WAIT", f"sentiment block ({sentiment:+.2f})"
+        return "BUY", f"oversold rsi={rsi:.0f}"
+    return "WAIT", f"rsi={rsi:.0f}"
+
+
 STRATEGIES = {
     "current": sig_current,
     "mean_reversion": sig_meanreversion,
+    "mean_reversion_sentiment": ("sig", sig_meanreversion_sentiment),
     "regime_trend": sig_regime_trend,
     "trend_follow": sig_trend_follow,
 }
@@ -121,7 +144,7 @@ class VariantResult:
 
 
 def replay(symbol: str, days: int, fee_rate: float, start_equity: float,
-           strat_fn, settings: Settings) -> VariantResult:
+           strat_fn, settings: Settings, sentiment=None) -> VariantResult:
     gw = KrakenGateway(settings)
     bars = fetch_history(gw, symbol, days)
     if bars.empty:
@@ -146,7 +169,7 @@ def replay(symbol: str, days: int, fee_rate: float, start_equity: float,
         if window.empty:
             continue
         price = float(window.iloc[-1]["close"])
-        action, reason = strat_fn(window, in_pos)
+        action, reason = strat_fn(window, in_pos, sentiment) if sentiment is not None else strat_fn(window, in_pos)
         if not in_pos:
             if action == "BUY":
                 state = SessionState(start_equity=start_equity, peak_equity=start_equity,
@@ -202,12 +225,19 @@ def main() -> None:
     args = ap.parse_args()
 
     settings = Settings()
-    print(f"Comparing strategies on {args.symbol} | {args.days}d | 15m | fee {args.fee*100:.2f}%\n")
-    print(f"{'strategy':<16}{'trades':>7}{'win%':>7}{'exp/t':>9}{'net$':>10}{'final$':>10}{'sharpe':>8}{'maxDD':>7}")
-    for name, fn in STRATEGIES.items():
-        r = replay(args.symbol, args.days, args.fee, args.equity, fn, settings)
+    from dublin_bot.sentiment import SentimentAgent, SentimentConfig
+    agent = SentimentAgent(SentimentConfig())
+    coin = args.symbol.split("/")[0].upper()
+    cur_sent = agent.index_for(args.symbol).score
+    print(f"Comparing strategies on {args.symbol} | {args.days}d | 15m | fee {args.fee*100:.2f}%")
+    print(f"Live sentiment overlay for {coin}: {cur_sent:+.2f} (applied to *sentiment variants only)\n")
+    print(f"{'strategy':<26}{'trades':>7}{'win%':>7}{'exp/t':>9}{'net$':>10}{'final$':>10}{'sharpe':>8}{'maxDD':>7}")
+    for name, entry in STRATEGIES.items():
+        fn = entry[1] if isinstance(entry, tuple) else entry
+        sent = cur_sent if isinstance(entry, tuple) else None
+        r = replay(args.symbol, args.days, args.fee, args.equity, fn, settings, sentiment=sent)
         wr = f"{r.wins/r.trades*100:.0f}%" if r.trades else "-"
-        print(f"{name:<16}{r.trades:>7}{wr:>7}{r.expectancy:>9.2f}{r.total_pnl:>10.2f}"
+        print(f"{name:<26}{r.trades:>7}{wr:>7}{r.expectancy:>9.2f}{r.total_pnl:>10.2f}"
               f"{r.final_equity:>10.2f}{r.sharpe:>8.2f}{r.max_dd*100:>6.1f}%")
 
 

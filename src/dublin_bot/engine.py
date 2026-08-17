@@ -44,7 +44,7 @@ from .models import Action, DecisionRecord, RiskDecision, Signal
 from .paper import PaperPortfolio
 from .risk import RiskManager
 from .state import StateStore
-from .strategy import TrendBreakoutStrategy
+from .strategy import TrendBreakoutStrategy, build_strategy
 from .emergency import emergency_stop_active
 
 
@@ -89,7 +89,7 @@ class TradingEngine:
         self.settings = settings
         self.audit = audit or AuditLog(Path(settings.audit_log_path))
         self.gateway = gateway or build_gateway(settings, audit=self.audit)
-        self.strategy = TrendBreakoutStrategy(settings)
+        self.strategy = build_strategy(settings)
         self.risk = RiskManager(settings)
         self.journal = Journal(settings.journal_path)
         self.state_store = StateStore(Path("logs/session_state.json"))

@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     # bearish mood blocks fresh BUYs, a collapse forces a protective SELL. It
     # never originates a trade on its own.
     sentiment_enabled: bool = Field(default=True)
+    # ── Active signal strategy ─────────────────────────────────
+    # "momentum" (default, RSI band gate) or "mean_reversion" (oversold
+    # stretch + reversion exit) — the latter backtested best on XRP/USD.
+    strategy: str = Field(default="mean_reversion")
     # Margin (leveraged) trading. OFF by default — spot only. When enabled the
     # gateway submits margin orders and tracks positions via OpenPositions. Kraken
     # can force-liquidate a margin position, so the exposure cap is tightened and
@@ -118,6 +122,8 @@ class Settings(BaseSettings):
     rsi_period: int = Field(default=14, ge=2)
     rsi_min: float = 45.0
     rsi_max: float = 68.0
+    rsi_oversold: float = 32.0   # mean-reversion entry threshold (washed out)
+    rsi_exit: float = 55.0       # mean-reversion exit threshold (recovered)
     atr_period: int = Field(default=14, ge=2)
     atr_stop_multiplier: float = Field(default=1.5, gt=0)
     breakout_lookback: int = Field(default=20, ge=2)
