@@ -87,6 +87,17 @@ class Settings(BaseSettings):
     # "momentum" (default, RSI band gate) or "mean_reversion" (oversold
     # stretch + reversion exit) — the latter backtested best on XRP/USD.
     strategy: str = Field(default="mean_reversion")
+    # ── DCA accumulator sleeve ─────────────────────────────────
+    # Mechanical fixed-USD accumulation on a timer, UNDER the same risk gates as
+    # every other order. PUMP/USD only (the coin with proven positive MR
+    # expectancy). Caps prevent unbounded stacking. OFF by default.
+    dca_enabled: bool = Field(default=False)
+    dca_symbol: str = Field(default="PUMP/USD")
+    dca_interval_minutes: int = Field(default=240, ge=30)
+    dca_fixed_usd: float = Field(default=2.0, gt=0)
+    dca_max_buys_per_day: int = Field(default=4, ge=0)
+    dca_max_total_buys: int = Field(default=40, ge=0)
+    dca_stop_buffer: float = Field(default=0.05, gt=0, le=0.5)  # synthetic stop for risk gate only
     # Margin (leveraged) trading. OFF by default — spot only. When enabled the
     # gateway submits margin orders and tracks positions via OpenPositions. Kraken
     # can force-liquidate a margin position, so the exposure cap is tightened and

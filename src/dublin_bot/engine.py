@@ -46,6 +46,7 @@ from .risk import RiskManager
 from .state import StateStore
 from .strategy import TrendBreakoutStrategy, build_strategy
 from .emergency import emergency_stop_active
+from .dca import DCAAccumulator, DCAState
 
 
 def build_gateway(settings: Settings, **kwargs):
@@ -102,6 +103,8 @@ class TradingEngine:
         self.paper_portfolio = PaperPortfolio(Path("logs/paper_portfolio.json"))
         self.sentiment = SentimentAgent()
         self._rotation = 0  # round-robin pointer across affordable small-cap coins
+        self.dca = DCAAccumulator(settings)
+        self._dca_state = DCAState()
 
     # ── gate 1: safety ───────────────────────────────────────
 
@@ -349,6 +352,36 @@ class TradingEngine:
                     "score": idx.score, "sample_size": idx.sample_size,
                 })
 
+        # Gate 5.7 — DCA accumulator sleeve (complementary to MR).
+        # If the main strategy is not entering this bar and DCA is due for its
+        # configured coin (default PUMP/USD), build a fixed-USD BUY signal that
+        # still flows through Gate 6 (risk) and the shared execution path.
+        if self.settings.dca_enabled and signal.action is not Action.BUY:
+            try:
+                pump_price = self.gateway.get_ticker_for(self.settings.dca_symbol)["last"]
+                dca_signal = self.dca.maybe_signal(
+                    self._dca_state,
+                    price=pump_price,
+                    in_position=in_position,
+                    mr_action_is_buy=(signal.action is Action.BUY),
+                )
+                if dca_signal is not None:
+                    # Point this cycle's execution at the DCA coin so the
+                    # idempotency key, sizing, and order target PUMP/USD.
+                    saved_symbol = self.settings.symbol
+                    self.settings.symbol = self.settings.dca_symbol
+                    signal = dca_signal
+                    self._dca_executed_this_cycle = True
+                    self._dca_saved_symbol = saved_symbol
+                    self.audit.record(AuditEvent.SIGNAL, {
+                        "event": "dca_signal", "symbol": self.settings.dca_symbol,
+                        "reason": dca_signal.reason, "price": pump_price,
+                    })
+            except BrokerError as exc:
+                self.audit.record(AuditEvent.BROKER_ERROR,
+                                  {"operation": "dca_ticker", "error": str(exc)},
+                                  severity="error")
+
         # Gate 6 — risk
         equity = self.gateway.account_equity()
         state = self.state_store.load(equity)
@@ -402,6 +435,14 @@ class TradingEngine:
                 bar_timestamp=bar_timestamp, state=state, gates=gates,
                 leverage=leverage,
             )
+            # If this BUY was a DCA accumulator entry, update its counters and
+            # restore the cycle's primary symbol so downstream bookkeeping and
+            # the next cycle's rotation are unaffected.
+            if getattr(self, "_dca_executed_this_cycle", False):
+                if order_id is not None:
+                    self.dca.record_buy(self._dca_state)
+                self.settings.symbol = self._dca_saved_symbol
+                self._dca_executed_this_cycle = False
         elif signal.action is Action.SELL and in_position and risk.approved:
             # Exits use the risk manager's verdict (approved for SELL, never
             # blocked by entry breakers). Position existence, idempotency,
