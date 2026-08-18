@@ -73,6 +73,21 @@ def sig_meanreversion(df: pd.DataFrame, in_position: bool) -> tuple[str, str]:
     return "WAIT", f"rsi={rsi:.0f}"
 
 
+def sig_meanreversion_aggressive(df: pd.DataFrame, in_position: bool) -> tuple[str, str]:
+    """Aggressive MR: wider entry band (RSI<40) but still requires price<slow EMA."""
+    row = df.iloc[-1]
+    price = float(row["close"])
+    rsi = float(row["rsi"])
+    slow = float(row["ema_slow"])
+    if in_position:
+        if rsi > 55 or price >= slow:
+            return "SELL", f"reversion rsi={rsi:.0f}"
+        return "WAIT", "hold"
+    if rsi < 40 and price < slow:
+        return "BUY", f"oversold rsi={rsi:.0f}"
+    return "WAIT", f"rsi={rsi:.0f}"
+
+
 def sig_regime_trend(df: pd.DataFrame, in_position: bool) -> tuple[str, str]:
     """Buy only when in uptrend (price>regime EMA) AND momentum gate; sell below slow EMA."""
     row = df.iloc[-1]
@@ -160,6 +175,7 @@ STRATEGIES = {
     "current": sig_current,
     "mean_reversion": sig_meanreversion,
     "mean_reversion_loose": sig_meanreversion_loose,
+    "mean_reversion_aggressive": sig_meanreversion_aggressive,
     "mean_reversion_sentiment": ("sig", sig_meanreversion_sentiment),
     "combined_mr_momentum": sig_combined,
     "regime_trend": sig_regime_trend,

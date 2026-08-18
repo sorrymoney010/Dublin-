@@ -184,11 +184,11 @@ def test_coin_control_reports_speed_and_risk_posture(tmp_path):
     data = coin_control_data(settings)
     assert data["timeframe_minutes"] == 15
     assert data["cadence_minutes"] == 15
-    assert data["cooldown_minutes"] == 15
+    assert data["cooldown_minutes"] == 10
     assert data["max_orders_per_day"] == 0  # 0 = unlimited orders/day
     assert data["rapid_mode"] is True
     assert data["active_mode"] == "paper"
-    assert data["risk_per_trade"] == pytest.approx(0.01)
+    assert data["risk_per_trade"] == pytest.approx(0.02)
     assert data["allowed_symbols"] == settings.allowed_symbols
 
 

@@ -12,7 +12,7 @@ def test_risk_manager_caps_order_to_quarter_of_budget():
     state = SessionState(start_equity=25.0, peak_equity=25.0, current_equity=25.0)
     decision = manager.evaluate(signal, state)
     assert decision.approved is True
-    assert decision.notional_usd <= 6.25
+    assert decision.notional_usd <= 10.0  # 25.0 * max_position_fraction(0.40)
     assert decision.planned_loss_usd <= 0.25
 
 

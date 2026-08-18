@@ -94,8 +94,8 @@ class Settings(BaseSettings):
     margin_enabled: bool = Field(default=False)
     max_leverage: float = Field(default=2.0, gt=0, le=5.0)
     margin_exposure_fraction: float = Field(default=0.25, gt=0, le=0.5)
-    risk_per_trade: float = Field(default=0.01, gt=0, le=0.02)
-    max_position_fraction: float = Field(default=0.25, gt=0, le=0.5)
+    risk_per_trade: float = Field(default=0.02, gt=0, le=0.02)
+    max_position_fraction: float = Field(default=0.40, gt=0, le=0.5)
     # Vol-target / fractional-Kelly sizing (see dublin_bot.sizing).
     target_vol: float = Field(default=0.12, gt=0, le=1.0)
     kelly_fraction: float = Field(default=0.25, gt=0, le=0.5)
@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     # Daily order cap. Set to 0 for unlimited orders per day (cooldown still
     # applies between entries). Bounded at 10 when a cap is used.
     max_orders_per_day: int = Field(default=0, ge=0, le=10)
-    cooldown_minutes: int = Field(default=15, ge=0)
+    cooldown_minutes: int = Field(default=10, ge=0)
     monitor_interval_seconds: int = Field(default=900, ge=60, le=86400)
     # Rapid mode flag (status only). Does not loosen strategy RSI/momentum or
     # any risk/loss/exposure threshold — it only selects the faster cadence above.
@@ -117,7 +117,7 @@ class Settings(BaseSettings):
     rsi_period: int = Field(default=14, ge=2)
     rsi_min: float = 45.0
     rsi_max: float = 68.0
-    rsi_oversold: float = 32.0   # mean-reversion entry threshold (washed out)
+    rsi_oversold: float = 32.0   # strict MR entry (backtest-proven best on PUMP); aggression comes from size/cooldown, not a wider band
     rsi_exit: float = 55.0       # mean-reversion exit threshold (recovered)
     atr_period: int = Field(default=14, ge=2)
     atr_stop_multiplier: float = Field(default=1.5, gt=0)
