@@ -102,9 +102,15 @@ class TradingEngine:
         self.fill_model = FillModel(settings)
         self.paper_portfolio = PaperPortfolio(Path("logs/paper_portfolio.json"))
         self.sentiment = SentimentAgent()
-        self._rotation = 0  # round-robin pointer across affordable small-cap coins
+        self._rotation = 0  # retained for backward compat; selection is now score-driven
         self.dca = DCAAccumulator(settings)
         self._dca_state = DCAState()
+        from .learner import LearningAgent
+        self.learner = LearningAgent(
+            settings.learner_path,
+            min_trades=settings.learner_min_trades,
+            enabled=settings.learner_enabled,
+        )
 
     # ── gate 1: safety ───────────────────────────────────────
 
@@ -126,43 +132,89 @@ class TradingEngine:
             self.settings.symbol = saved
 
     def _select_symbol(self) -> None:
-        """Pick the next tradeable symbol (basket rotation) for this cycle.
+        """Autonomously pick the best tradeable coin for THIS cycle.
 
-        With a small balance the configured symbol (e.g. BTC) and most altcoins
-        may be unaffordable — their lot minimum rounds above what the risk model
-        allows.  We scan the fallback list and rotate through every coin that can
-        *actually* be sized at the sized notional, one per cycle, building a
-        small-cap basket over time.  Coins that cannot be sized at this balance
-        (e.g. ADA/DOGE need a bigger ticket) are skipped until the account grows.
+        No manual coin section: the bot scans the full tradeable universe
+        (every active Kraken */USD pair when universe_mode="all_usd", otherwise
+        the configured basket), keeps only coins it can *actually size* at the
+        current balance and that the sentiment filter does not block, and ranks
+        them by live strategy setup quality weighted by the self-learning agent
+        (favor coins with proven positive expectancy, avoid bleeders). It trades
+        whatever coin the market is offering — no pinned list, no round-robin.
+
+        If we already hold a position, we stay put and let the strategy exit it
+        rather than churning into a different coin mid-trade.
         """
         s = self.settings
-        if not getattr(s, "auto_symbol_rotation", True):
-            # Manual mode: the operator pinned a coin — never rotate away from it.
-            preferred = str(getattr(s, "preferred_symbol", "") or s.symbol).strip().upper()
-            if preferred and preferred in s.allowed_symbols and preferred != s.symbol:
-                s.symbol = preferred
-                self.audit.record(
-                    AuditEvent.SIGNAL,
-                    {"event": "symbol_manual_lock", "symbol": preferred},
-                )
+        in_position = self.gateway.has_position()
+
+        # Never abandon an open position — the strategy decides when to exit.
+        if in_position:
             return
+
         equity = self.gateway.account_equity()
         cap = equity * s.max_position_fraction
-        candidates = [s.symbol] + list(s.fallback_symbols)
-        # Only coins the gateway can truly size at the position cap.
+
+        # 1) Build the universe.
+        if s.universe_mode == "basket":
+            candidates = list(s.coin_basket)
+        else:  # all_usd: full Kraken market
+            try:
+                pairs = self.gateway.list_usd_pairs()
+                candidates = [p.altname or p.key for p in pairs]
+            except Exception as exc:
+                self.audit.record(AuditEvent.BROKER_ERROR,
+                                  {"operation": "list_usd_pairs", "error": str(exc)},
+                                  severity="error")
+                candidates = list(s.coin_basket)
+        # Apply hard safety allowlist if the operator set one.
+        if s.universe_allowlist:
+            candidates = [c for c in candidates if c.upper() in
+                          {x.upper() for x in s.universe_allowlist}]
+
+        # 2) Keep only coins we can truly size at the position cap.
         affordable = [sym for sym in candidates if self._can_size(sym, cap)]
         if not affordable:
             affordable = candidates  # nothing fits; let risk reject downstream
-        # Round-robin: advance the pointer so successive cycles pick different coins.
-        self._rotation = (self._rotation + 1) % len(affordable)
-        chosen = affordable[self._rotation % len(affordable)]
-        if chosen != s.symbol:
-            s.symbol = chosen
+
+        # 3) Rank each by live MR setup quality × self-learning bias.
+        BUY_THRESHOLD = 60  # MeanReversionStrategy emits score 60 on a real setup
+        best_sym: str | None = None
+        best_score = -1.0
+        scored: list[tuple[str, float]] = []
+        regime = self.learner.last_regime
+        for sym in affordable:
+            if sym == s.symbol:
+                continue
+            if self.sentiment.should_block_buy(sym):
+                continue
+            saved = s.symbol
+            try:
+                s.symbol = sym
+                bars = self.gateway.get_bars()
+                sig = self.strategy.evaluate(bars, in_position=False)
+            except Exception:
+                s.symbol = saved
+                continue
+            finally:
+                s.symbol = saved
+            bias = self.learner.bias(sym) * self.learner.regime_penalty(sym, regime)
+            effective = float(sig.score) * bias
+            scored.append((sym, effective))
+            if effective > best_score:
+                best_score = effective
+                best_sym = sym
+
+        # 4) Switch only if a coin clears the BUY threshold (a real setup).
+        if best_sym is not None and best_score >= BUY_THRESHOLD:
+            s.symbol = best_sym
             self.audit.record(
                 AuditEvent.SIGNAL,
-                {"event": "symbol_switch", "symbol": chosen, "equity": round(equity, 2),
-                 "rotation": self._rotation, "affordable": affordable},
+                {"event": "symbol_switch", "symbol": best_sym,
+                 "score": round(best_score, 2), "equity": round(equity, 2),
+                 "candidates_scored": len(scored)},
             )
+
 
     def assert_safety_locks(self) -> dict:
         """Verify the declared safety posture is internally consistent.
@@ -255,6 +307,16 @@ class TradingEngine:
         # the DCA sleeve pointing one execution at PUMP/USD) is fully undone by
         # the end of the cycle, independent of in-cycle rotation.
         self._cycle_symbol_snapshot = self.settings.symbol
+
+        # Gate 0 — self-learning sync (best-effort, never blocks trading).
+        # Ingest REAL closed-trade P&L from Kraken so the learner's coin bias
+        # reflects live results, not just paper fills.
+        try:
+            self.learner.sync_from_exchange(self.gateway)
+        except Exception as exc:
+            self.audit.record(AuditEvent.BROKER_ERROR,
+                              {"operation": "learner_sync", "error": str(exc)},
+                              severity="warning")
 
         # Gate 1 — safety locks
         try:
@@ -537,6 +599,10 @@ class TradingEngine:
                             fill_price=fill.price,
                             fee=fill.fee,
                             when=datetime.now(timezone.utc).isoformat(),
+                        )
+                        # Self-learning: feed the closed-trade outcome back in.
+                        self.learner.record_trade(
+                            self.settings.symbol, realized, self.learner.last_regime
                         )
                         state.realized_pnl_today += realized
                         state.current_equity = self.paper_portfolio.snapshot().equity

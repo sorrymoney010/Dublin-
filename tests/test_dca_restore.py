@@ -26,7 +26,7 @@ def make_engine():
     s = Settings(_env_file=None, dca_enabled=True, dca_symbol="PUMP/USD",
                  dca_interval_minutes=30, dca_fixed_usd=2.0,
                  dca_max_buys_per_day=10, dca_max_total_buys=100,
-                 symbol="XRP/USD", preferred_symbol="XRP/USD")
+                 symbol="XRP/USD")
     gw = MagicMock()
     gw.get_ticker_for.return_value = {"last": 1.23, "bid": 1.22, "ask": 1.24,
                                       "volume_24h": 1e6, "vwap_24h": 1.23, "trades_24h": 100}

@@ -328,6 +328,20 @@ class KrakenGateway:
                 options.add(dst + compact[len(src):])
         return [o for o in options if o]
 
+    def list_usd_pairs(self) -> list[SymbolMeta]:
+        """Every active Kraken */USD spot pair — the full tradeable universe.
+
+        Used by the autonomous selector (universe_mode="all_usd") so the bot can
+        discover and trade any USD-quoted coin Kraken offers, not just a fixed
+        basket. Pairs that are delisted/suspended are excluded by status.
+        """
+        meta = self.load_metadata()
+        out: list[SymbolMeta] = []
+        for m in meta.values():
+            if m.quote.upper() == "USD" and str(m.status).lower() == "online":
+                out.append(m)
+        return out
+
     def resolve_symbol(self, symbol: str | None = None) -> SymbolMeta:
         """Resolve a configured symbol to authoritative Kraken pair metadata."""
         symbol = symbol or self.settings.symbol
@@ -527,6 +541,38 @@ class KrakenGateway:
 
     def has_position(self) -> bool:
         return bool(self.positions())
+
+    def closed_trade_pnl(self, since: int = 0) -> tuple[dict[str, float], int]:
+        """Net realized P&L per coin from closed trades since ``since`` (unix ns).
+
+        Used by the self-learning agent to ingest REAL closed-trade outcomes in
+        live mode (where the paper portfolio does not track fills). Returns a
+        mapping of ``SYMBOL`` -> net P&L and the latest trade timestamp cursor
+        so the caller can persist it and avoid double-counting on the next poll.
+        Raises BrokerError/AuthenticationError on failure — callers must guard.
+        """
+        result = self._private("TradesHistory", {"type": "all", "trades": True,
+                                                 "start": str(since)})
+        trades = result.get("trades") or {}
+        pnl: dict[str, float] = {}
+        latest = since
+        for _txid, t in trades.items():
+            sym = str(t.get("pair", "")).replace("/", "").upper()
+            # Kraken reports closed-trade realized P&L in the "pnl" field.
+            raw = t.get("pnl")
+            if raw is None:
+                continue
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                continue
+            pnl[sym] = pnl.get(sym, 0.0) + val
+            try:
+                ts = int(t.get("time", 0))
+                latest = max(latest, ts)
+            except (TypeError, ValueError):
+                pass
+        return pnl, latest * 1_000_000_000  # seconds -> ns cursor
 
     def orders(self) -> list[dict]:
         if not self.has_credentials:

@@ -448,74 +448,41 @@ def safety_status(settings: Settings) -> dict[str, object]:
 # Coin control — pick the traded coin from the phone. Never places an order.
 # ---------------------------------------------------------------------------
 
-def coin_control_data(settings: Settings) -> dict[str, object]:
-    """Current coin, basket, mode, and the speed/risk posture shown on mobile."""
-    return {
-        "ok": True,
-        "active_symbol": settings.symbol,
-        "preferred_symbol": getattr(settings, "preferred_symbol", settings.symbol),
-        "auto_rotation": bool(getattr(settings, "auto_symbol_rotation", True)),
-        "mode": "auto" if getattr(settings, "auto_symbol_rotation", True) else "manual",
-        "allowed_symbols": settings.allowed_symbols,
-        "timeframe_minutes": settings.timeframe_minutes,
-        "cadence_minutes": int(settings.monitor_interval_seconds // 60),
-        "cooldown_minutes": settings.cooldown_minutes,
-        "max_orders_per_day": settings.max_orders_per_day,
-        "rapid_mode": bool(getattr(settings, "rapid_mode", True)),
-        "active_mode": settings.active_mode,
-        "risk_per_trade": settings.risk_per_trade,
-        "max_position_fraction": settings.max_position_fraction,
-        "max_daily_loss_fraction": settings.max_daily_loss_fraction,
-        "max_drawdown_fraction": settings.max_drawdown_fraction,
-    }
+def learner_state_data(settings: Settings) -> dict[str, object]:
+    """Closed-loop self-learning state (per-coin expectancy) for the dashboard.
 
-
-def apply_coin_control(settings: Settings, payload: dict[str, object]) -> dict[str, object]:
-    """Validate + apply a coin-control request. Selecting a coin places NO order.
-
-    - ``symbol``: must be in ``allowed_symbols`` (else rejected, nothing changes).
-      A manual selection pins the coin and disables auto rotation.
-    - ``auto_rotation``: explicit toggle; True re-enables basket rotation.
+    Reads the learner store directly so the UI can show what the bot has learned
+    about each coin without threading the engine instance through the handler.
     """
-    changed: dict[str, object] = {}
-
-    # auto_rotation must be a real JSON boolean. Reject coercions like the
-    # string "false" (which Python would truthily coerce) so a mis-sent value
-    # can never silently flip the mode. Validate before any mutation so a bad
-    # payload changes nothing.
-    if "auto_rotation" in payload:
-        value = payload["auto_rotation"]
-        if not isinstance(value, bool):
-            return {
-                "ok": False,
-                "error": f"auto_rotation must be a boolean, got {type(value).__name__}",
-                "allowed_symbols": settings.allowed_symbols,
-                "active_symbol": settings.symbol,
-            }
-
-    raw_symbol = payload.get("symbol")
-    if raw_symbol is not None:
-        symbol = str(raw_symbol).strip().upper()
-        if symbol not in settings.allowed_symbols:
-            return {
-                "ok": False,
-                "error": f"symbol not allowed: {symbol or '(empty)'}",
-                "allowed_symbols": settings.allowed_symbols,
-                "active_symbol": settings.symbol,
-            }
-        settings.preferred_symbol = symbol
-        settings.symbol = symbol
-        settings.auto_symbol_rotation = False  # manual selection locks the coin
-        changed["symbol"] = symbol
-
-    if "auto_rotation" in payload:
-        settings.auto_symbol_rotation = bool(payload["auto_rotation"])
-        changed["auto_rotation"] = settings.auto_symbol_rotation
-
-    settings.save_coin_control()
-    data = coin_control_data(settings)
-    data["changed"] = changed
-    return data
+    path = Path(settings.learner_path)
+    if not path.exists():
+        return {"enabled": settings.learner_enabled, "coins_tracked": 0, "best": [], "worst": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {"enabled": settings.learner_enabled, "coins_tracked": 0, "best": [], "worst": []}
+    coins = data.get("coins", {})
+    ranked = sorted(
+        coins.items(),
+        key=lambda kv: (kv[1].get("pnl", 0.0) / kv[1]["trades"]) if kv[1].get("trades") else 0,
+        reverse=True,
+    )
+    def shape(item):
+        sym, c = item
+        tr = c.get("trades", 0) or 1
+        return {
+            "symbol": sym,
+            "trades": c.get("trades", 0),
+            "win_rate_pct": round((c.get("wins", 0) / tr) * 100, 1) if tr else 0.0,
+            "expectancy_usd": round(c.get("pnl", 0.0) / tr, 3) if tr else 0.0,
+        }
+    return {
+        "enabled": settings.learner_enabled,
+        "last_regime": data.get("last_regime", "unknown"),
+        "coins_tracked": len(coins),
+        "best": [shape(x) for x in ranked[:5]],
+        "worst": [shape(x) for x in ranked[-3:]],
+    }
 
 
 def health_snapshot(settings: Settings) -> dict[str, object]:
@@ -1344,28 +1311,21 @@ nav button.on{color:var(--cyan)}
   </div>
 </section>
 
-<!-- ============ COIN CONTROL ============ -->
+<!-- ============ SELF-LEARNING ============ -->
 <section class="view" id="v-coin">
   <div class="grid">
     <div class="card m12">
-      <div class="label">Coin Control — tap a coin to trade it</div>
-      <div class="row"><span class="rl">Active coin</span><span class="rv" id="ccActive">—</span></div>
-      <div class="row"><span class="rl">Mode</span><span class="rv" id="ccMode">—</span></div>
-      <div class="sub muted">Selecting a coin does not place an order. Manual selection locks the coin; Auto resumes basket rotation.</div>
-      <div id="ccBasket" class="basket"></div>
-      <div class="btns">
-        <button id="ccAuto" onclick="setRotation(true)">Auto rotation</button>
-        <button id="ccManual" onclick="setRotation(false)">Manual lock</button>
-      </div>
-      <div class="sub muted" id="ccMsg"></div>
+      <div class="label">Self-Learning Agent — what the bot has learned</div>
+      <div class="row"><span class="rl">Active coin</span><span class="rv" id="lrActive">—</span></div>
+      <div class="row"><span class="rl">Market regime</span><span class="rv" id="learnerRegime">—</span></div>
+      <div class="sub muted">The bot scans the full Kraken USD market each cycle and biases toward coins with proven positive expectancy. Best-known coins by $/trade:</div>
+      <div id="learnerBody" class="basket"></div>
     </div>
     <div class="card m12">
-      <div class="label">Speed &amp; Risk</div>
-      <div class="row"><span class="rl">Timeframe</span><span class="rv" id="ccTf">—</span></div>
-      <div class="row"><span class="rl">Cycle cadence</span><span class="rv" id="ccCadence">—</span></div>
-      <div class="row"><span class="rl">Cooldown</span><span class="rv" id="ccCooldown">—</span></div>
-      <div class="row"><span class="rl">Max orders / day</span><span class="rv" id="ccOrders">—</span></div>
-      <div class="row"><span class="rl">Risk per trade</span><span class="rv" id="ccRisk">—</span></div>
+      <div class="label">Universe &amp; Mode</div>
+      <div class="row"><span class="rl">Universe</span><span class="rv" id="lrUniverse">all Kraken USD</span></div>
+      <div class="row"><span class="rl">Selection</span><span class="rv" id="lrSel">autonomous (strategy + market)</span></div>
+      <div class="sub muted">No manual coin pinning. The engine trades whatever coin the mean-reversion strategy + self-learning bias selects.</div>
     </div>
   </div>
 </section>
@@ -1442,38 +1402,19 @@ function connFail(){
     $("banner").classList.add("show");
   }
 }
-function renderCoin(cc){
-  if (!cc) return;
-  $("ccActive").textContent = cc.active_symbol || "—";
-  $("ccMode").textContent = cc.auto_rotation ? "Auto (basket rotation)" : "Manual (locked)";
-  $("ccTf").textContent = (cc.timeframe_minutes||0) + "m";
-  $("ccCadence").textContent = "every " + (cc.cadence_minutes||0) + "m";
-  $("ccCooldown").textContent = (cc.cooldown_minutes||0) + "m";
-  $("ccOrders").textContent = (cc.max_orders_per_day||0) + " / day";
-  $("ccRisk").textContent = ((cc.risk_per_trade||0)*100).toFixed(2) + "% of equity";
-  $("ccAuto").classList.toggle("on", !!cc.auto_rotation);
-  $("ccManual").classList.toggle("on", !cc.auto_rotation);
-  const box = $("ccBasket");
-  box.innerHTML = "";
-  (cc.allowed_symbols||[]).forEach(sym=>{
-    const b = document.createElement("button");
-    b.textContent = sym.replace("/USD","");
-    if (sym === cc.active_symbol) b.classList.add("on");
-    b.onclick = ()=> selectCoin(sym);
-    box.appendChild(b);
-  });
-}
-async function selectCoin(symbol){
-  const j = await post("/api/coin-control", {symbol: symbol});
-  $("ccMsg").textContent = (j && j.ok)
-    ? "Locked to " + symbol + " — no order placed."
-    : "Rejected: " + ((j && j.error) || "unknown error");
-  if (j && j.ok) renderCoin(j);
-}
-async function setRotation(on){
-  const j = await post("/api/coin-control", {auto_rotation: !!on});
-  $("ccMsg").textContent = on ? "Auto rotation enabled." : "Manual mode — coin locked.";
-  if (j && j.ok) renderCoin(j);
+function renderLearner(ov){
+  const lr = ov && ov.learner;
+  const el = $("learnerBody");
+  if (!el || !lr) return;
+  if (!lr.enabled){ el.innerHTML = "<div class='muted'>self-learning disabled</div>"; return; }
+  const rows = (lr.best||[]).map(c=>{
+    const good = c.expectancy_usd >= 0;
+    return `<div class='row'><span>${c.symbol.replace('/USD','')}</span>`+
+      `<span class='${good?'pos':'neg'}'>${c.expectancy_usd>=0?'+':''}${c.expectancy_usd} $/trade</span>`+
+      `<span class='muted'>${c.win_rate_pct}% · ${c.trades}t</span></div>`;
+  }).join("");
+  el.innerHTML = rows || "<div class='muted'>learning from trades…</div>";
+  $("learnerRegime").textContent = lr.last_regime || "unknown";
 }
 async function getJSON(url){
   const r = await fetch(url, {cache:"no-store"});
@@ -1751,7 +1692,8 @@ async function refresh(){
   const res = await Promise.allSettled(urls.map(getJSON));
   const val = i => res[i].status==="fulfilled" ? res[i].value : null;
   if (val(0)) renderKraken(val(0));
-  renderCoin(ov.coin_control);
+  renderLearner(ov);
+  if (ov && ov.learner) $("lrActive").textContent = (ov.active_symbol || "—");
   if (val(1)) renderTrades(val(1));
   if (val(2)) renderScanner(val(2));
   if (val(3)) renderStrategy(val(3));
@@ -1787,7 +1729,7 @@ def make_handler(settings: Settings, monitor: PaperMonitor) -> type[BaseHTTPRequ
             "monitor": monitor.status(),
             "health": health_snapshot(settings),
             "audit": audit_summary(settings, limit=12),
-            "coin_control": coin_control_data(settings),
+            "learner": learner_state_data(settings),
             "last_wait_reason": last_wait_reason(settings),
         }
 
@@ -1811,7 +1753,7 @@ def make_handler(settings: Settings, monitor: PaperMonitor) -> type[BaseHTTPRequ
         "/api/kraken/trades": lambda: ("json", kraken_trades_data(settings)),
         "/api/scanner": lambda: ("json", scanner_data(settings)),
         "/api/alerts": lambda: ("json", alerts_status()),
-        "/api/coin-control": lambda: ("json", coin_control_data(settings)),
+        "/api/learner": lambda: ("json", learner_state_data(settings)),
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -1895,15 +1837,6 @@ def make_handler(settings: Settings, monitor: PaperMonitor) -> type[BaseHTTPRequ
                             priority="high", tags="rotating_light",
                         )
                     self.send_json(result)
-                elif path == "/api/coin-control":
-                    length = int(self.headers.get("content-length", "0"))
-                    payload = json.loads(self.rfile.read(length)) if length else {}
-                    if not isinstance(payload, dict):
-                        payload = {}
-                    result = apply_coin_control(settings, payload)
-                    status = (HTTPStatus.OK if result.get("ok")
-                              else HTTPStatus.BAD_REQUEST)
-                    self.send_json(result, status)
                 else:
                     self.send_error(HTTPStatus.NOT_FOUND)
             except Exception as exc:
@@ -1916,11 +1849,18 @@ def make_handler(settings: Settings, monitor: PaperMonitor) -> type[BaseHTTPRequ
 
 
 def serve_dashboard(settings: Settings, run: bool = True) -> int:
-    # Restore any persisted manual coin lock / rotation mode at startup so the
-    # dashboard honours the operator's last selection after a restart. Done
-    # before the monitor/server are built — and before the early `run=False`
-    # return — so callers that only want startup initialization get it too.
-    settings.load_coin_control()
+    # Load persisted learner state (per-coin expectancy) at startup so the
+    # self-learning bias survives restarts. Done before the monitor/server are
+    # built — and before the early `run=False` return — so callers that only
+    # want startup initialization get it too.
+    if getattr(settings, "learner_enabled", False):
+        try:
+            from .learner import LearningAgent
+            LearningAgent(settings.learner_path,
+                           min_trades=settings.learner_min_trades,
+                           enabled=True).load()
+        except Exception:
+            pass
     if not run:
         return 0
     monitor = TradingMonitor(settings)
