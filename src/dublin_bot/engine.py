@@ -44,7 +44,7 @@ from .models import Action, DecisionRecord, RiskDecision, Signal
 from .paper import PaperPortfolio
 from .risk import RiskManager
 from .state import StateStore
-from .strategy import TrendBreakoutStrategy, build_strategy
+from .strategy import build_strategy
 from .emergency import emergency_stop_active
 from .dca import DCAAccumulator, DCAState
 
@@ -251,6 +251,10 @@ class TradingEngine:
 
     def run_cycle(self) -> CycleResult:
         gates: dict[str, object] = {}
+        # Snapshot the active symbol at cycle start so any temporary swap (e.g.
+        # the DCA sleeve pointing one execution at PUMP/USD) is fully undone by
+        # the end of the cycle, independent of in-cycle rotation.
+        self._cycle_symbol_snapshot = self.settings.symbol
 
         # Gate 1 — safety locks
         try:
@@ -368,11 +372,11 @@ class TradingEngine:
                 if dca_signal is not None:
                     # Point this cycle's execution at the DCA coin so the
                     # idempotency key, sizing, and order target PUMP/USD.
-                    saved_symbol = self.settings.symbol
+                    # Restore uses the cycle-start snapshot (set at the top of
+                    # run_cycle) so in-cycle rotation is not disturbed.
                     self.settings.symbol = self.settings.dca_symbol
                     signal = dca_signal
                     self._dca_executed_this_cycle = True
-                    self._dca_saved_symbol = saved_symbol
                     self.audit.record(AuditEvent.SIGNAL, {
                         "event": "dca_signal", "symbol": self.settings.dca_symbol,
                         "reason": dca_signal.reason, "price": pump_price,
@@ -435,14 +439,11 @@ class TradingEngine:
                 bar_timestamp=bar_timestamp, state=state, gates=gates,
                 leverage=leverage,
             )
-            # If this BUY was a DCA accumulator entry, update its counters and
-            # restore the cycle's primary symbol so downstream bookkeeping and
-            # the next cycle's rotation are unaffected.
-            if getattr(self, "_dca_executed_this_cycle", False):
-                if order_id is not None:
-                    self.dca.record_buy(self._dca_state)
-                self.settings.symbol = self._dca_saved_symbol
-                self._dca_executed_this_cycle = False
+            # If this BUY was a DCA accumulator entry and an order was actually
+            # placed, update its counters. Symbol restoration happens below
+            # (outside this branch) so it runs even if risk rejected the order.
+            if getattr(self, "_dca_executed_this_cycle", False) and order_id is not None:
+                self.dca.record_buy(self._dca_state)
         elif signal.action is Action.SELL and in_position and risk.approved:
             # Exits use the risk manager's verdict (approved for SELL, never
             # blocked by entry breakers). Position existence, idempotency,
@@ -452,6 +453,13 @@ class TradingEngine:
                 bar_timestamp=bar_timestamp, state=state, gates=gates,
                 leverage=leverage,
             )
+
+        # Restore the cycle's primary symbol if the DCA sleeve had swapped it.
+        # Uses the cycle-start snapshot so in-cycle rotation is preserved and a
+        # rejected DCA order does NOT leave the engine pinned to PUMP/USD.
+        if getattr(self, "_dca_executed_this_cycle", False):
+            self.settings.symbol = self._cycle_symbol_snapshot
+            self._dca_executed_this_cycle = False
 
         self.state_store.save(state)
         # Adapt risk scaling from the session's realized P&L streak.

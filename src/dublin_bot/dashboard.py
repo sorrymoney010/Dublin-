@@ -17,12 +17,8 @@ This file only READS from Kraken; it never places orders.
 """
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
 import json
 import os
-import time
 import urllib.parse
 import urllib.request
 from collections import deque
@@ -1821,15 +1817,24 @@ def make_handler(settings: Settings, monitor: PaperMonitor) -> type[BaseHTTPRequ
     class Handler(BaseHTTPRequestHandler):
         def send_bytes(self, payload: bytes, content_type: str,
                        status: HTTPStatus = HTTPStatus.OK) -> None:
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except BrokenPipeError:
+                # Client disconnected before we finished writing (e.g. browser
+                # navigated away, or a stream consumer closed early). Not a bug
+                # in the bot — swallow it so the handler doesn't crash.
+                pass
 
         def send_json(self, value: object, status: HTTPStatus = HTTPStatus.OK) -> None:
-            self.send_bytes(json.dumps(value, default=str).encode(), "application/json", status)
+            try:
+                self.send_bytes(json.dumps(value, default=str).encode(), "application/json", status)
+            except BrokenPipeError:
+                pass
 
         def do_GET(self) -> None:
             path = self.path.split("?", 1)[0]

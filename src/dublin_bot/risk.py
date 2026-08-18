@@ -7,7 +7,7 @@ import pandas as pd
 
 from .config import Settings
 from .models import Action, RiskDecision, Signal
-from .sizing import EdgeEstimate, PositionSizer, SizingConfig
+from .sizing import PositionSizer, SizingConfig
 
 
 @dataclass
