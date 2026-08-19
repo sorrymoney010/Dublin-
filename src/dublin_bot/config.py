@@ -82,6 +82,11 @@ class Settings(BaseSettings):
     # only ones the bot may ever touch; in "all_usd" mode this stays empty so
     # the full market is reachable, but it can pin the bot down if desired.
     universe_allowlist: list[str] = Field(default_factory=list)
+    # Max coins scored per cycle (each costs one get_bars call). The bot scans
+    # the vetted basket first; if you raise this it will also probe the broader
+    # Kraken USD market (via list_usd_pairs) up to the limit. Keep small to
+    # respect Kraken's public rate limits.
+    universe_scan_limit: int = Field(default=12, ge=1)
     # ── Self-learning agent ──────────────────────────────────────
     # When enabled, the bot records every closed trade's P&L keyed by coin +
     # regime and biases coin selection toward coins with proven positive
@@ -112,6 +117,7 @@ class Settings(BaseSettings):
     dca_max_buys_per_day: int = Field(default=4, ge=0)
     dca_max_total_buys: int = Field(default=40, ge=0)
     dca_stop_buffer: float = Field(default=0.05, gt=0, le=0.5)  # synthetic stop for risk gate only
+    dca_state_path: Path = Path("logs/dca_state.json")  # persisted interval/cap counters
     # Margin (leveraged) trading. OFF by default — spot only. When enabled the
     # gateway submits margin orders and tracks positions via OpenPositions. Kraken
     # can force-liquidate a margin position, so the exposure cap is tightened and

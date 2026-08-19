@@ -23,8 +23,10 @@ Design notes
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Callable
 
 from .config import Settings
@@ -51,6 +53,24 @@ class DCAState:
             self.day = today
             self.buys_today = 0
 
+    def to_dict(self) -> dict:
+        return {
+            "last_buy_at": self.last_buy_at.isoformat() if self.last_buy_at else None,
+            "buys_today": self.buys_today,
+            "total_buys": self.total_buys,
+            "day": self.day,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "DCAState":
+        last = data.get("last_buy_at")
+        return cls(
+            last_buy_at=datetime.fromisoformat(last) if last else None,
+            buys_today=int(data.get("buys_today", 0)),
+            total_buys=int(data.get("total_buys", 0)),
+            day=data.get("day", _now().date().isoformat()),
+        )
+
 
 class DCAAccumulator:
     """Decides whether a DCA BUY is due this cycle.
@@ -63,6 +83,7 @@ class DCAAccumulator:
     def __init__(self, settings: Settings, now: Callable[[], datetime] = _now) -> None:
         self.s = settings
         self._now = now
+        self._state_path: Path | None = None
 
     # ── gating ──────────────────────────────────────────────────
     def _interval_ok(self, state: DCAState) -> tuple[bool, str]:
@@ -123,3 +144,25 @@ class DCAAccumulator:
         state.last_buy_at = self._now()
         state.buys_today += 1
         state.total_buys += 1
+        self.save(state)
+
+    # ── persistence ──────────────────────────────────────────
+    def load(self, path) -> DCAState:
+        """Load persisted DCA state; returns a fresh state if none exists."""
+        p = Path(path)
+        if p.exists():
+            try:
+                return DCAState.from_dict(json.loads(p.read_text(encoding="utf-8")))
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+        return DCAState()
+
+    def save(self, state: DCAState, path=None) -> None:
+        p = Path(path) if path else getattr(self, "_state_path", None)
+        if p is None:
+            return
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(state.to_dict(), indent=2), encoding="utf-8")
+        except OSError:
+            pass

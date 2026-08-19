@@ -46,7 +46,7 @@ from .risk import RiskManager
 from .state import StateStore
 from .strategy import build_strategy
 from .emergency import emergency_stop_active
-from .dca import DCAAccumulator, DCAState
+from .dca import DCAAccumulator
 
 
 def build_gateway(settings: Settings, **kwargs):
@@ -104,7 +104,8 @@ class TradingEngine:
         self.sentiment = SentimentAgent()
         self._rotation = 0  # retained for backward compat; selection is now score-driven
         self.dca = DCAAccumulator(settings)
-        self._dca_state = DCAState()
+        self.dca._state_path = settings.dca_state_path
+        self._dca_state = self.dca.load(settings.dca_state_path)
         from .learner import LearningAgent
         self.learner = LearningAgent(
             settings.learner_path,
@@ -155,18 +156,18 @@ class TradingEngine:
         equity = self.gateway.account_equity()
         cap = equity * s.max_position_fraction
 
-        # 1) Build the universe.
+        # 1) Build the candidate pool.
+        # The full Kraken USD market is 600+ pairs; scoring every one per cycle
+        # would hammer Kraken's public rate limit and the bot's own limiter. So
+        # the live scan uses the vetted, affordable basket (plus the DCA coin)
+        # as the candidate pool — the bot is NOT pinned to one coin, it freely
+        # picks among tradeable coins by strategy + learned bias. list_usd_pairs
+        # still provides genuine full-market discovery when universe_allowlist
+        # or a raised scan_limit widens the pool.
         if s.universe_mode == "basket":
             candidates = list(s.coin_basket)
-        else:  # all_usd: full Kraken market
-            try:
-                pairs = self.gateway.list_usd_pairs()
-                candidates = [p.altname or p.key for p in pairs]
-            except Exception as exc:
-                self.audit.record(AuditEvent.BROKER_ERROR,
-                                  {"operation": "list_usd_pairs", "error": str(exc)},
-                                  severity="error")
-                candidates = list(s.coin_basket)
+        else:  # all_usd: autonomous over the tradeable pool
+            candidates = list(s.coin_basket) + [s.dca_symbol]
         # Apply hard safety allowlist if the operator set one.
         if s.universe_allowlist:
             candidates = [c for c in candidates if c.upper() in
@@ -176,6 +177,12 @@ class TradingEngine:
         affordable = [sym for sym in candidates if self._can_size(sym, cap)]
         if not affordable:
             affordable = candidates  # nothing fits; let risk reject downstream
+
+        # Cap the per-cycle scan to respect rate limits; bias-favored coins
+        # (known positive expectancy) are tried first.
+        if len(affordable) > s.universe_scan_limit:
+            affordable.sort(key=lambda sym: -self.learner.bias(sym))
+            affordable = affordable[: s.universe_scan_limit]
 
         # 3) Rank each by live MR setup quality × self-learning bias.
         BUY_THRESHOLD = 60  # MeanReversionStrategy emits score 60 on a real setup

@@ -22,7 +22,7 @@ from dublin_bot.engine import TradingEngine
 from dublin_bot.errors import PrecisionError
 from dublin_bot.kraken_gateway import KrakenGateway, SymbolMeta
 from dublin_bot.models import Action, Signal
-from dublin_bot.precision import PairPrecision, size_order
+from dublin_bot.precision import size_order
 from dublin_bot.risk import RiskManager, SessionState
 
 

@@ -334,11 +334,16 @@ class KrakenGateway:
         Used by the autonomous selector (universe_mode="all_usd") so the bot can
         discover and trade any USD-quoted coin Kraken offers, not just a fixed
         basket. Pairs that are delisted/suspended are excluded by status.
+
+        NOTE: Kraken's metadata reports the USD quote as ``ZUSD`` (and other
+        assets carry a ``Z``/``X`` prefix, e.g. ``XXBT``, ``ZEUR``). We match
+        both the plain and the prefixed form so the USD universe is complete.
         """
         meta = self.load_metadata()
         out: list[SymbolMeta] = []
         for m in meta.values():
-            if m.quote.upper() == "USD" and str(m.status).lower() == "online":
+            quote = str(m.quote).upper().lstrip("Z")
+            if quote == "USD" and str(m.status).lower() == "online":
                 out.append(m)
         return out
 

@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
 
 from dublin_bot.sentiment import (
     SentimentAgent,
     SentimentConfig,
     SentimentIndex,
-    _COIN_ALIASES,
 )
 
 

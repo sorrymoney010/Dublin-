@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 from dublin_bot.config import Settings
 from dublin_bot.learner import LearningAgent
 from dublin_bot.engine import TradingEngine
-from dublin_bot.models import Action, RiskDecision, Signal
+from dublin_bot.models import Action, Signal
 
 
 def _fake_bars(rsi=70.0, price=1.0):
@@ -108,3 +108,37 @@ def test_autonomous_selection_stays_when_holding():
     eng.run_cycle()
     # Must not churn away from the open position.
     assert eng.settings.symbol == before
+
+
+# ── gateway universe (root-cause regression for "not trading at all") ──
+def test_list_usd_pairs_matches_kraken_zusd_quote():
+    """Kraken reports the USD quote as 'ZUSD'; list_usd_pairs must still find it.
+
+    Regression: an earlier filter checked quote == 'USD' and returned 0 pairs,
+    which emptied the autonomous universe and stopped all MR trading.
+    """
+    from decimal import Decimal
+    import time
+    from dublin_bot.kraken_gateway import KrakenGateway, SymbolMeta
+
+    gw = KrakenGateway.__new__(KrakenGateway)
+    gw._meta = {
+        "XRPUSD": SymbolMeta(key="XRPUSD", altname="XRPUSD", wsname="XRP/USD",
+                             base="XXRP", quote="ZUSD", lot_decimals=8,
+                             pair_decimals=5, order_min=Decimal("0"), cost_min=Decimal("0"),
+                             status="online"),
+        "BTCEUR": SymbolMeta(key="BTCEUR", altname="BTCEUR", wsname="BTC/EUR",
+                             base="XXBT", quote="ZEUR", lot_decimals=8,
+                             pair_decimals=5, order_min=Decimal("0"), cost_min=Decimal("0"),
+                             status="online"),
+        "DELISTEDUSD": SymbolMeta(key="DELISTEDUSD", altname="DELISTEDUSD",
+                                  wsname="DEL/USD", base="DEL", quote="ZUSD",
+                                  lot_decimals=8, pair_decimals=5,
+                                  order_min=Decimal("0"), cost_min=Decimal("0"),
+                                  status="delisted"),
+    }
+    gw._meta_loaded_at = time.time()  # cache hit -> load_metadata returns _meta
+    gw._meta_ttl = 3600
+    pairs = gw.list_usd_pairs()
+    assert len(pairs) == 1, f"expected only XRPUSD, got {[p.altname for p in pairs]}"
+    assert pairs[0].altname == "XRPUSD"
