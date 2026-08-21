@@ -892,7 +892,10 @@ def system_health_data(settings: Settings) -> dict[str, object]:
             "database": {"audit_chain_intact": audit_ok, "journal_exists": journal_ok,
                          "state_persisted": state_ok},
             "alerts": alerts_status(),
-            "deploy": {"version": "2.0-liveview", "build": "dry-run"},
+            "deploy": {"version": "2.0-liveview",
+                       "build": "live" if (settings.has_credentials and settings.allow_live_trading
+                                            and not settings.dry_run and not settings.paper_trading)
+                                else "simulated"},
             "api_latency_ms": broker_health.get("latency_ms", 0),
             "clock_skew": broker_health.get("clock_skew_seconds"),
             "rate_budget": broker_health.get("rate_limiter", {}),
