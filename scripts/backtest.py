@@ -14,7 +14,6 @@ import argparse
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd

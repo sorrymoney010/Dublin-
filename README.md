@@ -43,15 +43,20 @@ safety locks → market data → freshness → market quality → strategy
 ## Setup on macOS
 
 ```bash
-cd Dublin-local
+git clone https://github.com/sorrymoney010/Dublin-.git
+cd Dublin-
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
 cp .env.example .env
+dublin-bot doctor
+dublin-bot run-once
 ```
 
-Add a **read-only** Kraken key to `.env` (*Query Funds* + *Query Orders* only —
-never *Withdraw Funds*) and set `BROKER=kraken`. Never commit `.env`.
+The default `run-once` command is dry-run paper trading and cannot submit a real
+order. Public market data works without credentials. If you later add a Kraken
+key for private account-status checks, use a **read-only** key (*Query Funds* +
+*Query Orders* only — never *Withdraw Funds*). Never commit `.env`.
 
 ## Commands
 
@@ -73,11 +78,12 @@ locks are engaged.
 ## Tests
 
 ```bash
-|ruff check .    # All checks passed|
-|pytest -q       # 114 passed (30 Kraken gateway + 84 engine/safety)|
+ruff check .     # lint the complete project
+pytest -q        # run the complete offline test suite
 ```
 
-The suite is fully offline — no network calls, no real orders.
+Current verified result: **191 tests passed**. The suite is fully offline — no
+network calls, no real orders.
 `tests/test_safety_locks.py` fails loudly if the trading locks are relaxed.
 
 ## Important

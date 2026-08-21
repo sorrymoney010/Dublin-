@@ -340,9 +340,22 @@ def save_report(settings: Settings, report: LearningReport) -> Path:
     return report_path
 
 
-def generate_brief(settings: Settings) -> str:
-    """Generate a human-readable daily brief from the learning report."""
-    report = build_learning_report(settings)
+def generate_brief(
+    settings: Settings,
+    decisions: list[dict] | None = None,
+    market_closes: list[float] | None = None,
+) -> str:
+    """Generate a human-readable daily brief from the learning report.
+
+    Callers may provide already-loaded decisions and closes. Besides making
+    batch use cheaper, this keeps tests and other offline workflows from
+    silently reaching a market-data service.
+    """
+    report = build_learning_report(
+        settings,
+        decisions=decisions,
+        market_closes=market_closes,
+    )
     lines = [
         f"=== Dublin Daily Brief ({report.timestamp[:10]}) ===",
         f"Market Regime: {report.regime.description}",

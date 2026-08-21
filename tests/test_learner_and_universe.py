@@ -55,7 +55,8 @@ def test_learner_persists_and_reloads(tmp_path):
 # ── autonomous selection (no manual pinning) ───────────────
 def make_engine(universe="all_usd", symbols=None):
     s = Settings(_env_file=None, universe_mode=universe, symbol="XRP/USD",
-                 learner_enabled=True, strategy="mean_reversion")
+                 learner_enabled=True, strategy="mean_reversion",
+                 sentiment_enabled=False)
     gw = MagicMock()
     gw.account_equity.return_value = 20.0
     gw.has_position.return_value = False

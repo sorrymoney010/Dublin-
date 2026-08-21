@@ -297,13 +297,13 @@ class TestSaveReport:
 
 class TestGenerateBrief:
     def test_brief_has_regime(self, sample_settings, sample_decisions, uptrend_bars):
-        brief = generate_brief(sample_settings)
+        brief = generate_brief(sample_settings, sample_decisions, uptrend_bars)
         assert "Market Regime" in brief
 
     def test_brief_has_timestamp(self, sample_settings, sample_decisions, uptrend_bars):
-        brief = generate_brief(sample_settings)
+        brief = generate_brief(sample_settings, sample_decisions, uptrend_bars)
         assert "Brief" in brief
 
     def test_brief_mentions_safety(self, sample_settings, sample_decisions, uptrend_bars):
-        brief = generate_brief(sample_settings)
+        brief = generate_brief(sample_settings, sample_decisions, uptrend_bars)
         assert "approval" in brief.lower() or "owner" in brief.lower()

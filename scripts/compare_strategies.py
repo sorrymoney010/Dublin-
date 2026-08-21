@@ -11,7 +11,7 @@ Run:
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -205,7 +205,7 @@ def replay(symbol: str, days: int, fee_rate: float, start_equity: float,
     equity = start_equity
     peak = start_equity
     in_pos = False
-    ep = eq = en = et = 0.0
+    eq = en = 0.0
     res = VariantResult(strat_fn.__name__)
     pnls = []
 
@@ -234,8 +234,6 @@ def replay(symbol: str, days: int, fee_rate: float, start_equity: float,
                 if dec.approved and dec.notional_usd > 0:
                     en = dec.notional_usd
                     eq = en / price
-                    ep = price
-                    et = float(window.iloc[-1]["time"])
                     in_pos = True
         else:
             if action == "SELL":

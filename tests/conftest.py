@@ -187,6 +187,9 @@ def settings_factory(tmp_path):
             kraken_api_key="test-key",
             kraken_api_secret=FAKE_SECRET,
             symbol="BTC/USD",
+            # Network-backed sentiment is covered by its own fully mocked
+            # tests. Keep shared engine fixtures strictly offline.
+            sentiment_enabled=False,
             timeframe_minutes=60,
             lookback_bars=250,
             journal_path=tmp_path / "decisions.jsonl",

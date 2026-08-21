@@ -106,6 +106,8 @@ class TradingEngine:
         self.dca = DCAAccumulator(settings)
         self.dca._state_path = settings.dca_state_path
         self._dca_state = self.dca.load(settings.dca_state_path)
+        self._dca_executed_this_cycle = False
+        self._dca_notional = 0.0
         from .learner import LearningAgent
         self.learner = LearningAgent(
             settings.learner_path,
@@ -446,6 +448,10 @@ class TradingEngine:
                     self.settings.symbol = self.settings.dca_symbol
                     signal = dca_signal
                     self._dca_executed_this_cycle = True
+                    # DCA sizes by its own fixed USD, NOT the risk-manager
+                    # notional (which would be risk_per_trade*equity and fall
+                    # below Kraken's minimum order size on a small account).
+                    self._dca_notional = self.settings.dca_fixed_usd
                     self.audit.record(AuditEvent.SIGNAL, {
                         "event": "dca_signal", "symbol": self.settings.dca_symbol,
                         "reason": dca_signal.reason, "price": pump_price,
@@ -503,11 +509,26 @@ class TradingEngine:
 
         # Gates 7–9 — precision, idempotency, execution
         if signal.action is Action.BUY and risk.approved:
-            order_id, risk = self._execute(
-                side="buy", notional=risk.notional_usd, risk=risk,
-                bar_timestamp=bar_timestamp, state=state, gates=gates,
-                leverage=leverage,
+            buy_notional = (
+                self._dca_notional
+                if getattr(self, "_dca_executed_this_cycle", False)
+                else risk.notional_usd
             )
+            # Never attempt an order larger than the account can afford. A buy
+            # above available balance is rejected by the exchange (and would
+            # otherwise be retried every cycle). Cap to the position budget.
+            max_affordable = equity * self.settings.max_position_fraction
+            if buy_notional > max_affordable:
+                buy_notional = max_affordable
+            if buy_notional <= 0:
+                risk = RiskDecision(False, "No affordable size (balance below minimum order)")
+                order_id = None
+            else:
+                order_id, risk = self._execute(
+                    side="buy", notional=buy_notional, risk=risk,
+                    bar_timestamp=bar_timestamp, state=state, gates=gates,
+                    leverage=leverage,
+                )
             # If this BUY was a DCA accumulator entry and an order was actually
             # placed, update its counters. Symbol restoration happens below
             # (outside this branch) so it runs even if risk rejected the order.
