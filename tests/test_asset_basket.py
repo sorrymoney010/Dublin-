@@ -40,6 +40,9 @@ def make_settings(**overrides) -> Settings:
         symbol="BTC/USD",
         timeframe_minutes=60,
         lookback_bars=500,
+        # Budget equals equity here so the live budget cap (strategy_equity_usd)
+        # does not bind and the symbol-agnosticism assertion is isolated.
+        strategy_equity_usd=1000.0,
     )
     defaults.update(overrides)
     return Settings(**defaults)

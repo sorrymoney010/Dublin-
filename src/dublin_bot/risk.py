@@ -71,7 +71,12 @@ class RiskManager:
         returns: pd.Series | None = None,
     ) -> RiskDecision:
         s = self.settings
-        equity = max(state.current_equity, 0.0) or s.strategy_equity_usd
+        # Sizing equity is capped at the advertised budget (strategy_equity_usd).
+        # The bot must never size against more than the owner authorized, even
+        # when the real Kraken balance is larger. The real equity is still used
+        # for "can I afford this at all" floors elsewhere; here it is a ceiling.
+        real_equity = max(state.current_equity, 0.0)
+        equity = min(real_equity, s.strategy_equity_usd) or real_equity
         # Exits (SELL) from an existing position are gated only by the signal
         # action and the engine's position/idempotency/gateway checks — NOT by
         # the entry breakers below. A trapped position must always be free to
@@ -84,7 +89,7 @@ class RiskManager:
             return RiskDecision(False, "Daily loss circuit breaker is active")
         if equity < s.min_order_notional_usd:
             return RiskDecision(False, f"Account equity {equity:.2f} below minimum order notional")
-        drawdown = 1 - (equity / max(state.peak_equity, 0.01))
+        drawdown = 1 - (equity / max(min(state.peak_equity, s.strategy_equity_usd), 0.01))
         if drawdown >= s.max_drawdown_fraction:
             return RiskDecision(False, "Maximum drawdown circuit breaker is active")
         if s.max_orders_per_day > 0 and state.orders_today >= s.max_orders_per_day:

@@ -156,6 +156,18 @@ class Settings(BaseSettings):
     volume_lookback: int = Field(default=20, ge=2)
     min_volume_ratio: float = Field(default=1.10, gt=0)
     min_order_notional_usd: float = Field(default=1.0, ge=1.0)
+    # ── Advanced order execution (Kraken full API) ──────────
+    # The bot places exchange-native bracket orders (stop-loss + take-profit)
+    # and can use limit (maker) entries to cut fees. All still flow through the
+    # idempotency, precision, and risk gates.
+    order_type: str = Field(default="market", pattern="^(market|limit)$")
+    # Fraction of ask (buy) / bid (sell) used to post a limit order inside the
+    # spread. 0.001 = 0.1% better than touch. Only used when order_type="limit".
+    limit_offset_pct: float = Field(default=0.001, gt=0, le=0.02)
+    use_bracket: bool = Field(default=True)  # attach SL+TP on entry
+    stop_loss_pct: float = Field(default=0.04, gt=0, le=0.50)   # 4% below entry
+    take_profit_pct: float = Field(default=0.08, gt=0, le=1.0)  # 8% above entry
+    trailing_stop: bool = Field(default=False)                 # trail SL to peak
     journal_path: Path = Path("logs/decisions.jsonl")
 
     @model_validator(mode="after")

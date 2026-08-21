@@ -47,6 +47,8 @@ class AuditEvent(StrEnum):
     ORDER_SUBMITTED = "order_submitted"
     ORDER_REJECTED = "order_rejected"
     ORDER_DUPLICATE_BLOCKED = "order_duplicate_blocked"
+    ORDER_CANCELLED = "order_cancelled"
+    ORDER_EDITED = "order_edited"
     RECOVERY = "recovery"
     RECONCILIATION = "reconciliation"
     BROKER_ERROR = "broker_error"

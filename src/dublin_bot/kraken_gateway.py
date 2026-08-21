@@ -747,20 +747,26 @@ class KrakenGateway:
                 continue
         return positions
 
-    def close_position(self, *, userref: int | None = None) -> str:
-        """Sell the entire base-asset balance of the configured pair."""
+    def close_position(self, *, userref: int | None = None, quantity: float | None = None) -> str:
+        """Sell the base-asset balance of the configured pair.
+
+        If ``quantity`` is given it is an explicit cap (the bot's own acquired
+        lot) so the order never liquidates holdings the bot did not purchase.
+        Otherwise the full balance is sold (legacy behaviour).
+        """
         positions = self.positions()
         if not positions:
             raise BrokerError("No position to close")
         meta = self.resolve_symbol()
-        quantity = positions[0]["quantity"]
+        full = float(positions[0]["quantity"])
+        target = min(quantity, full) if quantity is not None else full
         precision = meta.to_precision()
         from .precision import round_volume
 
-        volume = round_volume(quantity, precision)
+        volume = round_volume(target, precision)
         if volume <= 0:
             raise BrokerError(
-                f"Position {quantity} rounds to zero volume for {meta.key}"
+                f"Position {target} rounds to zero volume for {meta.key}"
             )
 
         if not self.order_submission_enabled:
@@ -786,6 +792,81 @@ class KrakenGateway:
             "order_id": order_id, "userref": userref,
         }, severity="warning")
         return order_id
+
+    def add_order(self, params: dict) -> str:
+        """Submit a raw ``AddOrder`` with pre-built params (advanced orders).
+
+        ``params`` is the flattened dict from ``orders.BracketPlan.to_addorder_params``
+        (pair/type/ordertype/volume/price/close[...]). All safety gates apply:
+        dry-run returns a synthetic id and logs; live requires submission enabled.
+        """
+        if not self.order_submission_enabled:
+            self._log(AuditEvent.ORDER_INTENT, {"mode": "dry_run", **params})
+            return f"kraken-dry-{params.get('userref', int(time.time()))}"
+        self._assert_can_submit()
+        result = self._private("AddOrder", dict(params))
+        order_id = (result.get("txid") or ["unknown"])[0]
+        self._log(AuditEvent.ORDER_SUBMITTED,
+                  {"pair": params.get("pair"), "side": params.get("type"),
+                   "ordertype": params.get("ordertype"), "order_id": order_id,
+                   "bracket": "close" in params},
+                  severity="warning")
+        return order_id
+
+    def cancel_order(self, txid: str) -> bool:
+        """Cancel an open order by txid. Best-effort; returns success."""
+        if not self.order_submission_enabled:
+            self._log(AuditEvent.ORDER_INTENT, {"mode": "dry_run", "cancel": txid})
+            return True
+        self._assert_can_submit()
+        try:
+            self._private("CancelOrder", {"txid": txid})
+            self._log(AuditEvent.ORDER_CANCELLED, {"txid": txid})
+            return True
+        except BrokerError as exc:
+            self._log(AuditEvent.BROKER_ERROR,
+                      {"operation": "CancelOrder", "txid": txid, "error": str(exc)},
+                      severity="warning")
+            return False
+
+    def cancel_attached(self, userref: int) -> int:
+        """Cancel any open orders carrying a userref >= base and < base+10.
+
+        Bracket children use refs ``userref+1`` (stop) and ``userref+2`` (target),
+        so cancelling the parent's neighbourhood clears the whole bracket. Returns
+        the number of orders cancelled.
+        """
+        if not self.order_submission_enabled:
+            return 0
+        cancelled = 0
+        for ref in range(userref, userref + 10):
+            try:
+                result = self._private("OpenOrders", {"userref": ref})
+            except BrokerError:
+                continue
+            for txid in (result.get("open") or {}).keys():
+                if self.cancel_order(txid):
+                    cancelled += 1
+        return cancelled
+
+    def edit_order(self, txid: str, *, price: float | None = None,
+                   volume: float | None = None) -> str:
+        """Amend an open order's price and/or volume (Kraken EditOrder)."""
+        from .orders import fmt_price
+        if not self.order_submission_enabled:
+            self._log(AuditEvent.ORDER_INTENT,
+                      {"mode": "dry_run", "edit": txid, "price": price, "volume": volume})
+            return txid
+        self._assert_can_submit()
+        params: dict[str, str] = {"txid": txid}
+        if price is not None:
+            params["price"] = fmt_price(price)
+        if volume is not None:
+            params["volume"] = format(volume, "f")
+        result = self._private("EditOrder", params)
+        new_id = (result.get("txid") or [txid])[0]
+        self._log(AuditEvent.ORDER_EDITED, {"txid": txid, "new_txid": new_id})
+        return new_id
 
     # ── health ───────────────────────────────────────────────
 

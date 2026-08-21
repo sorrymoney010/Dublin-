@@ -108,6 +108,10 @@ class TradingEngine:
         self._dca_state = self.dca.load(settings.dca_state_path)
         self._dca_executed_this_cycle = False
         self._dca_notional = 0.0
+        # Bot-owned lot ledger: symbol -> quantity the bot actually acquired,
+        # so a SELL never liquidates holdings the bot did not purchase.
+        self._bot_qty_path = Path("logs/bot_positions.json")
+        self._bot_qty: dict[str, float] = self._load_bot_qty()
         from .learner import LearningAgent
         self.learner = LearningAgent(
             settings.learner_path,
@@ -516,18 +520,20 @@ class TradingEngine:
             )
             # Never attempt an order larger than the account can afford. A buy
             # above available balance is rejected by the exchange (and would
-            # otherwise be retried every cycle). Cap to the position budget.
-            max_affordable = equity * self.settings.max_position_fraction
+            # otherwise be retried every cycle). Cap to the position budget,
+            # which itself is bounded by the authorized sizing budget.
+            budget = min(equity, self.settings.strategy_equity_usd)
+            max_affordable = budget * self.settings.max_position_fraction
             if buy_notional > max_affordable:
                 buy_notional = max_affordable
             if buy_notional <= 0:
                 risk = RiskDecision(False, "No affordable size (balance below minimum order)")
                 order_id = None
             else:
-                order_id, risk = self._execute(
-                    side="buy", notional=buy_notional, risk=risk,
+                order_id, risk = self._execute_buy(
+                    notional=buy_notional, risk=risk,
                     bar_timestamp=bar_timestamp, state=state, gates=gates,
-                    leverage=leverage,
+                    leverage=leverage, dca=getattr(self, "_dca_executed_this_cycle", False),
                 )
             # If this BUY was a DCA accumulator entry and an order was actually
             # placed, update its counters. Symbol restoration happens below
@@ -536,8 +542,9 @@ class TradingEngine:
                 self.dca.record_buy(self._dca_state)
         elif signal.action is Action.SELL and in_position and risk.approved:
             # Exits use the risk manager's verdict (approved for SELL, never
-            # blocked by entry breakers). Position existence, idempotency,
-            # precision, and gateway safety are still enforced in _execute.
+            # blocked by entry breakers). Cancel any attached bracket orders
+            # first so the exchange-native stop/target don't fight the close.
+            self._cancel_attached_bracket(state)
             order_id, risk = self._execute(
                 side="sell", notional=0.0, risk=risk,
                 bar_timestamp=bar_timestamp, state=state, gates=gates,
@@ -566,7 +573,8 @@ class TradingEngine:
         return CycleResult(record, None, None, gates)
 
     def _execute(self, *, side: str, notional: float, risk: RiskDecision,
-                 bar_timestamp: str, state, gates: dict, leverage: float | None = None) -> tuple[str | None, RiskDecision]:
+                 bar_timestamp: str, state, gates: dict, leverage: float | None = None,
+                 bracket_plan=None) -> tuple[str | None, RiskDecision]:
         """Reserve an idempotency key, then execute. Never resends on ambiguity."""
         key = make_intent_key(
             symbol=self.settings.symbol, side=side,
@@ -587,28 +595,64 @@ class TradingEngine:
         gates["idempotency"] = {"blocked": False, "key": key, "userref": record.userref}
         try:
             if side == "buy":
-                order_id = self.gateway.buy_notional(notional, userref=record.userref, leverage=leverage)
-                if self.settings.paper_trading or self.settings.dry_run:
-                    ticker = self.gateway.get_ticker()
-                    sized = self.gateway.size_buy(notional, price=float(ticker["ask"]))
-                    fill = self.fill_model.buy(
-                        price=float(sized.price),
-                        volume=float(sized.volume),
-                        bid=float(ticker.get("bid", 0.0)) if ticker.get("bid") else None,
-                        ask=float(ticker.get("ask", 0.0)) if ticker.get("ask") else None,
-                    )
-                    self.paper_portfolio.record_buy(
-                        symbol=self.settings.symbol,
-                        quantity=float(sized.volume),
-                        fill_price=fill.price,
-                        fee=fill.fee,
-                        when=datetime.now(timezone.utc).isoformat(),
-                    )
-                    portfolio = self.paper_portfolio.snapshot()
-                    state.current_equity = portfolio.equity
-                    state.peak_equity = max(state.peak_equity, state.current_equity)
+                if bracket_plan is not None:
+                    # Advanced path: submit the bracket/limit order via AddOrder.
+                    bracket_plan.userref = record.userref
+                    params = bracket_plan.to_addorder_params()
+                    order_id = self.gateway.add_order(params)
+                    if self.settings.paper_trading or self.settings.dry_run:
+                        ticker = self.gateway.get_ticker()
+                        sized = self.gateway.size_buy(notional, price=float(ticker["ask"]))
+                        fill = self.fill_model.buy(
+                            price=float(sized.price),
+                            volume=float(sized.volume),
+                            bid=float(ticker.get("bid", 0.0)) if ticker.get("bid") else None,
+                            ask=float(ticker.get("ask", 0.0)) if ticker.get("ask") else None,
+                        )
+                        self.paper_portfolio.record_buy(
+                            symbol=self.settings.symbol,
+                            quantity=float(sized.volume),
+                            fill_price=fill.price,
+                            fee=fill.fee,
+                            when=datetime.now(timezone.utc).isoformat(),
+                        )
+                        portfolio = self.paper_portfolio.snapshot()
+                        state.current_equity = portfolio.equity
+                        state.peak_equity = max(state.peak_equity, state.current_equity)
+                else:
+                    order_id = self.gateway.buy_notional(notional, userref=record.userref, leverage=leverage)
+                    if order_id is not None:
+                        # Legacy / DCA buy path: record the bot-owned lot so a
+                        # later SELL never sweeps external holdings (#3).
+                        sized_qty = float(self.gateway.size_buy(notional, price=float(self.gateway.get_ticker().get("ask", 0) or 1)).volume)
+                        self._record_bot_buy(self.settings.symbol, sized_qty)
+                    if self.settings.paper_trading or self.settings.dry_run:
+                        ticker = self.gateway.get_ticker()
+                        sized = self.gateway.size_buy(notional, price=float(ticker["ask"]))
+                        fill = self.fill_model.buy(
+                            price=float(sized.price),
+                            volume=float(sized.volume),
+                            bid=float(ticker.get("bid", 0.0)) if ticker.get("bid") else None,
+                            ask=float(ticker.get("ask", 0.0)) if ticker.get("ask") else None,
+                        )
+                        self.paper_portfolio.record_buy(
+                            symbol=self.settings.symbol,
+                            quantity=float(sized.volume),
+                            fill_price=fill.price,
+                            fee=fill.fee,
+                            when=datetime.now(timezone.utc).isoformat(),
+                        )
+                        portfolio = self.paper_portfolio.snapshot()
+                        state.current_equity = portfolio.equity
+                        state.peak_equity = max(state.peak_equity, state.current_equity)
             else:
-                order_id = self.gateway.close_position(userref=record.userref)
+                # Sell only the bot's own acquired lot — never sweep external
+                # holdings of the same pair (audit finding #3).
+                bot_qty = self._bot_qty.get(self.settings.symbol, None)
+                order_id = self.gateway.close_position(
+                    userref=record.userref, quantity=bot_qty
+                )
+                self._record_bot_sell(self.settings.symbol)
                 if self.settings.paper_trading or self.settings.dry_run:
                     ticker = self.gateway.get_ticker()
                     portfolio = self.paper_portfolio.snapshot()
@@ -652,6 +696,119 @@ class TradingEngine:
         state.orders_today += 1
         state.last_order_at = datetime.now(timezone.utc)
         return order_id, risk
+
+    def _execute_buy(self, *, notional: float, risk: RiskDecision,
+                     bar_timestamp: str, state, gates: dict,
+                     leverage: float | None, dca: bool) -> tuple[str | None, RiskDecision]:
+        """Advanced BUY path: bracket (SL+TP) and/or limit entry.
+
+        Falls back to the legacy ``buy_notional`` market order when neither
+        bracket nor limit is configured. All other gates (idempotency,
+        precision, risk) are still enforced by ``_execute``.
+        """
+        from .orders import BracketPlan, limit_entry_price, fmt_price, build_take_profit_order
+
+        s = self.settings
+        # Reference price for SL/TP math and limit posting.
+        ticker = self.gateway.get_ticker_for(s.symbol) if hasattr(self.gateway, "get_ticker_for") else self.gateway.get_ticker()
+        touch = float(ticker.get("ask", 0.0) or ticker.get("last", 0.0))
+        if touch <= 0:
+            return self._execute(side="buy", notional=notional, risk=risk,
+                                 bar_timestamp=bar_timestamp, state=state, gates=gates,
+                                 leverage=leverage)
+        meta = self.gateway.resolve_symbol()
+        sized = self.gateway.size_buy(notional, price=touch)
+        volume = sized.volume_str
+
+        use_bracket = s.use_bracket and not dca  # DCA keeps it simple (no bracket)
+        use_limit = (s.order_type == "limit") and not dca
+        if not (use_bracket or use_limit):
+            return self._execute(side="buy", notional=notional, risk=risk,
+                                 bar_timestamp=bar_timestamp, state=state, gates=gates,
+                                 leverage=leverage)
+
+        entry_price = None
+        if use_limit:
+            entry_price = fmt_price(limit_entry_price("buy", touch, s.limit_offset_pct))
+        sl = None
+        if use_bracket:
+            # Exchange-side protective stop. Use the config stop-loss percentage
+            # applied to the entry price (auditable, deterministic).
+            sl = (float(entry_price or touch)) * (1.0 - s.stop_loss_pct)
+        plan = BracketPlan(
+            pair=meta.key,
+            side="buy",
+            volume=volume,
+            ordertype="limit" if use_limit else "market",
+            entry_price=entry_price,
+            stop_loss=sl,
+            userref=None,  # filled by _execute idempotency
+            leverage=leverage,
+            trailing=s.trailing_stop,
+            pair_decimals=meta.pair_decimals,
+        )
+        # Route through _execute so idempotency/ledger/precision still apply,
+        # but submit via the advanced add_order with the bracket block.
+        res = self._execute(
+            side="buy", notional=notional, risk=risk,
+            bar_timestamp=bar_timestamp, state=state, gates=gates,
+            leverage=leverage, bracket_plan=plan,
+        )
+        # Take-profit: a separate resting limit order (avoids close[1] which
+        # this tier rejects). Only on a real entry with bracket enabled.
+        if use_bracket and s.take_profit_pct > 0 and res[0] is not None:
+            try:
+                tp_price = (float(entry_price or touch)) * (1.0 + s.take_profit_pct)
+                tp_params = build_take_profit_order(
+                    meta.key, "buy", volume, tp_price,
+                    userref=(plan.userref or 0) + 2 if plan.userref else None,
+                    pair_decimals=meta.pair_decimals,
+                )
+                self.gateway.add_order(tp_params)
+            except (BrokerError, SafetyLockError):
+                pass
+        if res[0] is not None:
+            self._record_bot_buy(s.symbol, float(volume))
+        return res
+
+    # ── bot-owned lot ledger (audit finding #3) ─────────────
+    def _load_bot_qty(self) -> dict[str, float]:
+        try:
+            import json
+            return json.loads(self._bot_qty_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _save_bot_qty(self) -> None:
+        import json
+        self._bot_qty_path.parent.mkdir(parents=True, exist_ok=True)
+        self._bot_qty_path.write_text(json.dumps(self._bot_qty), encoding="utf-8")
+
+    def _record_bot_buy(self, symbol: str, qty: float) -> None:
+        self._bot_qty[symbol] = self._bot_qty.get(symbol, 0.0) + qty
+        self._save_bot_qty()
+
+    def _record_bot_sell(self, symbol: str, qty: float | None = None) -> None:
+        if qty is None:
+            # Full bot lot sold.
+            self._bot_qty.pop(symbol, None)
+        else:
+            remaining = self._bot_qty.get(symbol, 0.0) - qty
+            if remaining <= 1e-12:
+                self._bot_qty.pop(symbol, None)
+            else:
+                self._bot_qty[symbol] = remaining
+        self._save_bot_qty()
+
+    def _cancel_attached_bracket(self, state) -> None:
+        """Cancel any exchange-native stop/target still attached to the open trade."""
+        ref = getattr(state, "open_userref", None)
+        if ref is None:
+            return
+        try:
+            self.gateway.cancel_attached(int(ref))
+        except (BrokerError, SafetyLockError, ValueError):
+            pass
 
     # ── backwards-compatible entry point ─────────────────────
 
