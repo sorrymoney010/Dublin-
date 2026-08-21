@@ -175,3 +175,19 @@ def test_budget_cap_limits_sizing_to_strategy_equity():
     # Hard ceiling: budget ($25) * max_position_fraction (0.40) = $10.
     assert decision.notional_usd <= 25.0 * 0.40 + 1e-6
     assert decision.notional_usd <= 10.0 + 1e-6
+
+
+def test_universe_allowlist_defaults_to_positive_expectancy_coins():
+    """Audit #8: the live MR edge is coin-specific, so the default universe
+    must be restricted to coins with positive backtested expectancy — not the
+    entire Kraken market (which bleeds on XRP/SOL)."""
+    s = Settings(_env_file=None)
+    assert s.universe_allowlist == ["PUMP/USD", "BTC/USD"]
+    # The engine applies the allowlist on top of all_usd discovery.
+    candidates = ["PUMP/USD", "BTC/USD", "XRP/USD", "SOL/USD"]
+    if s.universe_allowlist:
+        allowed = {x.upper() for x in s.universe_allowlist}
+        candidates = [c for c in candidates if c.upper() in allowed]
+    assert "XRP/USD" not in candidates
+    assert "SOL/USD" not in candidates
+

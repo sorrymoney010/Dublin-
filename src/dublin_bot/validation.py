@@ -6,7 +6,7 @@ import pandas as pd
 
 from .config import Settings
 from .models import Action
-from .strategy import TrendBreakoutStrategy
+from .strategy import build_strategy
 
 
 @dataclass(frozen=True)
@@ -34,7 +34,7 @@ class BacktestResult:
 
 def backtest(bars: pd.DataFrame, settings: Settings, costs: BacktestCosts | None = None) -> BacktestResult:
     costs = costs or BacktestCosts()
-    strategy = TrendBreakoutStrategy(settings)
+    strategy = build_strategy(settings)
     equity = settings.strategy_equity_usd
     peak = equity
     max_dd = 0.0

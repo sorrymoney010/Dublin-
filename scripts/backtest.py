@@ -23,7 +23,7 @@ from dublin_bot.engine import build_gateway
 from dublin_bot.kraken_gateway import KrakenGateway
 from dublin_bot.models import Action, Signal
 from dublin_bot.risk import RiskManager, SessionState
-from dublin_bot.strategy import TrendBreakoutStrategy
+from dublin_bot.strategy import build_strategy
 
 
 # ── real historical bars from Kraken public OHLC ────────────────
@@ -106,16 +106,25 @@ class BacktestResult:
 
 
 def run_backtest(symbol: str, days: int, fee_rate: float = 0.0026,
-                 start_equity: float = 1000.0, interval_min: int = 15) -> BacktestResult:
-    """Replay the real strategy/risk pipeline bar-by-bar."""
+                 start_equity: float = 1000.0, interval_min: int = 60,
+                 strategy_name: str | None = None) -> BacktestResult:
+    """Replay the REAL live strategy/risk pipeline bar-by-bar.
+
+    Defaults to the strategy the bot is actually running (build_strategy), so the
+    validation matches what is risking money. ``--strategy`` can pin a specific
+    variant for comparison. Charges realistic taker fees on both legs.
+    """
     settings = Settings(_env_file=None) if _has_envarg() else Settings()
     settings.symbol = symbol
+    settings.timeframe_minutes = interval_min
+    if strategy_name:
+        settings.strategy = strategy_name
     gw = build_gateway(settings)
     bars = fetch_history(gw, symbol, days, interval_min)
     if bars.empty:
         raise RuntimeError(f"No history for {symbol}")
 
-    strat = TrendBreakoutStrategy(settings)
+    strat = build_strategy(settings)  # live strategy factory
     risk = RiskManager(settings)
 
     equity = start_equity
@@ -195,11 +204,18 @@ def main() -> None:
     ap.add_argument("--days", type=int, default=120)
     ap.add_argument("--fee", type=float, default=0.0026)
     ap.add_argument("--equity", type=float, default=1000.0)
+    ap.add_argument("--interval", type=int, default=60,
+                    help="candle interval in minutes (live bot uses 60)")
+    ap.add_argument("--strategy", default=None,
+                    help="override strategy (mean_reversion|momentum). "
+                         "Default = the live bot's strategy (build_strategy).")
     args = ap.parse_args()
 
-    print(f"Backtesting {args.symbol} over {args.days}d (15m bars, fee {args.fee*100:.2f}%) ...")
+    print(f"Backtesting {args.symbol} over {args.days}d ({args.interval}m bars, "
+          f"fee {args.fee*100:.2f}%) using the LIVE strategy pipeline ...")
     res = run_backtest(args.symbol, args.days, fee_rate=args.fee,
-                       start_equity=args.equity)
+                       start_equity=args.equity, interval_min=args.interval,
+                       strategy_name=args.strategy)
 
     print(f"\n=== {res.symbol} | {res.bars} bars | {res.n} trades ===")
     print(f"Win rate      : {res.win_rate*100:.1f}%  ({res.wins}/{res.n})")

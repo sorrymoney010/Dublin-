@@ -48,19 +48,35 @@ class RiskManager:
 
     _last_scale = 1.0
 
-    def update_scale(self, state: SessionState) -> None:
-        """Adjust the adaptation factor from the most recent closed trade P&L.
+    def update_scale_from_trade(self, realized_pnl: float, state: SessionState) -> None:
+        """Adjust the adaptation factor from a single closed trade's P&L.
 
-        A win nudges the scale up by ``risk_step``; a loss nudges it down. The
-        scale is clamped to [min_risk_scale, max_risk_scale] so a hot streak
-        compounds allocation while a cold streak tightens it — never below the
-        floor, never past the ceiling.
+        A win nudges the scale up by ``risk_step``; a loss nudges it down.
+        The scale is clamped to [min_risk_scale, max_risk_scale] so a hot streak
+        compounds allocation while a cold streak tightens it. Win/loss streaks
+        are persisted on ``state`` so the adaptation survives across cycles and
+        restarts (previously these fields existed but were never written, so
+        adaptive risk was a permanent no-op).
         """
         s = self.settings
-        if state.realized_pnl_today > 0 and state.win_streak >= 1:
+        if not s.adaptive_risk:
+            return
+        if realized_pnl > 0:
+            state.win_streak += 1
+            state.loss_streak = 0
             self._last_scale = min(s.max_risk_scale, self._last_scale + s.risk_step)
-        elif state.realized_pnl_today < 0 and state.loss_streak >= 1:
+        elif realized_pnl < 0:
+            state.loss_streak += 1
+            state.win_streak = 0
             self._last_scale = max(s.min_risk_scale, self._last_scale - s.risk_step)
+        else:
+            return
+        state.risk_scale = self._last_scale
+
+    def update_scale(self, state: SessionState) -> None:
+        """Legacy entry point kept for compatibility; no-op when adaptive off."""
+        if not self.settings.adaptive_risk:
+            return
         state.risk_scale = self._last_scale
 
     def evaluate(

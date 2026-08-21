@@ -79,9 +79,14 @@ class Settings(BaseSettings):
     #   "full API access" mode — no manual coin section.
     universe_mode: str = Field(default="all_usd")
     # Hard safety allowlist applied ON TOP of the universe. Coins here are the
-    # only ones the bot may ever touch; in "all_usd" mode this stays empty so
-    # the full market is reachable, but it can pin the bot down if desired.
-    universe_allowlist: list[str] = Field(default_factory=list)
+    # only ones the bot may ever touch. Default = the set with POSITIVE
+    # backtested expectancy for the live mean-reversion strategy (audit #8:
+    # the edge is coin-specific — XRP/SOL bleed, PUMP/BTC are positive). The
+    # bot still ranks autonomously within this set; it just cannot leak on
+    # negative-expectancy coins. Override via UNIVERSE_ALLOWLIST in .env.
+    universe_allowlist: list[str] = Field(
+        default_factory=lambda: ["PUMP/USD", "BTC/USD"]
+    )
     # Max coins scored per cycle (each costs one get_bars call). The bot scans
     # the vetted basket first; if you raise this it will also probe the broader
     # Kraken USD market (via list_usd_pairs) up to the limit. Keep small to

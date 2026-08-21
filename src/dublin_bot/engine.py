@@ -559,8 +559,15 @@ class TradingEngine:
             self._dca_executed_this_cycle = False
 
         self.state_store.save(state)
-        # Adapt risk scaling from the session's realized P&L streak.
-        self.risk.update_scale(state)
+        # Adapt risk scaling from the session's realized P&L streak. In live
+        # mode the per-cycle equity delta equals the realized P&L of any trade
+        # closed this cycle; in paper mode the per-trade update already ran in
+        # the SELL path. Either way the win/loss streak drives the scale (#6).
+        cycle_pnl = state.current_equity - equity
+        if abs(cycle_pnl) > 1e-9:
+            self.risk.update_scale_from_trade(cycle_pnl, state)
+        else:
+            self.risk.update_scale(state)
         record = DecisionRecord(
             symbol=self.settings.symbol,
             signal=signal,
@@ -676,6 +683,9 @@ class TradingEngine:
                         self.learner.record_trade(
                             self.settings.symbol, realized, self.learner.last_regime
                         )
+                        # Adaptive risk: update win/loss streak + scale from
+                        # the realized P&L of this closed trade (audit #6).
+                        self.risk.update_scale_from_trade(realized, state)
                         state.realized_pnl_today += realized
                         state.current_equity = self.paper_portfolio.snapshot().equity
                         state.peak_equity = max(state.peak_equity, state.current_equity)
