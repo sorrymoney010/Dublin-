@@ -1866,8 +1866,32 @@ def serve_dashboard(settings: Settings, run: bool = True) -> int:
             pass
     if not run:
         return 0
-    monitor = TradingMonitor(settings)
-    server = ThreadingHTTPServer((HOST, PORT), make_handler(settings, monitor))
+
+    # Multi-platform: launch one trading monitor per configured broker account.
+    # Each account trades the SAME engine/strategy independently, sharing the
+    # audit log and the dashboard. Single-account setups (no `accounts` list)
+    # just run the one `broker`.
+    accounts = list(getattr(settings, "accounts", []) or [])
+    if not accounts:
+        accounts = [settings.broker]
+    monitors: list["TradingMonitor"] = []
+    for broker in accounts:
+        acct_settings = settings.model_copy(deep=True)
+        acct_settings.broker = broker
+        # Per-broker credentials: kraken_api_key/secret, binance_api_key/secret,
+        # coinbase_api_key/secret. Copy the matching pair onto the Settings
+        # instance so build_gateway reads them.
+        key_attr = f"{broker}_api_key"
+        secret_attr = f"{broker}_api_secret"
+        if hasattr(settings, key_attr):
+            setattr(acct_settings, key_attr, getattr(settings, key_attr, ""))
+            setattr(acct_settings, secret_attr, getattr(settings, secret_attr, ""))
+        m = TradingMonitor(acct_settings)
+        m.start()
+        monitors.append(m)
+        print(f"[multi-platform] started monitor for broker={broker}")
+
+    server = ThreadingHTTPServer((HOST, PORT), make_handler(settings, monitors[0]))
     print(f"Dublin Terminal v2: http://{HOST}:{PORT}")
     print("Press Control-C to stop.")
     try:
@@ -1875,5 +1899,7 @@ def serve_dashboard(settings: Settings, run: bool = True) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        for m in monitors:
+            m.stop()
         server.server_close()
     return 0

@@ -27,6 +27,23 @@ class Settings(BaseSettings):
     kraken_api_secret: str = ""
     kraken_tier: str = "starter"  # starter | intermediate | pro
 
+    # ── Binance Spot ───────────────────────────────────────
+    binance_api_key: str = ""
+    binance_api_secret: str = ""
+
+    # ── Coinbase Advanced Trade ────────────────────────────
+    coinbase_api_key: str = ""
+    coinbase_api_secret: str = ""  # Coinbase uses a key *name* + PEM/passphrase
+
+    # ── Bybit Spot (optional, future) ──────────────────────
+    bybit_api_key: str = ""
+    bybit_api_secret: str = ""
+
+    # ── Multi-account: run the same engine across several brokers ──
+    # Each entry is a broker name; the matching *_api_key/_secret are read
+    # from the environment. Empty => single-account (use `broker`).
+    accounts: list[str] = Field(default_factory=list)
+
     # ── Transport / reliability ────────────────────────────
     http_timeout_seconds: float = Field(default=15.0, gt=0, le=120)
     max_retries: int = Field(default=3, ge=1, le=6)
@@ -54,6 +71,11 @@ class Settings(BaseSettings):
     # cooldown between entries. Strategy RSI/momentum gates are NOT loosened.
     timeframe_minutes: int = Field(default=15, ge=1)
     lookback_bars: int = Field(default=500, ge=220)
+    # Day-trade mode: tighten to 5-minute bars and a 60-second monitor cadence
+    # so the engine reacts intraday instead of every 15 minutes. Strategy gates
+    # are NOT loosened — only the data resolution and polling speed change.
+    # Applied at startup by TradingEngine._apply_performance_profile().
+    day_trade_mode: bool = False
     strategy_equity_usd: float = Field(default=25.0, ge=25.0)
     # Auto-scale risk per trade based on session win/loss streak. The base risk
     # (risk_per_trade) is multiplied by this factor, which the engine moves

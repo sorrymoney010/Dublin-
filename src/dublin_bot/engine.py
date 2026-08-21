@@ -39,6 +39,7 @@ from .fills import FillModel
 from .idempotency import IdempotencyLedger, make_intent_key
 from .journal import Journal
 from .kraken_gateway import KrakenGateway
+from .binance_gateway import BinanceGateway
 from .market_quality import MarketGuard, MarketQuality
 from .models import Action, DecisionRecord, RiskDecision, Signal
 from .paper import PaperPortfolio
@@ -52,14 +53,19 @@ from .dca import DCAAccumulator
 def build_gateway(settings: Settings, **kwargs):
     """Factory: returns the configured broker gateway.
 
-    Only Kraken Spot is supported.  Alpaca has been removed — see SAFETY.md.
+    Supported: kraken (Spot), binance (Spot).  Each adapter is a drop-in
+    implementation of the BrokerGateway protocol, so the engine, risk manager,
+    dashboard and audit log stay broker-agnostic.
     """
     if settings.broker == "kraken":
         kwargs.setdefault("allow_order_submission", bool(settings.allow_live_trading and not settings.paper_trading and not settings.dry_run))
         return KrakenGateway(settings, **kwargs)
+    if settings.broker == "binance":
+        kwargs.setdefault("allow_order_submission", bool(settings.allow_live_trading and not settings.paper_trading and not settings.dry_run))
+        return BinanceGateway(settings, **kwargs)
     raise ValueError(
         f"Unsupported broker: {settings.broker!r}. "
-        "Only 'kraken' is supported. Alpaca has been decommissioned."
+        "Supported: 'kraken', 'binance'."
     )
 
 
@@ -118,6 +124,43 @@ class TradingEngine:
             min_trades=settings.learner_min_trades,
             enabled=settings.learner_enabled,
         )
+        # Day-trade mode: tighten data resolution + monitor cadence so the bot
+        # reacts intraday. Strategy gates are NOT loosened — only speed.
+        self._apply_performance_profile()
+
+        # Real-time feed (WebSocket) — read-only, best-effort. Lets the bot
+        # check live price between REST cycles for protective-stop triggers.
+        # Only spun up in day-trade mode (otherwise the 15m REST cadence is
+        # enough).  Falls back to REST ticker if the socket is down.
+        self._feed = None
+        if getattr(self.settings, "day_trade_mode", False):
+            try:
+                from .realtime import KrakenRealtimeFeed
+                wsname = self._kraken_wsname()
+                self._feed = KrakenRealtimeFeed({self.settings.symbol: wsname})
+                self._feed.start()
+            except Exception:
+                self._feed = None
+
+    def _kraken_wsname(self) -> str:
+        """Kraken wsname (e.g. 'XBT/USD') for the active symbol, else canonical."""
+        try:
+            return self.gateway.resolve_symbol().wsname or self.settings.symbol
+        except Exception:
+            return self.settings.symbol
+
+    def _apply_performance_profile(self) -> None:
+        """Coerce timeframe/cadence from the high-level mode flags.
+
+        day_trade_mode -> 5m bars, 60s monitor cadence.  Lets the operator flip
+        intraday behaviour with one boolean instead of three coupled knobs.
+        """
+        s = self.settings
+        if getattr(s, "day_trade_mode", False):
+            s.timeframe_minutes = 5
+            # Keep the existing cadence unless it is slower than 60s.
+            if int(getattr(s, "monitor_interval_seconds", 900)) > 60:
+                s.monitor_interval_seconds = 60
 
     # ── gate 1: safety ───────────────────────────────────────
 
@@ -809,6 +852,39 @@ class TradingEngine:
             else:
                 self._bot_qty[symbol] = remaining
         self._save_bot_qty()
+
+    def live_price(self, symbol: str | None = None) -> float | None:
+        """Best available price: real-time WS feed if connected, else REST.
+
+        Read-only helper used for intraday protective-stop checks between the
+        slower REST cycles.  Never touches the order path.
+        """
+        sym = symbol or self.settings.symbol
+        if self._feed is not None:
+            snap = self._feed.latest(sym)
+            if snap is not None and snap.last > 0 and snap.source == "ws":
+                return snap.last
+        try:
+            return float(self.gateway.get_ticker_for(sym)["last"])
+        except Exception:
+            return None
+
+    def check_realtime_stop(self, entry_price: float, stop_price: float) -> bool:
+        """True if the live price has breached the protective stop.
+
+        Called between REST cycles in day-trade mode so a stop breach exits
+        within seconds rather than waiting up to ``monitor_interval_seconds``.
+        Returns False when no position / no feed / no breach.
+        """
+        if entry_price <= 0 or stop_price <= 0:
+            return False
+        if not self.gateway.has_position():
+            return False
+        price = self.live_price()
+        if price is None:
+            return False
+        # Long position: stop breached when price <= stop.
+        return price <= stop_price
 
     def _cancel_attached_bracket(self, state) -> None:
         """Cancel any exchange-native stop/target still attached to the open trade."""
