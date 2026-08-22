@@ -694,13 +694,14 @@ class KrakenGateway:
         try:
             result = self._private("AddOrder", params)
         except BrokerError as exc:
-            # A pair that does not support margin trading rejects the `leverage`
-            # argument outright ("Invalid arguments:leverage"). When margin mode
-            # is on but the chosen symbol is a spot-only pair, retry once as a
-            # plain spot order so the trade can still go through.
-            if leverage is not None and "leverage" in str(exc):
+            # Margin not available for this pair/account (Kraken rejects the
+            # leverage argument or reports insufficient/Non-ECP margin). Retry
+            # once as a PLAIN SPOT order so spot trading still works. We never
+            # pretend margin executed; the log is explicit.
+            msg = str(exc)
+            if "leverage" in msg or "initial margin" in msg or "Non-ECP" in msg or "Reduce only" in msg:
                 self._log(AuditEvent.BROKER_ERROR,
-                          {"operation": "AddOrder", "error": str(exc),
+                          {"operation": "AddOrder", "error": msg,
                            "fallback": "retry without leverage (spot)"},
                           severity="warning")
                 params.pop("leverage", None)
@@ -810,7 +811,25 @@ class KrakenGateway:
             self._log(AuditEvent.ORDER_INTENT, {"mode": "dry_run", **params})
             return f"kraken-dry-{params.get('userref', int(time.time()))}"
         self._assert_can_submit()
-        result = self._private("AddOrder", dict(params))
+        try:
+            result = self._private("AddOrder", params)
+        except BrokerError as exc:
+            # Margin not available for this pair/account (Kraken rejects the
+            # leverage argument or reports insufficient/Non-ECP margin). Retry
+            # once as a PLAIN SPOT order so spot trading still works — the bot
+            # must trade spot even when the account lacks margin eligibility.
+            # We never pretend margin executed; the log is explicit.
+            msg = str(exc)
+            if "leverage" in msg or "initial margin" in msg or "Non-ECP" in msg or "Reduce only" in msg:
+                params = dict(params)
+                params.pop("leverage", None)
+                self._log(AuditEvent.BROKER_ERROR,
+                          {"operation": "AddOrder", "error": msg,
+                           "fallback": "retry without leverage (spot)"},
+                          severity="warning")
+                result = self._private("AddOrder", params)
+            else:
+                raise
         order_id = (result.get("txid") or ["unknown"])[0]
         self._log(AuditEvent.ORDER_SUBMITTED,
                   {"pair": params.get("pair"), "side": params.get("type"),

@@ -996,6 +996,12 @@ class TradingEngine:
             return {}
 
     def _save_bot_qty(self) -> None:
+        # Never persist the lot ledger in paper/dry-run mode. A diagnostic or
+        # dry cycle that "buys" would otherwise write phantom lots to
+        # logs/bot_positions.json, which the LIVE bot then reads as real and
+        # freezes into exit-only (stale-phantom-lot freeze — audit finding).
+        if self.settings.paper_trading or self.settings.dry_run:
+            return
         import json
         self._bot_qty_path.parent.mkdir(parents=True, exist_ok=True)
         self._bot_qty_path.write_text(json.dumps(self._bot_qty), encoding="utf-8")
