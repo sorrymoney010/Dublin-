@@ -436,7 +436,11 @@ class TradingEngine:
             last = 0.0
         min_qty = float(meta.order_min)
         if last > 0:
-            return min_qty * last
+            # Add a safety margin so the resulting order, after volume rounding
+            # to the pair's precision, still clears Kraken's lot minimum. A bare
+            # order_min*last can round DOWN just below the limit (e.g. 2196 <
+            # 2200) and raise PrecisionError mid-execution.
+            return min_qty * last * 1.05
         cost_min = float(meta.cost_min) if meta.cost_min else 0.0
         return cost_min if cost_min > 0 else float("inf")
 
@@ -540,7 +544,12 @@ class TradingEngine:
         # forced SELL, nor the DCA sleeve to inject a buy this cycle).
         signal: Signal = Signal(Action.WAIT, 0, "no signal", 0.0)
         if rotation_target is None:
-            in_position = self.gateway.has_position()
+            # Per-symbol, bot-owned position awareness: the strategy is told the
+            # bot owns the CURRENT symbol only if the bot itself bought it
+            # (self._bot_qty). Raw gateway.has_position() sees ALL balances
+            # (e.g. pre-existing XXBT dust), which would falsely lock the main
+            # loop into exit-only mode and prevent new BTC entries.
+            in_position = self._bot_qty.get(self.settings.symbol, 0.0) > 1e-9
             signal = self.strategy.evaluate(bars, in_position=in_position)
             self.audit.record(AuditEvent.SIGNAL, {
                 "action": signal.action.value, "score": signal.score,
@@ -584,38 +593,51 @@ class TradingEngine:
             # still flows through Gate 6 (risk) and the shared execution path.
             if self.settings.dca_enabled and signal.action is not Action.BUY:
                 try:
-                    pump_price = self.gateway.get_ticker_for(self.settings.dca_symbol)["last"]
-                    dca_signal = self.dca.maybe_signal(
-                        self._dca_state,
-                        price=pump_price,
-                        in_position=in_position,
-                        mr_action_is_buy=(signal.action is Action.BUY),
-                    )
-                    if dca_signal is not None:
-                        # Point this cycle's execution at the DCA coin so the
-                        # idempotency key, sizing, and order target PUMP/USD.
-                        # Restore uses the cycle-start snapshot (set at the top of
-                        # run_cycle) so in-cycle rotation is not disturbed.
-                        self.settings.symbol = self.settings.dca_symbol
-                        signal = dca_signal
-                        self._dca_executed_this_cycle = True
-                        # DCA sizes by its own fixed USD, NOT the risk-manager
-                        # notional (which would be risk_per_trade*equity and fall
-                        # below Kraken's minimum order size on a small account).
-                        self._dca_notional = self.settings.dca_fixed_usd
+                    dca_sym = self.settings.dca_symbol
+                    # Guard: only size the DCA buy if the configured coin can
+                    # actually be ordered at this account size. A coin below
+                    # Kraken's lot minimum (e.g. PUMP/USD at this balance) would
+                    # otherwise raise PrecisionError mid-execution and crash the
+                    # cycle. Skip silently when it cannot be sized.
+                    if not self._can_size(dca_sym, self.settings.dca_fixed_usd):
                         self.audit.record(AuditEvent.SIGNAL, {
-                            "event": "dca_signal", "symbol": self.settings.dca_symbol,
-                            "reason": dca_signal.reason, "price": pump_price,
+                            "event": "dca_skip", "symbol": dca_sym,
+                            "reason": "below Kraken minimum order for this account size",
                         })
+                    else:
+                        pump_price = self.gateway.get_ticker_for(dca_sym)["last"]
+                        dca_signal = self.dca.maybe_signal(
+                            self._dca_state,
+                            price=pump_price,
+                            in_position=in_position,
+                            mr_action_is_buy=(signal.action is Action.BUY),
+                        )
+                        if dca_signal is not None:
+                            # Point this cycle's execution at the DCA coin so the
+                            # idempotency key, sizing, and order target it.
+                            # Restore uses the cycle-start snapshot (set at the top of
+                            # run_cycle) so in-cycle rotation is not disturbed.
+                            self.settings.symbol = dca_sym
+                            signal = dca_signal
+                            self._dca_executed_this_cycle = True
+                            # DCA sizes by its own fixed USD, NOT the risk-manager
+                            # notional (which would be risk_per_trade*equity and fall
+                            # below Kraken's minimum order size on a small account).
+                            self._dca_notional = self.settings.dca_fixed_usd
+                            self.audit.record(AuditEvent.SIGNAL, {
+                                "event": "dca_signal", "symbol": dca_sym,
+                                "reason": dca_signal.reason, "price": pump_price,
+                            })
                 except BrokerError as exc:
                     self.audit.record(AuditEvent.BROKER_ERROR,
                                       {"operation": "dca_ticker", "error": str(exc)},
                                       severity="error")
         else:
             # Rotation exit: the held bot-owned lot is sold this cycle. The
-            # SELL branch below requires in_position; the held coin is still
-            # present on the exchange, so raw has_position() is True.
-            in_position = self.gateway.has_position()
+            # SELL branch below requires in_position; since we only rotate a
+            # coin the bot actually owns (self._bot_qty), in_position is True.
+            in_position = self._bot_qty.get(self.settings.symbol, 0.0) > 1e-9 or \
+                self._bot_qty.get(self._cycle_symbol_snapshot, 0.0) > 1e-9
 
         # Gate 6 — risk
         equity = self.gateway.account_equity()
@@ -635,7 +657,9 @@ class TradingEngine:
                 open_exposure = float(sum(
                     p.get("market_value", 0.0) for p in self.gateway.positions()
                 ))
-        except BrokerError:
+        except Exception:
+            # Margin/positions endpoint errors must never block trading or
+            # crash the cycle — exposure is advisory (risk still caps per-trade).
             open_exposure = 0.0
         leverage = self.settings.max_leverage if self.settings.margin_enabled else None
         if leverage is not None:
@@ -670,16 +694,32 @@ class TradingEngine:
                 if getattr(self, "_dca_executed_this_cycle", False)
                 else risk.notional_usd
             )
-            # Never attempt an order larger than the account can afford. A buy
-            # above available balance is rejected by the exchange (and would
-            # otherwise be retried every cycle). Cap to the position budget,
-            # which itself is bounded by the authorized sizing budget.
-            budget = min(equity, self.settings.strategy_equity_usd)
-            max_affordable = budget * self.settings.max_position_fraction
+            # Sizing floor that actually clears the exchange. On a small account
+            # the risk-per-trade notional (risk_per_trade*equity) is often
+            # BELOW a coin's lot minimum, so a raw momentum BUY would raise
+            # PrecisionError and crash the cycle (this is why the bot looked
+            # dead). Enforce a fillable floor = the coin's real minimum order
+            # notional, still bounded by the authorized exposure cap. Real
+            # equity (not the config strategy_equity_usd ceiling) is the cap, so
+            # added funds deploy fully.
+            sym = self.settings.symbol
+            try:
+                coin_min = self._min_notional(sym)
+            except Exception:
+                coin_min = self.settings.min_order_notional_usd
+            # Exposure cap uses REAL equity (skill: never cap at the config
+            # budget field, which would throttle funds the owner actually has).
+            max_affordable = equity * self.settings.max_position_fraction
+            if buy_notional < coin_min:
+                buy_notional = coin_min
             if buy_notional > max_affordable:
                 buy_notional = max_affordable
-            if buy_notional <= 0:
-                risk = RiskDecision(False, "No affordable size (balance below minimum order)")
+            if buy_notional < coin_min or buy_notional <= 0:
+                risk = RiskDecision(
+                    False,
+                    f"Order size below exchange minimum for {sym} "
+                    f"(balance too small to trade this coin)",
+                )
                 order_id = None
             else:
                 order_id, risk = self._execute_buy(
@@ -810,13 +850,22 @@ class TradingEngine:
                         state.current_equity = portfolio.equity
                         state.peak_equity = max(state.peak_equity, state.current_equity)
             else:
-                # Sell only the bot's own acquired lot — never sweep external
-                # holdings of the same pair (audit finding #3).
-                bot_qty = self._bot_qty.get(self.settings.symbol, None)
+                # No-sweep guard (audit finding #3, hardened): only ever sell a
+                # lot the bot itself recorded buying. If the ledger has no
+                # bot-owned quantity for this symbol, abort the sell — never
+                # call close_position with quantity=None (which would liquidate
+                # the ENTIRE exchange balance, including external/legacy holdings).
+                bot_qty = self._bot_qty.get(self.settings.symbol, 0.0)
+                if bot_qty <= 1e-9:
+                    self.ledger.fail(key, "no-sweep: no bot-owned lot to sell")
+                    self.audit.record(AuditEvent.ORDER_REJECTED,
+                                      {"key": key, "reason": "no-sweep: no bot-owned lot",
+                                       "gate": "no_sweep"}, severity="warning")
+                    return None, RiskDecision(False, "No bot-owned lot to sell (sweep blocked)")
                 order_id = self.gateway.close_position(
                     userref=record.userref, quantity=bot_qty
                 )
-                self._record_bot_sell(self.settings.symbol)
+                self._record_bot_sell(self.settings.symbol, bot_qty)
                 if self.settings.paper_trading or self.settings.dry_run:
                     ticker = self.gateway.get_ticker()
                     portfolio = self.paper_portfolio.snapshot()

@@ -484,8 +484,25 @@ def test_close_position_dry_run_returns_synthetic_id():
     with patch.object(gw, "positions", return_value=[{
         "quantity": 0.5, "symbol": "XBTUSD"
     }]):
-        order_id = gw.close_position()
+        order_id = gw.close_position(quantity=0.5)
     assert "dry" in order_id.lower()
+
+
+def test_close_position_refuses_none_quantity_no_sweep():
+    """A None quantity would liquidate the ENTIRE balance — hard-refuse it.
+
+    This is the no-sweep safeguard: an empty bot-owned ledger must never
+    produce a full-balance sell of external/legacy holdings.
+    """
+    settings = make_settings()
+    gw = _make_gateway_with_creds(settings)
+    _prime_metadata(gw)
+
+    with patch.object(gw, "positions", return_value=[{
+        "quantity": 0.5, "symbol": "XBTUSD"
+    }]):
+        with pytest.raises(BrokerError, match="quantity=None"):
+            gw.close_position(quantity=None)
 
 
 def test_order_submission_blocked_by_safety_locks():

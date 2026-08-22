@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     # are NOT loosened — only the data resolution and polling speed change.
     # Applied at startup by TradingEngine._apply_performance_profile().
     day_trade_mode: bool = False
-    strategy_equity_usd: float = Field(default=25.0, ge=25.0)
+    strategy_equity_usd: float = Field(default=100.0, ge=25.0)
     # Auto-scale risk per trade based on session win/loss streak. The base risk
     # (risk_per_trade) is multiplied by this factor, which the engine moves
     # between min_risk_scale and max_risk_scale as the bot wins/loses — so a
@@ -150,7 +150,7 @@ class Settings(BaseSettings):
     dca_enabled: bool = Field(default=False)
     dca_symbol: str = Field(default="PUMP/USD")
     dca_interval_minutes: int = Field(default=240, ge=30)
-    dca_fixed_usd: float = Field(default=2.0, gt=0)
+    dca_fixed_usd: float = Field(default=12.0, gt=0)
     dca_max_buys_per_day: int = Field(default=4, ge=0)
     dca_max_total_buys: int = Field(default=40, ge=0)
     dca_stop_buffer: float = Field(default=0.05, gt=0, le=0.5)  # synthetic stop for risk gate only
@@ -159,7 +159,7 @@ class Settings(BaseSettings):
     # gateway submits margin orders and tracks positions via OpenPositions. Kraken
     # can force-liquidate a margin position, so the exposure cap is tightened and
     # a hard leverage ceiling is enforced; leverage is never auto-raised above it.
-    margin_enabled: bool = Field(default=False)
+    margin_enabled: bool = Field(default=True)
     max_leverage: float = Field(default=2.0, gt=0, le=5.0)
     margin_exposure_fraction: float = Field(default=0.25, gt=0, le=0.5)
     risk_per_trade: float = Field(default=0.02, gt=0, le=0.02)

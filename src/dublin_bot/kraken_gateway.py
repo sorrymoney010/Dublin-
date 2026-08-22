@@ -759,6 +759,12 @@ class KrakenGateway:
             raise BrokerError("No position to close")
         meta = self.resolve_symbol()
         full = float(positions[0]["quantity"])
+        # Hard no-sweep defense: a None quantity would liquidate the ENTIRE
+        # balance. Only sell an explicit, positive lot the caller authorized.
+        if quantity is None or quantity <= 0:
+            raise BrokerError(
+                "Refusing to close position with quantity=None (would sweep full balance)"
+            )
         target = min(quantity, full) if quantity is not None else full
         precision = meta.to_precision()
         from .precision import round_volume

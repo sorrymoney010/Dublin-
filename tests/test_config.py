@@ -8,7 +8,7 @@ def test_safe_defaults_are_paper_and_dry_run():
     assert settings.paper_trading is True
     assert settings.dry_run is True
     assert settings.allow_live_trading is False
-    assert settings.strategy_equity_usd == 25.0
+    assert settings.strategy_equity_usd == 100.0
     assert settings.timeframe_minutes == 15
     assert settings.monitor_interval_seconds == 900
     assert settings.cooldown_minutes == 10
