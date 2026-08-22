@@ -104,11 +104,46 @@ def test_autonomous_selection_picks_mr_setup_without_manual_pin():
 
 def test_autonomous_selection_stays_when_holding():
     eng = make_engine()
-    eng.gateway.has_position.return_value = True  # already in a trade
+    # Disable rotation so this test isolates the churn-guard alone: with a
+    # bot-owned lot open and no stronger setup to rotate into, the engine must
+    # NOT abandon the position mid-trade. (Rotation itself is covered live.)
+    eng.settings.rotate_positions = False
+    # Simulate a BOT-OWNED open lot on the current symbol (the new position
+    # model). Raw gateway.has_position() is no longer what gates churn — only
+    # lots the bot actually acquired count, so external/pre-existing balances
+    # can't freeze the engine into exit-only mode.
+    eng._bot_qty[eng.settings.symbol] = 1.0
+    eng.gateway.has_position.return_value = True  # belt-and-suspenders for SELL branch
     before = eng.settings.symbol
     eng.run_cycle()
-    # Must not churn away from the open position.
+    # Must not churn away from the open bot-owned position.
     assert eng.settings.symbol == before
+
+
+def test_rotation_exits_weak_coin_for_stronger_setup():
+    """When holding a bot-owned lot but another allowed coin has a clearly
+    stronger momentum setup, the engine rotates: this cycle flags the exit and
+    points at the stronger coin (the next cycle enters it)."""
+    eng = make_engine()
+    # Holding XRP/USD (bot-owned). PUMP/USD shows a strong setup; XRP does not.
+    eng.settings.symbol = "XRP/USD"
+    eng._bot_qty["XRP/USD"] = 1.0
+    eng.gateway.has_position.return_value = True
+
+    def fake_evaluate(bars, in_position=False):
+        sym = eng.settings.symbol
+        if sym == "PUMP/USD" and not in_position:
+            return Signal(Action.BUY, 90, "momentum confirmed", 1.0, 1.0)
+        if sym == "XRP/USD" and in_position:
+            return Signal(Action.WAIT, 30, "holding", 1.0, 1.0)
+        return Signal(Action.WAIT, 10, "no setup", 1.0, 1.0)
+
+    eng.strategy.evaluate = fake_evaluate
+    before = eng.settings.symbol
+    eng.run_cycle()
+    # Rotation detected: symbol repointed to the stronger coin for next cycle.
+    assert eng.settings.symbol == "PUMP/USD", f"expected PUMP/USD, got {eng.settings.symbol}"
+    assert before == "XRP/USD"  # didn't churn the hold symbol mid-cycle incorrectly
 
 
 # ── gateway universe (root-cause regression for "not trading at all") ──

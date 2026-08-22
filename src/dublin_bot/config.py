@@ -131,12 +131,22 @@ class Settings(BaseSettings):
     sentiment_enabled: bool = Field(default=True)
     # ── Active signal strategy ─────────────────────────────────
     # "momentum" (default, RSI band gate) or "mean_reversion" (oversold
-    # stretch + reversion exit) — the latter backtested best on XRP/USD.
-    strategy: str = Field(default="mean_reversion")
-    # ── DCA accumulator sleeve ─────────────────────────────────
-    # Mechanical fixed-USD accumulation on a timer, UNDER the same risk gates as
-    # every other order. PUMP/USD only (the coin with proven positive MR
-    # expectancy). Caps prevent unbounded stacking. OFF by default.
+    # stretch + reversion exit). momentum is the more active engine — it takes
+    # setups whenever RSI is inside the tradable band, so the bot trades far
+    # more often (aggressive) rather than waiting for a washed-out dip.
+    # Safety (budget cap, exchange stop, drawdown/daily-loss breakers) is
+    # unchanged — aggression is in entry frequency, not in risk.
+    strategy: str = Field(default="momentum")
+    # ── Position rotation (aggressive, single-position) ────────
+    # When the bot holds a position on one coin but a DIFFERENT allowed coin
+    # shows a clearly stronger momentum setup, it rotates: sells the weaker
+    # bot-owned lot and enters the stronger. This is what lets the bot "trade
+    # all things" (e.g. rotate PUMP -> BTC) instead of sitting in one coin
+    # forever. The exit always sells only the bot's own accumulated lot, and
+    # the new entry still runs through every risk gate. Turn off to keep the
+    # bot pinned to whichever coin it is currently holding.
+    rotate_positions: bool = Field(default=True)
+    rotate_min_score_gap: float = Field(default=15.0, ge=0.0)
     dca_enabled: bool = Field(default=False)
     dca_symbol: str = Field(default="PUMP/USD")
     dca_interval_minutes: int = Field(default=240, ge=30)
@@ -173,9 +183,9 @@ class Settings(BaseSettings):
     slow_ema: int = Field(default=50, ge=3)
     regime_ema: int = Field(default=200, ge=10)
     rsi_period: int = Field(default=14, ge=2)
-    rsi_min: float = 45.0
-    rsi_max: float = 68.0
-    rsi_oversold: float = 32.0   # strict MR entry (backtest-proven best on PUMP); aggression comes from size/cooldown, not a wider band
+    rsi_min: float = 35.0   # wider band so momentum fires in normal (non-extreme) conditions
+    rsi_max: float = 75.0   # — aggressive entry frequency, still excludes overbought/washed-out
+    rsi_oversold: float = 38.0   # looser MR entry so mild dips also trigger (aggressive)
     rsi_exit: float = 55.0       # mean-reversion exit threshold (recovered)
     atr_period: int = Field(default=14, ge=2)
     atr_stop_multiplier: float = Field(default=1.5, gt=0)

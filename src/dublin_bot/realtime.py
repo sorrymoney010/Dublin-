@@ -22,7 +22,9 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
-import websockets  # available in this environment
+# `websockets` is an optional dependency used only by the real-time feed.  Import
+# it lazily inside the feed class so the rest of the bot (and its tests) work
+# without it installed; the feed degrades to REST-only when it is missing.
 
 
 @dataclass
@@ -98,6 +100,8 @@ class KrakenRealtimeFeed:
         self._connected = False
 
     def _loop_once(self) -> None:
+        import websockets  # lazy: optional dependency; only used here
+
         async def _consume() -> None:
             async with websockets.connect(
                 self.WS_URL, open_timeout=self._timeout, close_timeout=self._timeout

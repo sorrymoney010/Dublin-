@@ -118,6 +118,10 @@ class TradingEngine:
         # so a SELL never liquidates holdings the bot did not purchase.
         self._bot_qty_path = Path("logs/bot_positions.json")
         self._bot_qty: dict[str, float] = self._load_bot_qty()
+        # Pending rotation target (single-position aggressive model): when set,
+        # the bot exits the held bot-owned lot on the current symbol and the
+        # next cycle enters this coin.
+        self._rotate_to: str | None = None
         from .learner import LearningAgent
         self.learner = LearningAgent(
             settings.learner_path,
@@ -192,14 +196,25 @@ class TradingEngine:
         (favor coins with proven positive expectancy, avoid bleeders). It trades
         whatever coin the market is offering — no pinned list, no round-robin.
 
-        If we already hold a position, we stay put and let the strategy exit it
-        rather than churning into a different coin mid-trade.
+        If we already hold a BOT-OWNED position in the current symbol, we let the
+        strategy exit it rather than churning. But if a DIFFERENT allowed coin
+        shows a clearly stronger momentum setup, we rotate: flag the stronger
+        coin so the cycle exits the current bot-owned lot and enters it.
+        Deposits/external holdings the bot did not buy never count as a
+        position, so they can't freeze the bot into exit-only mode.
         """
         s = self.settings
-        in_position = self.gateway.has_position()
+        # Position awareness is per-symbol and bot-owned only. Raw
+        # gateway.has_position() sees ALL balances (incl. pre-existing PUMP),
+        # which would falsely lock the bot into exit-only forever.
+        held_sym = s.symbol if self._bot_qty.get(s.symbol, 0.0) > 1e-9 else None
+        in_position = held_sym is not None
 
-        # Never abandon an open position — the strategy decides when to exit.
+        # Never abandon an open BOT-OWNED position without a reason — but if a
+        # stronger setup exists elsewhere, rotate into it.
         if in_position:
+            if s.rotate_positions:
+                self._maybe_rotate(held_sym)
             return
 
         equity = self.gateway.account_equity()
@@ -233,8 +248,12 @@ class TradingEngine:
             affordable.sort(key=lambda sym: -self.learner.bias(sym))
             affordable = affordable[: s.universe_scan_limit]
 
-        # 3) Rank each by live MR setup quality × self-learning bias.
-        BUY_THRESHOLD = 60  # MeanReversionStrategy emits score 60 on a real setup
+        # 3) Rank each by live setup quality × self-learning bias.
+        # Momentum (the default aggressive strategy) scores 30-40 on a real
+        # setup, so the rotation threshold is set below that to allow the bot
+        # to switch to the strongest coin in the universe. Mean-reversion
+        # scores 60; the threshold still admits it.
+        BUY_THRESHOLD = 25
         best_sym: str | None = None
         best_score = -1.0
         scored: list[tuple[str, float]] = []
@@ -271,6 +290,70 @@ class TradingEngine:
                  "candidates_scored": len(scored)},
             )
 
+    def _maybe_rotate(self, held_sym: str) -> None:
+        """Detect a stronger momentum setup on a different allowed coin.
+
+        When the bot holds a bot-owned lot on ``held_sym`` but another allowed
+        coin shows a clearly stronger setup (by ``rotate_min_score_gap``), flag
+        ``self._rotate_to`` so the cycle exits the held lot and the next cycle
+        enters the stronger coin. This is the "trade all things" behavior —
+        the bot rotates into the best opportunity instead of sitting in one
+        coin forever. Only bot-owned lots are ever sold.
+        """
+        s = self.settings
+        if not s.rotate_positions:
+            return
+        equity = self.gateway.account_equity()
+        cap = equity * s.max_position_fraction
+        candidates = list(s.coin_basket) + [s.dca_symbol]
+        if s.universe_allowlist:
+            allowed = {x.upper() for x in s.universe_allowlist}
+            candidates = [c for c in candidates if c.upper() in allowed]
+        affordable = [c for c in candidates
+                      if c != held_sym and self._can_size(c, cap)]
+        regime = self.learner.last_regime
+        best_sym: str | None = None
+        best_score = -1.0
+        saved = s.symbol
+        try:
+            for sym in affordable:
+                if self.sentiment.should_block_buy(sym):
+                    continue
+                try:
+                    s.symbol = sym
+                    bars = self.gateway.get_bars()
+                    sig = self.strategy.evaluate(bars, in_position=False)
+                except Exception:
+                    continue
+                finally:
+                    s.symbol = saved
+                bias = self.learner.bias(sym) * self.learner.regime_penalty(sym, regime)
+                eff = float(sig.score) * bias
+                if eff > best_score:
+                    best_score = eff
+                    best_sym = sym
+        finally:
+            s.symbol = saved
+        if best_sym is None or best_score < 25:
+            return
+        # Compare against the held coin's current hold strength.
+        try:
+            s.symbol = held_sym
+            hbars = self.gateway.get_bars()
+            hsig = self.strategy.evaluate(hbars, in_position=True)
+            held_score = float(hsig.score)
+        except Exception:
+            held_score = 0.0
+        finally:
+            s.symbol = saved
+        if best_score - held_score >= s.rotate_min_score_gap:
+            self._rotate_to = best_sym
+            self.audit.record(
+                AuditEvent.SIGNAL,
+                {"event": "rotation_detected", "from": held_sym, "to": best_sym,
+                 "held_score": round(held_score, 2), "target_score": round(best_score, 2),
+                 "gap": round(best_score - held_score, 2)},
+            )
 
     def assert_safety_locks(self) -> dict:
         """Verify the declared safety posture is internally consistent.
@@ -388,6 +471,23 @@ class TradingEngine:
         self._select_symbol()
         gates["symbol"] = self.settings.symbol
 
+        # Pending rotation: this cycle exits the held bot-owned lot, then points
+        # the engine at the stronger coin so the NEXT cycle enters it. The SELL
+        # branch below sells only the bot's own lot (never external holdings).
+        rotation_target = self._rotate_to
+        if rotation_target is not None:
+            held = self._cycle_symbol_snapshot
+            self.settings.symbol = held
+            signal = Signal(
+                Action.SELL, 90,
+                f"Rotation exit {held} -> {rotation_target}", 0.0,
+            )
+            self.audit.record(AuditEvent.SIGNAL, {
+                "event": "rotation_exit", "from": held, "to": rotation_target,
+            })
+            self._rotate_to = None
+            # Let the cycle run the SELL; we'll repoint to the target after.
+
         # Restart recovery before any new intent can be formed.
         gates["recovery"] = self.recover()
 
@@ -435,78 +535,87 @@ class TradingEngine:
                 quality_ok, quality_reason = False, f"market quality unavailable: {exc}"
                 gates["market_quality"] = {"approved": False, "reason": quality_reason}
 
-        # Gate 5 — strategy signal
-        in_position = self.gateway.has_position()
-        signal = self.strategy.evaluate(bars, in_position=in_position)
-        self.audit.record(AuditEvent.SIGNAL, {
-            "action": signal.action.value, "score": signal.score,
-            "reason": signal.reason, "price": signal.price,
-            "stop_price": signal.stop_price,
-        })
+        # Gate 5 — strategy signal (skipped when a rotation exit is already
+        # scheduled — we don't want the held-coin strategy to overwrite the
+        # forced SELL, nor the DCA sleeve to inject a buy this cycle).
+        signal: Signal = Signal(Action.WAIT, 0, "no signal", 0.0)
+        if rotation_target is None:
+            in_position = self.gateway.has_position()
+            signal = self.strategy.evaluate(bars, in_position=in_position)
+            self.audit.record(AuditEvent.SIGNAL, {
+                "action": signal.action.value, "score": signal.score,
+                "reason": signal.reason, "price": signal.price,
+                "stop_price": signal.stop_price,
+            })
 
-        # Gate 5.5 — sentiment confirmation filter (Stage 1).
-        # Sentiment never originates a trade; it only (a) blocks a fresh BUY when
-        # the coin's mood is bearish, and (b) forces a protective SELL when mood
-        # collapses while in a position. This is what stops the bot from buying
-        # into a coordinated dump / becoming reverse-pump exit liquidity.
-        if self.settings.sentiment_enabled:
-            sym = self.settings.symbol
-            idx = self.sentiment.index_for(sym)
-            if signal.action is Action.BUY and self.sentiment.should_block_buy(sym):
-                signal = Signal(
-                    Action.WAIT, signal.score,
-                    f"Sentiment filter: {idx.score:+.2f} bearish for {idx.coin} "
-                    f"(n={idx.sample_size})", signal.price, signal.atr,
-                    signal.stop_price,
-                )
-                self.audit.record(AuditEvent.SIGNAL, {
-                    "event": "sentiment_block_buy", "coin": idx.coin,
-                    "score": idx.score, "sample_size": idx.sample_size,
-                })
-            elif in_position and self.sentiment.should_force_exit(sym):
-                signal = Signal(
-                    Action.SELL, 95,
-                    f"Sentiment collapse: {idx.score:+.2f} for {idx.coin} "
-                    f"(n={idx.sample_size})", signal.price, signal.atr,
-                )
-                self.audit.record(AuditEvent.SIGNAL, {
-                    "event": "sentiment_force_sell", "coin": idx.coin,
-                    "score": idx.score, "sample_size": idx.sample_size,
-                })
-
-        # Gate 5.7 — DCA accumulator sleeve (complementary to MR).
-        # If the main strategy is not entering this bar and DCA is due for its
-        # configured coin (default PUMP/USD), build a fixed-USD BUY signal that
-        # still flows through Gate 6 (risk) and the shared execution path.
-        if self.settings.dca_enabled and signal.action is not Action.BUY:
-            try:
-                pump_price = self.gateway.get_ticker_for(self.settings.dca_symbol)["last"]
-                dca_signal = self.dca.maybe_signal(
-                    self._dca_state,
-                    price=pump_price,
-                    in_position=in_position,
-                    mr_action_is_buy=(signal.action is Action.BUY),
-                )
-                if dca_signal is not None:
-                    # Point this cycle's execution at the DCA coin so the
-                    # idempotency key, sizing, and order target PUMP/USD.
-                    # Restore uses the cycle-start snapshot (set at the top of
-                    # run_cycle) so in-cycle rotation is not disturbed.
-                    self.settings.symbol = self.settings.dca_symbol
-                    signal = dca_signal
-                    self._dca_executed_this_cycle = True
-                    # DCA sizes by its own fixed USD, NOT the risk-manager
-                    # notional (which would be risk_per_trade*equity and fall
-                    # below Kraken's minimum order size on a small account).
-                    self._dca_notional = self.settings.dca_fixed_usd
+            # Gate 5.5 — sentiment confirmation filter (Stage 1).
+            # Sentiment never originates a trade; it only (a) blocks a fresh BUY when
+            # the coin's mood is bearish, and (b) forces a protective SELL when mood
+            # collapses while in a position. This is what stops the bot from buying
+            # into a coordinated dump / becoming reverse-pump exit liquidity.
+            if self.settings.sentiment_enabled:
+                sym = self.settings.symbol
+                idx = self.sentiment.index_for(sym)
+                if signal.action is Action.BUY and self.sentiment.should_block_buy(sym):
+                    signal = Signal(
+                        Action.WAIT, signal.score,
+                        f"Sentiment filter: {idx.score:+.2f} bearish for {idx.coin} "
+                        f"(n={idx.sample_size})", signal.price, signal.atr,
+                        signal.stop_price,
+                    )
                     self.audit.record(AuditEvent.SIGNAL, {
-                        "event": "dca_signal", "symbol": self.settings.dca_symbol,
-                        "reason": dca_signal.reason, "price": pump_price,
+                        "event": "sentiment_block_buy", "coin": idx.coin,
+                        "score": idx.score, "sample_size": idx.sample_size,
                     })
-            except BrokerError as exc:
-                self.audit.record(AuditEvent.BROKER_ERROR,
-                                  {"operation": "dca_ticker", "error": str(exc)},
-                                  severity="error")
+                elif in_position and self.sentiment.should_force_exit(sym):
+                    signal = Signal(
+                        Action.SELL, 95,
+                        f"Sentiment collapse: {idx.score:+.2f} for {idx.coin} "
+                        f"(n={idx.sample_size})", signal.price, signal.atr,
+                    )
+                    self.audit.record(AuditEvent.SIGNAL, {
+                        "event": "sentiment_force_sell", "coin": idx.coin,
+                        "score": idx.score, "sample_size": idx.sample_size,
+                    })
+
+            # Gate 5.7 — DCA accumulator sleeve (complementary to MR).
+            # If the main strategy is not entering this bar and DCA is due for its
+            # configured coin (default PUMP/USD), build a fixed-USD BUY signal that
+            # still flows through Gate 6 (risk) and the shared execution path.
+            if self.settings.dca_enabled and signal.action is not Action.BUY:
+                try:
+                    pump_price = self.gateway.get_ticker_for(self.settings.dca_symbol)["last"]
+                    dca_signal = self.dca.maybe_signal(
+                        self._dca_state,
+                        price=pump_price,
+                        in_position=in_position,
+                        mr_action_is_buy=(signal.action is Action.BUY),
+                    )
+                    if dca_signal is not None:
+                        # Point this cycle's execution at the DCA coin so the
+                        # idempotency key, sizing, and order target PUMP/USD.
+                        # Restore uses the cycle-start snapshot (set at the top of
+                        # run_cycle) so in-cycle rotation is not disturbed.
+                        self.settings.symbol = self.settings.dca_symbol
+                        signal = dca_signal
+                        self._dca_executed_this_cycle = True
+                        # DCA sizes by its own fixed USD, NOT the risk-manager
+                        # notional (which would be risk_per_trade*equity and fall
+                        # below Kraken's minimum order size on a small account).
+                        self._dca_notional = self.settings.dca_fixed_usd
+                        self.audit.record(AuditEvent.SIGNAL, {
+                            "event": "dca_signal", "symbol": self.settings.dca_symbol,
+                            "reason": dca_signal.reason, "price": pump_price,
+                        })
+                except BrokerError as exc:
+                    self.audit.record(AuditEvent.BROKER_ERROR,
+                                      {"operation": "dca_ticker", "error": str(exc)},
+                                      severity="error")
+        else:
+            # Rotation exit: the held bot-owned lot is sold this cycle. The
+            # SELL branch below requires in_position; the held coin is still
+            # present on the exchange, so raw has_position() is True.
+            in_position = self.gateway.has_position()
 
         # Gate 6 — risk
         equity = self.gateway.account_equity()
@@ -600,6 +709,11 @@ class TradingEngine:
         if getattr(self, "_dca_executed_this_cycle", False):
             self.settings.symbol = self._cycle_symbol_snapshot
             self._dca_executed_this_cycle = False
+
+        # After a rotation exit, point the engine at the stronger coin so the
+        # NEXT cycle enters it (this cycle only sold the held bot-owned lot).
+        if rotation_target is not None:
+            self.settings.symbol = rotation_target
 
         self.state_store.save(state)
         # Adapt risk scaling from the session's realized P&L streak. In live
