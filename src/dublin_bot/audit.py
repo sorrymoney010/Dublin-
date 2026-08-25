@@ -18,13 +18,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
+import fcntl
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Iterator
 
 GENESIS_HASH = "0" * 64
+
+_PATH_LOCKS: dict[Path, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _path_lock(path: Path) -> threading.Lock:
+    """Return one in-process lock for every physical audit path."""
+    resolved = path.resolve()
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(resolved, threading.Lock())
 
 _SENSITIVE_KEYS = frozenset({
     "api_key", "api_secret", "apikey", "apisecret", "secret", "password",
@@ -45,6 +57,7 @@ class AuditEvent(StrEnum):
     RISK_DECISION = "risk_decision"
     ORDER_INTENT = "order_intent"
     ORDER_SUBMITTED = "order_submitted"
+    ORDER_FILLED = "order_filled"
     ORDER_REJECTED = "order_rejected"
     ORDER_DUPLICATE_BLOCKED = "order_duplicate_blocked"
     ORDER_CANCELLED = "order_cancelled"
@@ -79,7 +92,7 @@ class AuditLog:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self._lock = threading.Lock()
+        self._lock = _path_lock(self.path)
         self._last_hash = self._read_last_hash()
 
     def _read_last_hash(self) -> str:
@@ -102,22 +115,44 @@ class AuditLog:
 
     def record(self, event: AuditEvent | str, payload: dict | None = None,
                *, severity: str = "info") -> dict:
-        """Append one entry and return it (with its computed hash)."""
+        """Append one entry and return it (with its computed hash).
+
+        The last hash is re-read while holding both a per-path thread lock and
+        an OS file lock. Dashboard requests create several ``AuditLog``
+        instances, and without these locks two writers can use the same parent
+        hash and permanently fork the chain.
+        """
         with self._lock:
-            entry = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "event": str(event),
-                "severity": severity,
-                "payload": redact(payload or {}),
-                "previous_hash": self._last_hash,
-            }
-            entry["entry_hash"] = _entry_hash(entry)
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(entry, sort_keys=True) + "\n")
-                handle.flush()
-            self._last_hash = entry["entry_hash"]
-            return entry
+            with self.path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    handle.seek(0)
+                    last_hash = GENESIS_HASH
+                    for line in handle:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            last_hash = json.loads(line).get("entry_hash", last_hash)
+                        except json.JSONDecodeError:
+                            continue
+                    entry = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "event": str(event),
+                        "severity": severity,
+                        "payload": redact(payload or {}),
+                        "previous_hash": last_hash,
+                    }
+                    entry["entry_hash"] = _entry_hash(entry)
+                    handle.seek(0, os.SEEK_END)
+                    handle.write(json.dumps(entry, sort_keys=True) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    self._last_hash = entry["entry_hash"]
+                    return entry
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def entries(self) -> Iterator[dict]:
         if not self.path.exists():

@@ -66,6 +66,17 @@ def test_nonce_is_thread_safe(tmp_path):
     assert len(set(values)) == 400
 
 
+def test_independent_nonce_generators_share_one_high_water_mark(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = tmp_path / "nonce.json"
+    generators = [NonceGenerator(path) for _ in range(8)]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        values = list(pool.map(lambda i: generators[i % 8].next(), range(400)))
+    assert len(set(values)) == 400
+    assert json.loads(path.read_text())["last_nonce"] == max(values)
+
+
 # ── rate limiting ───────────────────────────────────────────────────
 
 def test_token_bucket_blocks_when_exhausted():
@@ -377,6 +388,23 @@ def test_audit_chain_continues_across_restart(tmp_path):
     AuditLog(path).record(AuditEvent.STARTUP, {})
     AuditLog(path).record(AuditEvent.SHUTDOWN, {})
     assert AuditLog(path).verify_chain()[0] is True
+
+
+def test_audit_chain_survives_concurrent_independent_writers(tmp_path):
+    """Dashboard threads create separate AuditLog objects for one file."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = tmp_path / "audit.jsonl"
+
+    def write(index: int) -> None:
+        AuditLog(path).record(AuditEvent.SIGNAL, {"index": index})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(write, range(50)))
+
+    intact, reason = AuditLog(path).verify_chain()
+    assert intact is True, reason
+    assert len(AuditLog(path).tail(100)) == 50
 
 
 def test_secrets_are_redacted():

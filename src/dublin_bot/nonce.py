@@ -23,15 +23,30 @@ import os
 import tempfile
 import threading
 import time
+import fcntl
 from pathlib import Path
+
+
+_PATH_LOCKS: dict[Path, threading.Lock] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _path_lock(path: Path) -> threading.Lock:
+    resolved = path.resolve()
+    with _PATH_LOCKS_GUARD:
+        return _PATH_LOCKS.setdefault(resolved, threading.Lock())
 
 
 class NonceGenerator:
     """Thread-safe, restart-safe, strictly increasing nonce source."""
 
     def __init__(self, state_path: Path | None = None) -> None:
-        self._lock = threading.Lock()
         self._state_path = Path(state_path) if state_path else None
+        self._lock = (
+            _path_lock(self._state_path)
+            if self._state_path is not None
+            else threading.Lock()
+        )
         self._last = self._load_persisted()
 
     def _load_persisted(self) -> int:
@@ -71,12 +86,27 @@ class NonceGenerator:
         producing a permanent ``EAPI:Invalid nonce`` lockout.
         """
         with self._lock:
-            candidate = int(time.time() * 1_000_000_000)
-            if candidate <= self._last:
-                candidate = self._last + 1
-            self._last = candidate
-            self._persist(candidate)
-            return candidate
+            if self._state_path is None:
+                candidate = max(int(time.time() * 1_000_000_000), self._last + 1)
+                self._last = candidate
+                return candidate
+
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = self._state_path.with_suffix(self._state_path.suffix + ".lock")
+            with lock_path.open("a+", encoding="utf-8") as lock_handle:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    persisted = self._load_persisted()
+                    candidate = max(
+                        int(time.time() * 1_000_000_000),
+                        self._last + 1,
+                        persisted + 1,
+                    )
+                    self._last = candidate
+                    self._persist(candidate)
+                    return candidate
+                finally:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
     @property
     def last(self) -> int:

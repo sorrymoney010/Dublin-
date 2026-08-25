@@ -19,6 +19,12 @@ from dublin_bot.config import Settings
 FAKE_SECRET = base64.b64encode(b"dublin-test-secret-key-material!").decode()
 
 
+@pytest.fixture(autouse=True)
+def isolate_runtime_files(tmp_path, monkeypatch):
+    """Never let a test overwrite the live bot's logs or risk state."""
+    monkeypatch.chdir(tmp_path)
+
+
 class FakeResponse:
     def __init__(self, payload: Any, status_code: int = 200) -> None:
         self._payload = payload
@@ -196,6 +202,7 @@ def settings_factory(tmp_path):
             audit_log_path=tmp_path / "audit.jsonl",
             idempotency_path=tmp_path / "orders.json",
             nonce_state_path=tmp_path / "nonce.json",
+            session_state_path=tmp_path / "session_state.json",
         )
         defaults.update(overrides)
         return Settings(**defaults)

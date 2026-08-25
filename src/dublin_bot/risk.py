@@ -36,14 +36,22 @@ class RiskManager:
             )
         )
 
-    def effective_risk_per_trade(self) -> float:
-        """Base risk scaled by the session's win/loss adaptation factor."""
+    def effective_risk_per_trade(self, state: "SessionState | None" = None) -> float:
+        """Base risk scaled by the session's win/loss adaptation factor.
+
+        The scale is persisted on ``state`` (see ``state.py``) so it survives the
+        per-cycle ``TradingEngine`` rebuilds the dashboard performs — a fresh
+        ``RiskManager`` per cycle would otherwise always see scale 1.0 and
+        adaptive risk would be a no-op. When ``state`` carries a scale, we trust
+        the persisted value; otherwise we fall back to the in-memory ``_last_scale``.
+        """
         s = self.settings
         if not s.adaptive_risk:
             return s.risk_per_trade
+        scale = state.risk_scale if state is not None else self._last_scale
         return min(
             s.max_risk_scale,
-            max(s.min_risk_scale, s.risk_per_trade * self._last_scale),
+            max(s.min_risk_scale, s.risk_per_trade * scale),
         )
 
     _last_scale = 1.0
@@ -56,11 +64,15 @@ class RiskManager:
         compounds allocation while a cold streak tightens it. Win/loss streaks
         are persisted on ``state`` so the adaptation survives across cycles and
         restarts (previously these fields existed but were never written, so
-        adaptive risk was a permanent no-op).
+        adaptive risk was a permanent no-op). The in-memory ``_last_scale`` is
+        also kept in sync for the legacy API.
         """
         s = self.settings
         if not s.adaptive_risk:
             return
+        # Trust the persisted scale as the source of truth (it survives
+        # TradingEngine rebuilds); apply the delta on top of it.
+        self._last_scale = state.risk_scale
         if realized_pnl > 0:
             state.win_streak += 1
             state.loss_streak = 0
@@ -121,7 +133,7 @@ class RiskManager:
         if open_exposure_usd >= exposure_cap:
             return RiskDecision(False, f"Exposure cap reached: {open_exposure_usd:.2f} >= {exposure_cap:.2f}")
 
-        risk_budget = equity * self.effective_risk_per_trade()
+        risk_budget = equity * self.effective_risk_per_trade(state)
         stop_fraction = (signal.price - signal.stop_price) / signal.price
         if stop_fraction <= 0:
             return RiskDecision(False, "Invalid stop distance")

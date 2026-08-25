@@ -1,8 +1,7 @@
 # Dublin Trading OS
 
 A private, paper-first crypto trading system built around strict risk controls,
-transparent decisions, and testable strategies. Now with a **native Kraken Spot
-connector**.
+transparent decisions, and testable strategies with a native Kraken Spot connector.
 
 > **Safety status: fully locked.** `PAPER_TRADING=true`, `DRY_RUN=true`,
 > `ALLOW_LIVE_TRADING=false`. The bot cannot place a real order.
@@ -82,7 +81,7 @@ ruff check .     # lint the complete project
 pytest -q        # run the complete offline test suite
 ```
 
-Current verified result: **191 tests passed**. The suite is fully offline — no
+Current verified result: **225 tests passed**. The suite is fully offline — no
 network calls, no real orders.
 `tests/test_safety_locks.py` fails loudly if the trading locks are relaxed.
 

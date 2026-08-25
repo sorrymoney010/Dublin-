@@ -46,7 +46,8 @@ class LearningAgent:
         self.enabled = enabled
         self.coins: dict[str, CoinStats] = {}
         self.last_regime: str = "unknown"
-        self.sync_cursor: int = 0  # exchange TradesHistory cursor (ns) for live ingest
+        self.sync_cursor: int = 0  # exchange TradesHistory cursor (seconds) for live ingest
+        self._seen: set[str] = set()  # txids already credited to expectancy (dedup)
         self.load()
 
     # ── persistence ────────────────────────────────────────────
@@ -59,6 +60,7 @@ class LearningAgent:
             return
         self.last_regime = data.get("last_regime", "unknown")
         self.sync_cursor = int(data.get("sync_cursor", 0))
+        self._seen = set(data.get("seen_txids", []))
         for sym, c in (data.get("coins") or {}).items():
             self.coins[sym] = CoinStats(
                 symbol=sym,
@@ -73,6 +75,7 @@ class LearningAgent:
         data = {
             "last_regime": self.last_regime,
             "sync_cursor": self.sync_cursor,
+            "seen_txids": sorted(self._seen)[-10_000:],
             "coins": {
                 sym: {
                     "trades": c.trades,
@@ -91,23 +94,35 @@ class LearningAgent:
     def sync_from_exchange(self, gateway) -> int:
         """Pull REAL closed-trade P&L from Kraken and feed it into the learner.
 
-        Returns the number of coins updated. Must be guarded by the caller — any
-        failure (auth, rate limit, offline) is swallowed and returns 0 so the
-        trading cycle is never blocked by the learning sync.
+        Returns the number of *new* trades ingested. Must be guarded by the
+        caller — any failure (auth, rate limit, offline) is swallowed and
+        returns 0 so the trading cycle is never blocked by the learning sync.
+        De-duplicates by Kraken txid so a re-fetch after a restart (or a wide
+        ``since`` window) never double-counts realized P&L.
         """
         if not self.enabled:
             return 0
         try:
-            pnl_map, cursor = gateway.closed_trade_pnl(since=self.sync_cursor)
+            rows, cursor = gateway.closed_trade_pnl(since=self.sync_cursor)
         except Exception:
             return 0
-        if not pnl_map:
+        if not rows:
             return 0
-        for sym, pnl in pnl_map.items():
-            self.record_trade(sym, pnl, self.last_regime)
+        ingested = 0
+        for t in rows:
+            txid = t.get("txid")
+            if txid and txid in self._seen:
+                continue
+            self.record_trade(t["symbol"], t["pnl"], self.last_regime)
+            if txid:
+                self._seen.add(txid)
+            ingested += 1
         self.sync_cursor = cursor
+        # Bound the seen set so the persisted file cannot grow without limit.
+        if len(self._seen) > 20_000:
+            self._seen = set(sorted(self._seen)[-10_000:])
         self.save()
-        return len(pnl_map)
+        return ingested
 
     # ── recording outcomes ────────────────────────────────────
     def record_trade(self, symbol: str, pnl: float, regime: str = "unknown") -> None:

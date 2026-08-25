@@ -54,6 +54,7 @@ from .errors import (
     TransientBrokerError,
     classify_kraken_error,
 )
+from .execution_store import ExecutionFill, ExecutionStore, utc_now
 from .freshness import FreshnessGuard, FreshnessVerdict, check_monotonic_bars
 from .nonce import NonceGenerator
 from .precision import PairPrecision, SizedOrder, size_order
@@ -141,6 +142,8 @@ class KrakenGateway:
         self._max_retries = max_retries
         self._sleep = sleep_fn
         self._timeout = settings.http_timeout_seconds
+        self._executions = ExecutionStore(settings.execution_db_path)
+        self.last_fill: ExecutionFill | None = None
 
         self._meta: dict[str, SymbolMeta] = {}
         self._meta_loaded_at: float = 0.0
@@ -547,21 +550,31 @@ class KrakenGateway:
     def has_position(self) -> bool:
         return bool(self.positions())
 
-    def closed_trade_pnl(self, since: int = 0) -> tuple[dict[str, float], int]:
-        """Net realized P&L per coin from closed trades since ``since`` (unix ns).
+    def closed_trade_pnl(self, since: int = 0) -> tuple[list[dict], int]:
+        """Realized P&L of closed trades since ``since`` (unix SECONDS).
 
         Used by the self-learning agent to ingest REAL closed-trade outcomes in
-        live mode (where the paper portfolio does not track fills). Returns a
-        mapping of ``SYMBOL`` -> net P&L and the latest trade timestamp cursor
-        so the caller can persist it and avoid double-counting on the next poll.
+        live mode (where the paper portfolio does not track fills). Returns the
+        list of individual trades (each carrying ``txid``, ``symbol``, ``pnl``,
+        and the trade's unix-SECONDS timestamp) plus the latest trade timestamp
+        to use as the next ``since`` cursor.
+
+        Both values are in SECONDS — Kraken's ``TradesHistory`` ``start`` and
+        ``time`` fields are seconds. The previous implementation multiplied the
+        cursor by 1e9 (treating it as nanoseconds), which made every cursor
+        after the first run absurdly large and silently stopped all
+        re-ingestion. Returning per-trade rows (not a pre-aggregated per-symbol
+        sum) lets the learner de-duplicate by txid so a re-fetch after a restart
+        never double-counts realized P&L.
+
         Raises BrokerError/AuthenticationError on failure — callers must guard.
         """
         result = self._private("TradesHistory", {"type": "all", "trades": True,
                                                  "start": str(since)})
         trades = result.get("trades") or {}
-        pnl: dict[str, float] = {}
+        rows: list[dict] = []
         latest = since
-        for _txid, t in trades.items():
+        for txid, t in trades.items():
             sym = str(t.get("pair", "")).replace("/", "").upper()
             # Kraken reports closed-trade realized P&L in the "pnl" field.
             raw = t.get("pnl")
@@ -571,13 +584,13 @@ class KrakenGateway:
                 val = float(raw)
             except (TypeError, ValueError):
                 continue
-            pnl[sym] = pnl.get(sym, 0.0) + val
             try:
                 ts = int(t.get("time", 0))
-                latest = max(latest, ts)
             except (TypeError, ValueError):
-                pass
-        return pnl, latest * 1_000_000_000  # seconds -> ns cursor
+                ts = 0
+            latest = max(latest, ts)
+            rows.append({"txid": str(txid), "symbol": sym, "pnl": val, "ts": ts})
+        return rows, latest
 
     def orders(self) -> list[dict]:
         if not self.has_credentials:
@@ -637,6 +650,82 @@ class KrakenGateway:
                 }
         return None
 
+    def query_order(self, txid: str) -> dict:
+        """Return Kraken's authoritative state for one submitted order."""
+        result = self._private("QueryOrders", {"txid": txid, "trades": True})
+        raw = result.get(txid)
+        if raw is None and len(result) == 1:
+            raw = next(iter(result.values()))
+        if not isinstance(raw, dict):
+            raise BrokerError(f"Kraken did not return order {txid}")
+        return raw
+
+    def _capture_fill(
+        self,
+        txid: str,
+        *,
+        symbol: str,
+        side: str,
+        signal_price: float,
+        attempts: int = 5,
+    ) -> ExecutionFill | None:
+        """Poll QueryOrders and persist the exchange-confirmed average fill."""
+        for attempt in range(max(1, attempts)):
+            try:
+                raw = self.query_order(txid)
+            except BrokerError as exc:
+                if attempt + 1 == attempts:
+                    self._log(
+                        AuditEvent.BROKER_ERROR,
+                        {"operation": "QueryOrders", "order_id": txid, "error": str(exc)},
+                        severity="warning",
+                    )
+                    return None
+                self._sleep(0.25)
+                continue
+
+            volume = float(raw.get("vol_exec", 0) or 0)
+            cost = float(raw.get("cost", 0) or 0)
+            price = float(raw.get("price", 0) or 0)
+            if price <= 0 and volume > 0:
+                price = cost / volume
+            status = str(raw.get("status", "unknown"))
+            if volume > 0 and price > 0:
+                expected = float(signal_price or 0)
+                signed_slippage = price - expected if side == "buy" else expected - price
+                slippage_bps = (
+                    signed_slippage / expected * 10_000 if expected > 0 else 0.0
+                )
+                fill = ExecutionFill(
+                    order_id=txid,
+                    symbol=symbol,
+                    side=side,
+                    status=status,
+                    signal_price=expected,
+                    fill_price=price,
+                    slippage_usd=signed_slippage,
+                    slippage_bps=slippage_bps,
+                    volume=volume,
+                    cost=cost,
+                    fee=float(raw.get("fee", 0) or 0),
+                    filled_at=utc_now(),
+                )
+                self._executions.save(fill)
+                self.last_fill = fill
+                self._log(AuditEvent.ORDER_FILLED, fill.to_dict())
+                return fill
+            if status in {"canceled", "expired"}:
+                return None
+            if attempt + 1 < attempts:
+                self._sleep(0.25)
+        self._log(
+            AuditEvent.BROKER_ERROR,
+            {"operation": "QueryOrders", "order_id": txid,
+             "error": "fill not confirmed before polling deadline"},
+            severity="warning",
+        )
+        return None
+
     # ── order sizing ─────────────────────────────────────────
 
     def size_buy(self, notional_usd: float, price: float | None = None) -> SizedOrder:
@@ -662,12 +751,11 @@ class KrakenGateway:
             )
 
     def buy_notional(self, notional_usd: float, *, userref: int | None = None,
-                     leverage: float | None = None) -> str:
+                     signal_price: float | None = None) -> str:
         """Buy ``notional_usd`` of the configured pair.
 
-        When ``leverage`` is given (and the gateway is in margin mode) the order
-        is submitted as a margin order; otherwise it is a plain spot order.  In
-        dry-run the order is fully sized and validated against real exchange
+        Orders are always plain spot orders. In dry-run the order is fully
+        sized and validated against real exchange
         metadata — the only step skipped is the network call.
         """
         sized = self.size_buy(notional_usd)
@@ -676,7 +764,6 @@ class KrakenGateway:
                 "mode": "dry_run", "pair": sized.pair, "side": "buy",
                 "volume": sized.volume_str, "price": sized.price_str,
                 "notional": str(sized.notional), "userref": userref,
-                "leverage": leverage,
             })
             return f"kraken-dry-buy-{userref or int(time.time())}"
 
@@ -687,33 +774,20 @@ class KrakenGateway:
             "ordertype": "market",
             "volume": sized.volume_str,
         }
-        if leverage is not None:
-            params["leverage"] = str(leverage)
         if userref is not None:
             params["userref"] = str(userref)
-        try:
-            result = self._private("AddOrder", params)
-        except BrokerError as exc:
-            # Margin not available for this pair/account (Kraken rejects the
-            # leverage argument or reports insufficient/Non-ECP margin). Retry
-            # once as a PLAIN SPOT order so spot trading still works. We never
-            # pretend margin executed; the log is explicit.
-            msg = str(exc)
-            if "leverage" in msg or "initial margin" in msg or "Non-ECP" in msg or "Reduce only" in msg:
-                self._log(AuditEvent.BROKER_ERROR,
-                          {"operation": "AddOrder", "error": msg,
-                           "fallback": "retry without leverage (spot)"},
-                          severity="warning")
-                params.pop("leverage", None)
-                result = self._private("AddOrder", params)
-                leverage = None
-            else:
-                raise
+        result = self._private("AddOrder", params)
         order_id = (result.get("txid") or ["unknown"])[0]
         self._log(AuditEvent.ORDER_SUBMITTED, {
             "pair": sized.pair, "side": "buy", "volume": sized.volume_str,
-            "order_id": order_id, "userref": userref, "leverage": leverage,
+            "order_id": order_id, "userref": userref,
         }, severity="warning")
+        self._capture_fill(
+            order_id,
+            symbol=sized.pair,
+            side="buy",
+            signal_price=float(signal_price or sized.price),
+        )
         return order_id
 
     def margin_positions(self) -> list[dict]:
@@ -748,7 +822,9 @@ class KrakenGateway:
                 continue
         return positions
 
-    def close_position(self, *, userref: int | None = None, quantity: float | None = None) -> str:
+    def close_position(self, *, userref: int | None = None,
+                       quantity: float | None = None,
+                       signal_price: float | None = None) -> str:
         """Sell the base-asset balance of the configured pair.
 
         If ``quantity`` is given it is an explicit cap (the bot's own acquired
@@ -798,44 +874,47 @@ class KrakenGateway:
             "pair": meta.key, "side": "sell", "volume": format(volume, "f"),
             "order_id": order_id, "userref": userref,
         }, severity="warning")
+        self._capture_fill(
+            order_id,
+            symbol=meta.key,
+            side="sell",
+            signal_price=float(signal_price or 0),
+        )
         return order_id
 
-    def add_order(self, params: dict) -> str:
+    def add_order(self, params: dict, *, signal_price: float | None = None) -> str:
         """Submit a raw ``AddOrder`` with pre-built params (advanced orders).
 
         ``params`` is the flattened dict from ``orders.BracketPlan.to_addorder_params``
         (pair/type/ordertype/volume/price/close[...]). All safety gates apply:
         dry-run returns a synthetic id and logs; live requires submission enabled.
         """
+        params = dict(params)
+        removed_leverage = params.pop("leverage", None)
+        if removed_leverage is not None:
+            self._log(
+                AuditEvent.SAFETY_VIOLATION,
+                {"operation": "AddOrder", "reason": "leverage stripped; spot-only"},
+                severity="warning",
+            )
         if not self.order_submission_enabled:
             self._log(AuditEvent.ORDER_INTENT, {"mode": "dry_run", **params})
             return f"kraken-dry-{params.get('userref', int(time.time()))}"
         self._assert_can_submit()
-        try:
-            result = self._private("AddOrder", params)
-        except BrokerError as exc:
-            # Margin not available for this pair/account (Kraken rejects the
-            # leverage argument or reports insufficient/Non-ECP margin). Retry
-            # once as a PLAIN SPOT order so spot trading still works — the bot
-            # must trade spot even when the account lacks margin eligibility.
-            # We never pretend margin executed; the log is explicit.
-            msg = str(exc)
-            if "leverage" in msg or "initial margin" in msg or "Non-ECP" in msg or "Reduce only" in msg:
-                params = dict(params)
-                params.pop("leverage", None)
-                self._log(AuditEvent.BROKER_ERROR,
-                          {"operation": "AddOrder", "error": msg,
-                           "fallback": "retry without leverage (spot)"},
-                          severity="warning")
-                result = self._private("AddOrder", params)
-            else:
-                raise
+        result = self._private("AddOrder", params)
         order_id = (result.get("txid") or ["unknown"])[0]
         self._log(AuditEvent.ORDER_SUBMITTED,
                   {"pair": params.get("pair"), "side": params.get("type"),
                    "ordertype": params.get("ordertype"), "order_id": order_id,
                    "bracket": "close" in params},
                   severity="warning")
+        if str(params.get("ordertype", "")).lower() == "market":
+            self._capture_fill(
+                order_id,
+                symbol=str(params.get("pair", self.settings.symbol)),
+                side=str(params.get("type", "")),
+                signal_price=float(signal_price or 0),
+            )
         return order_id
 
     def cancel_order(self, txid: str) -> bool:

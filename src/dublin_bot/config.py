@@ -60,6 +60,8 @@ class Settings(BaseSettings):
     audit_log_path: Path = Path("logs/audit.jsonl")
     idempotency_path: Path = Path("logs/orders.json")
     nonce_state_path: Path = Path("logs/nonce.json")
+    session_state_path: Path = Path("logs/session_state.json")
+    execution_db_path: Path = Path("logs/executions.sqlite3")
 
     paper_trading: bool = True
     allow_live_trading: bool = False
@@ -155,11 +157,9 @@ class Settings(BaseSettings):
     dca_max_total_buys: int = Field(default=40, ge=0)
     dca_stop_buffer: float = Field(default=0.05, gt=0, le=0.5)  # synthetic stop for risk gate only
     dca_state_path: Path = Path("logs/dca_state.json")  # persisted interval/cap counters
-    # Margin (leveraged) trading. OFF by default — spot only. When enabled the
-    # gateway submits margin orders and tracks positions via OpenPositions. Kraken
-    # can force-liquidate a margin position, so the exposure cap is tightened and
-    # a hard leverage ceiling is enforced; leverage is never auto-raised above it.
-    margin_enabled: bool = Field(default=True)
+    # Legacy compatibility setting only. Kraken execution is permanently spot-only;
+    # the gateway strips leverage from every submitted order.
+    margin_enabled: bool = Field(default=False)
     max_leverage: float = Field(default=2.0, gt=0, le=5.0)
     margin_exposure_fraction: float = Field(default=0.25, gt=0, le=0.5)
     risk_per_trade: float = Field(default=0.02, gt=0, le=0.02)
@@ -175,6 +175,10 @@ class Settings(BaseSettings):
     max_orders_per_day: int = Field(default=0, ge=0, le=10)
     cooldown_minutes: int = Field(default=10, ge=0)
     monitor_interval_seconds: int = Field(default=900, ge=60, le=86400)
+    candle_close_delay_seconds: int = Field(default=2, ge=1, le=30)
+    # Dashboard startup is observational by default. An operator must press
+    # Start (or explicitly opt in here) before automated cycles may run.
+    auto_start_monitor: bool = Field(default=False)
     # Rapid mode flag (status only). Does not loosen strategy RSI/momentum or
     # any risk/loss/exposure threshold — it only selects the faster cadence above.
     rapid_mode: bool = Field(default=True)

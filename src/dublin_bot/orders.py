@@ -63,7 +63,6 @@ class BracketPlan:
     stop_loss: float | None = None
     take_profit: float | None = None
     userref: int | None = None
-    leverage: float | None = None
     trailing: bool = False
     pair_decimals: int = 8             # Kraken price precision for the pair
 
@@ -83,8 +82,6 @@ class BracketPlan:
         }
         if self.ordertype == "limit" and self.entry_price is not None:
             params["price"] = self.entry_price
-        if self.leverage is not None:
-            params["leverage"] = str(self.leverage)
         if self.userref is not None:
             params["userref"] = str(self.userref)
 

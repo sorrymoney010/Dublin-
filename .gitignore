@@ -10,5 +10,8 @@ htmlcov/
 logs/*.jsonl
 logs/*.json
 logs/*.tmp
+logs/*.lock
+logs/*.sqlite3
+logs/*.sqlite3-shm
+logs/*.sqlite3-wal
 .DS_Store
-

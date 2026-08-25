@@ -555,17 +555,58 @@ def test_live_enabled_buy_routes_canonical_add_order_payload_without_network():
         notional=25.0,
     )
 
+    def private_response(endpoint, _params):
+        if endpoint == "AddOrder":
+            return {"txid": ["TEST-ORDER-ID"]}
+        assert endpoint == "QueryOrders"
+        return {
+            "TEST-ORDER-ID": {
+                "status": "closed", "price": "50025.0", "vol_exec": "0.0005",
+                "cost": "25.0125", "fee": "0.065",
+            }
+        }
+
     with (
         patch.object(gw, "size_buy", return_value=sized),
-        patch.object(gw, "_private", return_value={"txid": ["TEST-ORDER-ID"]}) as private,
+        patch.object(gw, "_private", side_effect=private_response) as private,
     ):
-        order_id = gw.buy_notional(25.0, userref=42)
+        order_id = gw.buy_notional(25.0, userref=42, signal_price=50000.0)
 
     assert order_id == "TEST-ORDER-ID"
-    private.assert_called_once_with("AddOrder", {
+    assert private.call_args_list[0].args == ("AddOrder", {
         "pair": "XXBTZUSD",
         "type": "buy",
         "ordertype": "market",
         "volume": "0.00050000",
         "userref": "42",
     })
+    assert private.call_args_list[1].args == (
+        "QueryOrders", {"txid": "TEST-ORDER-ID", "trades": True}
+    )
+    assert gw.last_fill is not None
+    assert gw.last_fill.fill_price == 50025.0
+    assert gw.last_fill.signal_price == 50000.0
+    assert gw.last_fill.slippage_usd == 25.0
+    assert gw.last_fill.slippage_bps == 5.0
+    assert gw._executions.get("TEST-ORDER-ID") == gw.last_fill
+
+
+def test_raw_add_order_strips_leverage_before_kraken_submission():
+    settings = make_settings(
+        dry_run=False,
+        paper_trading=False,
+        allow_live_trading=True,
+        live_risk_acknowledgement="I_ACCEPT_LIVE_TRADING_RISK",
+    )
+    gw = _make_gateway_with_creds(settings)
+    gw._allow_order_submission = True
+    params = {
+        "pair": "XXBTZUSD", "type": "buy", "ordertype": "limit",
+        "price": "50000", "volume": "0.0005", "leverage": "2",
+    }
+    with patch.object(
+        gw, "_private", return_value={"txid": ["SPOT-ONLY"]}
+    ) as private:
+        assert gw.add_order(params) == "SPOT-ONLY"
+    submitted = private.call_args.args[1]
+    assert "leverage" not in submitted

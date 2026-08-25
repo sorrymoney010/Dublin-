@@ -45,6 +45,13 @@ class StateStore:
             realized_pnl_today = float(data.get("realized_pnl_today", 0.0))
             orders_today = int(data.get("orders_today", 0))
             last_order_at = datetime.fromisoformat(last_order) if last_order else None
+        # Adaptive-risk state. Persisted so the streak/scale survives across the
+        # per-cycle TradingEngine rebuilds the dashboard does (and across
+        # restarts). Without this, adaptive risk was a permanent no-op because
+        # every cycle started a brand-new RiskManager at scale 1.0.
+        risk_scale = float(data.get("risk_scale", 1.0))
+        win_streak = int(data.get("win_streak", 0))
+        loss_streak = int(data.get("loss_streak", 0))
         return SessionState(
             start_equity=start_equity,
             peak_equity=peak_equity,
@@ -52,6 +59,9 @@ class StateStore:
             realized_pnl_today=realized_pnl_today,
             orders_today=orders_today,
             last_order_at=last_order_at,
+            risk_scale=risk_scale,
+            win_streak=win_streak,
+            loss_streak=loss_streak,
         )
 
     def save(self, state: SessionState) -> None:

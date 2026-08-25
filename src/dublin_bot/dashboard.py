@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.parse
 import urllib.request
 from collections import deque
@@ -33,6 +34,7 @@ from .audit import AuditLog
 from .config import Settings
 from .emergency import activate_emergency_stop, clear_emergency_stop, emergency_stop_active
 from .engine import TradingEngine
+from .execution_store import ExecutionStore
 from .state import StateStore
 
 HOST = os.environ.get("DUBLIN_HOST", "0.0.0.0")
@@ -185,6 +187,7 @@ def kraken_trades_data(settings: Settings, limit: int = 50) -> dict[str, object]
                 pair = str(t.get("pair", ""))
                 trades.append({
                     "id": txid,
+                    "order_id": t.get("ordertxid"),
                     "pair": pair,
                     "type": t.get("type"),
                     "price": float(t.get("price", 0)),
@@ -233,6 +236,32 @@ def kraken_trades_data(settings: Settings, limit: int = 50) -> dict[str, object]
             data = {"ok": False, "error": str(exc), "trades": [], "count": 0}
         _trades_cache.update(at=monotonic(), data=data)
         return data
+
+
+def execution_data(settings: Settings, limit: int = 100) -> dict[str, object]:
+    """Bot-only signal-to-fill matches and measured live slippage."""
+    try:
+        fills = ExecutionStore(settings.execution_db_path).recent(limit)
+        rows = [fill.to_dict() for fill in fills]
+        measured = [row for row in rows if float(row["signal_price"]) > 0]
+        avg_usd = (
+            sum(float(row["slippage_usd"]) for row in measured) / len(measured)
+            if measured else 0.0
+        )
+        avg_bps = (
+            sum(float(row["slippage_bps"]) for row in measured) / len(measured)
+            if measured else 0.0
+        )
+        return {
+            "ok": True,
+            "executions": rows,
+            "count": len(rows),
+            "measured_count": len(measured),
+            "average_slippage_usd": round(avg_usd, 8),
+            "average_slippage_bps": round(avg_bps, 4),
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "executions": [], "count": 0}
 
 
 # Full tradeable basket (BTC/SOL/XRP explicitly enabled alongside the
@@ -358,7 +387,10 @@ class TradingMonitor:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.interval_seconds = int(getattr(settings, "monitor_interval_seconds", 900))
+        if bool(getattr(settings, "day_trade_mode", False)):
+            settings.timeframe_minutes = 5
+            settings.monitor_interval_seconds = 300
+        self.interval_seconds = int(getattr(settings, "timeframe_minutes", 15)) * 60
         self.stop_event = Event()
         self.thread: Thread | None = None
         self.last_run: str | None = None
@@ -395,6 +427,8 @@ class TradingMonitor:
 
     def _loop(self) -> None:
         while not self.stop_event.is_set():
+            if self.stop_event.wait(self._seconds_until_next_candle()):
+                break
             try:
                 record = TradingEngine(self.settings).run_once()
                 self.last_run = record.timestamp
@@ -411,13 +445,19 @@ class TradingMonitor:
                 self.last_error = str(exc)
                 self.last_run = datetime.now(timezone.utc).isoformat()
                 ntfy_alert("Dublin cycle error", str(exc)[:200], priority="default", tags="warning")
-            self.stop_event.wait(self.interval_seconds)
+
+    def _seconds_until_next_candle(self, now: float | None = None) -> float:
+        """Wait until just after the next completed exchange candle boundary."""
+        current = time.time() if now is None else float(now)
+        candle_seconds = max(60, int(self.settings.timeframe_minutes) * 60)
+        delay = int(getattr(self.settings, "candle_close_delay_seconds", 2))
+        next_close = ((int(current) // candle_seconds) + 1) * candle_seconds
+        return max(0.0, next_close + delay - current)
 
     def set_interval(self, seconds: int) -> None:
-        self.interval_seconds = max(60, int(seconds))
-        if self.thread is not None and self.thread.is_alive():
-            self.stop_event.set()
-            self.start()
+        # The execution cadence is deliberately coupled to the candle size.
+        # An arbitrary UI interval previously produced stale/missed signals.
+        self.interval_seconds = max(60, int(self.settings.timeframe_minutes) * 60)
 
 
 # Backwards-compatible alias — callers importing PaperMonitor keep working.
@@ -655,12 +695,20 @@ def risk_state_snapshot(settings: Settings) -> dict[str, object]:
         if monotonic() - float(_state_cache["at"]) < 30:
             return dict(_state_cache["data"])
         try:
-            store = StateStore(Path(settings.idempotency_path))
-            s = store.load(settings.strategy_equity_usd)
+            # The trading engine persists daily risk state here. Reading the
+            # idempotency ledger as SessionState silently fell back to the
+            # configured budget and made a ~$31 live account display as $100.
+            live_equity = settings.strategy_equity_usd
+            if settings.has_credentials:
+                from .engine import build_gateway
+                live_equity = float(build_gateway(settings).account_equity())
+            store = StateStore(Path(settings.session_state_path))
+            s = store.load(live_equity)
             today = datetime.now(timezone.utc).date().isoformat()
             drawdown = round((1 - s.current_equity / max(s.peak_equity, 0.01)) * 100, 1)
             daily_loss = round(abs(s.realized_pnl_today), 2)
-            max_daily_loss = round(settings.strategy_equity_usd * settings.max_daily_loss_fraction, 2)
+            risk_equity = min(live_equity, settings.strategy_equity_usd)
+            max_daily_loss = round(risk_equity * settings.max_daily_loss_fraction, 2)
             max_dd_pct = round(settings.max_drawdown_fraction * 100, 1)
             cooldown_active = False
             cooldown_remaining = 0
@@ -695,7 +743,10 @@ def risk_state_snapshot(settings: Settings) -> dict[str, object]:
                         loss_streak += 1
                     else:
                         break
-                data["consecutive_losses"] = min(loss_streak, settings.max_orders_per_day)
+                data["consecutive_losses"] = (
+                    min(loss_streak, settings.max_orders_per_day)
+                    if settings.max_orders_per_day > 0 else loss_streak
+                )
             except Exception:
                 pass
         except Exception as exc:
@@ -1754,6 +1805,7 @@ def make_handler(settings: Settings, monitor: PaperMonitor) -> type[BaseHTTPRequ
         "/api/emergency-stop": lambda: ("json", {"active": emergency_stop_active()}),
         "/api/kraken/balances": lambda: ("json", kraken_balances_data(settings)),
         "/api/kraken/trades": lambda: ("json", kraken_trades_data(settings)),
+        "/api/executions": lambda: ("json", execution_data(settings)),
         "/api/scanner": lambda: ("json", scanner_data(settings)),
         "/api/alerts": lambda: ("json", alerts_status()),
         "/api/learner": lambda: ("json", learner_state_data(settings)),
@@ -1887,9 +1939,11 @@ def serve_dashboard(settings: Settings, run: bool = True) -> int:
             setattr(acct_settings, key_attr, getattr(settings, key_attr, ""))
             setattr(acct_settings, secret_attr, getattr(settings, secret_attr, ""))
         m = TradingMonitor(acct_settings)
-        m.start()
+        if getattr(acct_settings, "auto_start_monitor", False):
+            m.start()
         monitors.append(m)
-        print(f"[multi-platform] started monitor for broker={broker}")
+        state = "started" if m.status()["running"] else "ready (stopped)"
+        print(f"[multi-platform] monitor {state} for broker={broker}")
 
     server = ThreadingHTTPServer((HOST, PORT), make_handler(settings, monitors[0]))
     print(f"Dublin Terminal v2: http://{HOST}:{PORT}")

@@ -177,6 +177,31 @@ def test_budget_cap_limits_sizing_to_strategy_equity():
     assert decision.notional_usd <= 10.0 + 1e-6
 
 
+def test_bot_exposure_aggregates_every_owned_symbol():
+    from unittest.mock import MagicMock
+
+    s = Settings(_env_file=None)
+    gateway = MagicMock()
+    prices = {"BTC/USD": 80_000.0, "PUMP/USD": 0.005}
+    gateway.get_ticker_for.side_effect = lambda symbol: {"last": prices[symbol]}
+    engine = TradingEngine(s, gateway=gateway)
+    engine._bot_qty = {"BTC/USD": 0.0001, "PUMP/USD": 2_000.0}
+
+    assert engine._bot_open_exposure_usd() == 18.0
+
+
+def test_bot_exposure_fails_closed_when_a_lot_cannot_be_valued():
+    from unittest.mock import MagicMock
+
+    s = Settings(_env_file=None)
+    gateway = MagicMock()
+    gateway.get_ticker_for.side_effect = RuntimeError("ticker unavailable")
+    engine = TradingEngine(s, gateway=gateway)
+    engine._bot_qty = {"BTC/USD": 0.0001}
+
+    assert engine._bot_open_exposure_usd() == float("inf")
+
+
 def test_universe_allowlist_defaults_to_positive_expectancy_coins():
     """Audit #8: the live MR edge is coin-specific, so the default universe
     must be restricted to coins with positive backtested expectancy — not the
@@ -190,4 +215,3 @@ def test_universe_allowlist_defaults_to_positive_expectancy_coins():
         candidates = [c for c in candidates if c.upper() in allowed]
     assert "XRP/USD" not in candidates
     assert "SOL/USD" not in candidates
-

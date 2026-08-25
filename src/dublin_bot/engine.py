@@ -99,7 +99,7 @@ class TradingEngine:
         self.strategy = build_strategy(settings)
         self.risk = RiskManager(settings)
         self.journal = Journal(settings.journal_path)
-        self.state_store = StateStore(Path("logs/session_state.json"))
+        self.state_store = StateStore(Path(settings.session_state_path))
         self.ledger = IdempotencyLedger(Path(settings.idempotency_path))
         self.market_guard = MarketGuard(
             max_spread_bps=settings.max_spread_bps,
@@ -156,15 +156,13 @@ class TradingEngine:
     def _apply_performance_profile(self) -> None:
         """Coerce timeframe/cadence from the high-level mode flags.
 
-        day_trade_mode -> 5m bars, 60s monitor cadence.  Lets the operator flip
+        day_trade_mode -> 5m bars, 5m candle-close cadence. Lets the operator flip
         intraday behaviour with one boolean instead of three coupled knobs.
         """
         s = self.settings
         if getattr(s, "day_trade_mode", False):
             s.timeframe_minutes = 5
-            # Keep the existing cadence unless it is slower than 60s.
-            if int(getattr(s, "monitor_interval_seconds", 900)) > 60:
-                s.monitor_interval_seconds = 60
+            s.monitor_interval_seconds = 300
 
     # ── gate 1: safety ───────────────────────────────────────
 
@@ -647,23 +645,14 @@ class TradingEngine:
         state.realized_pnl_today = equity - state.start_equity
         open_exposure = 0.0
         try:
-            s = self.settings
-            if s.margin_enabled and hasattr(self.gateway, "margin_positions"):
-                # Margin exposure is measured by collateral committed, not notional.
-                open_exposure = float(sum(
-                    p.get("margin_total", 0.0) for p in self.gateway.margin_positions()
-                ))
-            elif hasattr(self.gateway, "positions"):
-                open_exposure = float(sum(
-                    p.get("market_value", 0.0) for p in self.gateway.positions()
-                ))
+            # Aggregate every bot-owned spot lot, not merely the currently
+            # selected symbol. Kraken execution is permanently spot-only.
+            open_exposure = self._bot_open_exposure_usd()
         except Exception:
             # Margin/positions endpoint errors must never block trading or
             # crash the cycle — exposure is advisory (risk still caps per-trade).
             open_exposure = 0.0
-        leverage = self.settings.max_leverage if self.settings.margin_enabled else None
-        if leverage is not None:
-            leverage = min(leverage, self.settings.max_leverage)
+        leverage = None
         returns = bars["close"].pct_change().dropna() if len(bars) > 1 else None
         risk = self.risk.evaluate(
             signal,
@@ -700,16 +689,16 @@ class TradingEngine:
             # PrecisionError and crash the cycle (this is why the bot looked
             # dead). Enforce a fillable floor = the coin's real minimum order
             # notional, still bounded by the authorized exposure cap. Real
-            # equity (not the config strategy_equity_usd ceiling) is the cap, so
-            # added funds deploy fully.
+            # equity and the explicitly authorized strategy budget both bind.
             sym = self.settings.symbol
             try:
                 coin_min = self._min_notional(sym)
             except Exception:
                 coin_min = self.settings.min_order_notional_usd
-            # Exposure cap uses REAL equity (skill: never cap at the config
-            # budget field, which would throttle funds the owner actually has).
-            max_affordable = equity * self.settings.max_position_fraction
+            max_affordable = (
+                min(equity, self.settings.strategy_equity_usd)
+                * self.settings.max_position_fraction
+            )
             if buy_notional < coin_min:
                 buy_notional = coin_min
             if buy_notional > max_affordable:
@@ -726,6 +715,7 @@ class TradingEngine:
                     notional=buy_notional, risk=risk,
                     bar_timestamp=bar_timestamp, state=state, gates=gates,
                     leverage=leverage, dca=getattr(self, "_dca_executed_this_cycle", False),
+                    signal_price=signal.price,
                 )
             # If this BUY was a DCA accumulator entry and an order was actually
             # placed, update its counters. Symbol restoration happens below
@@ -740,7 +730,7 @@ class TradingEngine:
             order_id, risk = self._execute(
                 side="sell", notional=0.0, risk=risk,
                 bar_timestamp=bar_timestamp, state=state, gates=gates,
-                leverage=leverage,
+                leverage=leverage, signal_price=signal.price,
             )
 
         # Restore the cycle's primary symbol if the DCA sleeve had swapped it.
@@ -778,7 +768,8 @@ class TradingEngine:
 
     def _execute(self, *, side: str, notional: float, risk: RiskDecision,
                  bar_timestamp: str, state, gates: dict, leverage: float | None = None,
-                 bracket_plan=None) -> tuple[str | None, RiskDecision]:
+                 bracket_plan=None,
+                 signal_price: float = 0.0) -> tuple[str | None, RiskDecision]:
         """Reserve an idempotency key, then execute. Never resends on ambiguity."""
         key = make_intent_key(
             symbol=self.settings.symbol, side=side,
@@ -803,7 +794,7 @@ class TradingEngine:
                     # Advanced path: submit the bracket/limit order via AddOrder.
                     bracket_plan.userref = record.userref
                     params = bracket_plan.to_addorder_params()
-                    order_id = self.gateway.add_order(params)
+                    order_id = self.gateway.add_order(params, signal_price=signal_price)
                     if self.settings.paper_trading or self.settings.dry_run:
                         ticker = self.gateway.get_ticker()
                         sized = self.gateway.size_buy(notional, price=float(ticker["ask"]))
@@ -824,11 +815,22 @@ class TradingEngine:
                         state.current_equity = portfolio.equity
                         state.peak_equity = max(state.peak_equity, state.current_equity)
                 else:
-                    order_id = self.gateway.buy_notional(notional, userref=record.userref, leverage=leverage)
+                    order_id = self.gateway.buy_notional(
+                        notional, userref=record.userref,
+                        signal_price=signal_price,
+                    )
                     if order_id is not None:
                         # Legacy / DCA buy path: record the bot-owned lot so a
                         # later SELL never sweeps external holdings (#3).
-                        sized_qty = float(self.gateway.size_buy(notional, price=float(self.gateway.get_ticker().get("ask", 0) or 1)).volume)
+                        live_fill = getattr(self.gateway, "last_fill", None)
+                        sized_qty = (
+                            float(live_fill.volume)
+                            if live_fill is not None and live_fill.order_id == order_id
+                            else float(self.gateway.size_buy(
+                                notional,
+                                price=float(self.gateway.get_ticker().get("ask", 0) or 1),
+                            ).volume)
+                        )
                         self._record_bot_buy(self.settings.symbol, sized_qty)
                     if self.settings.paper_trading or self.settings.dry_run:
                         ticker = self.gateway.get_ticker()
@@ -863,9 +865,16 @@ class TradingEngine:
                                        "gate": "no_sweep"}, severity="warning")
                     return None, RiskDecision(False, "No bot-owned lot to sell (sweep blocked)")
                 order_id = self.gateway.close_position(
-                    userref=record.userref, quantity=bot_qty
+                    userref=record.userref, quantity=bot_qty,
+                    signal_price=signal_price,
                 )
-                self._record_bot_sell(self.settings.symbol, bot_qty)
+                live_fill = getattr(self.gateway, "last_fill", None)
+                sold_qty = (
+                    float(live_fill.volume)
+                    if live_fill is not None and live_fill.order_id == order_id
+                    else bot_qty
+                )
+                self._record_bot_sell(self.settings.symbol, sold_qty)
                 if self.settings.paper_trading or self.settings.dry_run:
                     ticker = self.gateway.get_ticker()
                     portfolio = self.paper_portfolio.snapshot()
@@ -915,7 +924,8 @@ class TradingEngine:
 
     def _execute_buy(self, *, notional: float, risk: RiskDecision,
                      bar_timestamp: str, state, gates: dict,
-                     leverage: float | None, dca: bool) -> tuple[str | None, RiskDecision]:
+                     leverage: float | None, dca: bool,
+                     signal_price: float) -> tuple[str | None, RiskDecision]:
         """Advanced BUY path: bracket (SL+TP) and/or limit entry.
 
         Falls back to the legacy ``buy_notional`` market order when neither
@@ -931,7 +941,7 @@ class TradingEngine:
         if touch <= 0:
             return self._execute(side="buy", notional=notional, risk=risk,
                                  bar_timestamp=bar_timestamp, state=state, gates=gates,
-                                 leverage=leverage)
+                                 leverage=leverage, signal_price=signal_price)
         meta = self.gateway.resolve_symbol()
         sized = self.gateway.size_buy(notional, price=touch)
         volume = sized.volume_str
@@ -941,7 +951,7 @@ class TradingEngine:
         if not (use_bracket or use_limit):
             return self._execute(side="buy", notional=notional, risk=risk,
                                  bar_timestamp=bar_timestamp, state=state, gates=gates,
-                                 leverage=leverage)
+                                 leverage=leverage, signal_price=signal_price)
 
         entry_price = None
         if use_limit:
@@ -959,7 +969,6 @@ class TradingEngine:
             entry_price=entry_price,
             stop_loss=sl,
             userref=None,  # filled by _execute idempotency
-            leverage=leverage,
             trailing=s.trailing_stop,
             pair_decimals=meta.pair_decimals,
         )
@@ -968,7 +977,7 @@ class TradingEngine:
         res = self._execute(
             side="buy", notional=notional, risk=risk,
             bar_timestamp=bar_timestamp, state=state, gates=gates,
-            leverage=leverage, bracket_plan=plan,
+            leverage=leverage, bracket_plan=plan, signal_price=signal_price,
         )
         # Take-profit: a separate resting limit order (avoids close[1] which
         # this tier rejects). Only on a real entry with bracket enabled.
@@ -1021,6 +1030,21 @@ class TradingEngine:
             else:
                 self._bot_qty[symbol] = remaining
         self._save_bot_qty()
+
+    def _bot_open_exposure_usd(self) -> float:
+        """Market value of all bot-owned spot lots across symbols."""
+        total = 0.0
+        for symbol, quantity in self._bot_qty.items():
+            if quantity <= 0:
+                continue
+            try:
+                price = float(self.gateway.get_ticker_for(symbol)["last"])
+            except Exception:
+                # Unknown exposure must fail closed. Returning infinity blocks
+                # new entries until valuation is available again.
+                return float("inf")
+            total += quantity * price
+        return total
 
     def live_price(self, symbol: str | None = None) -> float | None:
         """Best available price: real-time WS feed if connected, else REST.

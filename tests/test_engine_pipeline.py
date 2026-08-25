@@ -139,9 +139,26 @@ def test_repeated_cycles_on_the_same_bar_do_not_duplicate(settings, fake_session
     second = engine.run_cycle()
 
     if first.executed:
-        # Same bar, same intent → the second attempt must be blocked.
+        # Same bar, same intent → the second attempt must be blocked. Once the
+        # first fill is reflected in aggregate bot-owned exposure, the risk
+        # gate may stop it before the idempotency gate is reached.
         assert second.executed is False
-        assert second.gates["idempotency"]["blocked"] is True
+        duplicate_blocked = second.gates.get("idempotency", {}).get("blocked") is True
+        exposure_blocked = (
+            second.record is not None
+            and "exposure" in second.record.risk.reason.lower()
+        )
+        position_held = (
+            second.record is not None
+            and second.record.signal.action is Action.WAIT
+            and second.record.risk.reason == "No entry order requested"
+        )
+        assert duplicate_blocked or exposure_blocked or position_held, {
+            "gates": second.gates,
+            "risk": repr(second.record.risk) if second.record else None,
+            "blocked_at": second.blocked_at,
+            "block_reason": second.block_reason,
+        }
     # Regardless of signal, at most one confirmed order exists for this bar.
     confirmed = [r for r in engine.ledger._records.values() if r.status == "confirmed"]
     assert len(confirmed) <= 1

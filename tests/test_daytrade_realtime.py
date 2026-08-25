@@ -6,14 +6,23 @@ from unittest.mock import MagicMock
 
 from dublin_bot.config import Settings
 from dublin_bot.engine import TradingEngine
+from dublin_bot.dashboard import TradingMonitor
 from dublin_bot.realtime import KrakenRealtimeFeed, FeedSnapshot
 
 
-def test_day_trade_mode_applies_5m_and_60s_cadence() -> None:
+def test_day_trade_mode_applies_5m_candle_cadence() -> None:
     s = Settings(day_trade_mode=True, monitor_interval_seconds=900)
     eng = TradingEngine(s)
     assert eng.settings.timeframe_minutes == 5
-    assert eng.settings.monitor_interval_seconds == 60
+    assert eng.settings.monitor_interval_seconds == 300
+
+
+def test_monitor_runs_two_seconds_after_next_five_minute_close() -> None:
+    settings = Settings(timeframe_minutes=5, candle_close_delay_seconds=2)
+    monitor = TradingMonitor(settings)
+    # 12:03:20 in an arbitrary five-minute bucket -> next run at 12:05:02.
+    assert monitor._seconds_until_next_candle(now=200.0) == 102.0
+    assert monitor.interval_seconds == 300
 
 
 def test_normal_mode_keeps_defaults() -> None:
