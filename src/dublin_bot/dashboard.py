@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock, Thread
 from time import monotonic
 
@@ -54,6 +55,10 @@ _learning_cache: dict[str, object] = {"at": 0.0, "data": {}}
 _learning_lock = Lock()
 _scanner_cache: dict[str, object] = {"at": 0.0, "data": {}}
 _scanner_lock = Lock()
+# Single long-lived executor for the watchlist scanner. Reused across requests
+# instead of creating a fresh ThreadPoolExecutor per page load (the old code
+# leaked 8 threads on every /api/scanner poll until ulimit -u was exhausted).
+_scanner_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="dublin-scanner")
 _trades_cache: dict[str, object] = {"at": 0.0, "data": {}}
 _trades_lock = Lock()
 _balances_cache: dict[str, object] = {"at": 0.0, "data": {}}
@@ -287,7 +292,6 @@ def scanner_data(settings: Settings) -> dict[str, object]:
     with _scanner_lock:
         if monotonic() - float(_scanner_cache["at"]) < 30:
             return dict(_scanner_cache["data"])
-        from concurrent.futures import ThreadPoolExecutor
 
         def _fetch(display: str) -> dict[str, object]:
             altname = KRAKEN_ALTNAMES.get(display, display.replace("/", ""))
@@ -310,13 +314,12 @@ def scanner_data(settings: Settings) -> dict[str, object]:
         pairs: list[dict[str, object]] = []
         errors: list[str] = []
         watchlist = _watchlist_pairs()
-        with ThreadPoolExecutor(max_workers=min(8, len(watchlist) or 1)) as pool:
-            futures = {pool.submit(_fetch, d): d for d in watchlist}
-            for fut, display in futures.items():
-                try:
-                    pairs.append(fut.result(timeout=12))
-                except Exception as exc:
-                    errors.append(f"{display}: {exc}")
+        futures = {_scanner_pool.submit(_fetch, d): d for d in watchlist}
+        for fut, display in futures.items():
+            try:
+                pairs.append(fut.result(timeout=12))
+            except Exception as exc:
+                errors.append(f"{display}: {exc}")
         pairs.sort(key=lambda p: abs(float(p["change_24h_pct"])), reverse=True)
         data = {
             "ok": True,
@@ -1946,6 +1949,7 @@ def serve_dashboard(settings: Settings, run: bool = True) -> int:
         print(f"[multi-platform] monitor {state} for broker={broker}")
 
     server = ThreadingHTTPServer((HOST, PORT), make_handler(settings, monitors[0]))
+    server.daemon_threads = True  # request threads don't accumulate / block shutdown
     print(f"Dublin Terminal v2: http://{HOST}:{PORT}")
     print("Press Control-C to stop.")
     try:
