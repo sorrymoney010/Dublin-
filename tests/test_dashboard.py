@@ -1,6 +1,7 @@
 from dublin_bot.config import Settings
 from dublin_bot import dashboard
-from dublin_bot.dashboard import risk_state_snapshot, safety_status
+from dublin_bot.dashboard import BoundedDashboardHTTPServer, risk_state_snapshot, safety_status
+from http.server import BaseHTTPRequestHandler
 
 
 def test_dashboard_requires_all_safe_defaults():
@@ -31,3 +32,13 @@ def test_risk_snapshot_uses_live_equity_and_engine_state_path(tmp_path, monkeypa
     assert snapshot["current_equity"] == 31.62
     assert snapshot["start_equity"] == 31.62
     assert snapshot["max_daily_loss"] == 0.95
+
+
+def test_dashboard_http_server_bounds_request_threads():
+    server = BoundedDashboardHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+    try:
+        assert server.daemon_threads is True
+        assert server.block_on_close is False
+        assert server.max_request_threads == 24
+    finally:
+        server.server_close()

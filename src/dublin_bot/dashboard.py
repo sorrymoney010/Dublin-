@@ -28,8 +28,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event, Lock, Thread
+from threading import BoundedSemaphore, Event, Lock, Thread
 from time import monotonic
+from typing import Any
 
 from .audit import AuditLog
 from .config import Settings
@@ -62,6 +63,37 @@ _scanner_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="dublin-sca
 _trades_cache: dict[str, object] = {"at": 0.0, "data": {}}
 _trades_lock = Lock()
 _balances_cache: dict[str, object] = {"at": 0.0, "data": {}}
+
+
+class BoundedDashboardHTTPServer(ThreadingHTTPServer):
+    """Threaded HTTP server with a fixed upper bound on active handlers.
+
+    Dashboard routes call Kraken and can take up to their network timeout. A
+    browser polling faster than those calls complete must never create an
+    unbounded number of OS threads and starve the trading monitor.
+    """
+
+    daemon_threads = True
+    block_on_close = False
+    max_request_threads = 24
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._request_slots = BoundedSemaphore(self.max_request_threads)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        self._request_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
 _balances_lock = Lock()
 
 
@@ -1948,8 +1980,7 @@ def serve_dashboard(settings: Settings, run: bool = True) -> int:
         state = "started" if m.status()["running"] else "ready (stopped)"
         print(f"[multi-platform] monitor {state} for broker={broker}")
 
-    server = ThreadingHTTPServer((HOST, PORT), make_handler(settings, monitors[0]))
-    server.daemon_threads = True  # request threads don't accumulate / block shutdown
+    server = BoundedDashboardHTTPServer((HOST, PORT), make_handler(settings, monitors[0]))
     print(f"Dublin Terminal v2: http://{HOST}:{PORT}")
     print("Press Control-C to stop.")
     try:
