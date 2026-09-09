@@ -193,6 +193,7 @@ def settings_factory(tmp_path):
             audit_log_path=tmp_path / "audit.jsonl",
             idempotency_path=tmp_path / "orders.json",
             nonce_state_path=tmp_path / "nonce.json",
+            managed_position_path=tmp_path / "managed.json",
         )
         defaults.update(overrides)
         return Settings(**defaults)
@@ -234,3 +235,12 @@ def synthetic_bars() -> pd.DataFrame:
         },
         index=index,
     )
+
+
+@pytest.fixture(autouse=True)
+def isolate_runtime(monkeypatch, tmp_path):
+    """Keep session state and implicit runtime paths isolated and prohibit HTTP."""
+    monkeypatch.chdir(tmp_path)
+    def reject_network(*args, **kwargs):
+        raise AssertionError("Tests must use a fake transport")
+    monkeypatch.setattr("requests.sessions.Session.request", reject_network)
