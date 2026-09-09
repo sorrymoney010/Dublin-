@@ -29,8 +29,19 @@ class ManagedKrakenGateway(KrakenGateway):
             return self.settings.strategy_equity_usd
 
     def available_base_quantity(self) -> float:
-        positions = self.positions()
-        return float(positions[0]["quantity"]) if positions else 0.0
+        """Read the configured base-asset balance directly.
+
+        This intentionally bypasses the legacy positions() helper because that
+        helper converts broker failures into an empty list. Live reconciliation
+        needs the distinction between "zero balance" and "could not read balance".
+        """
+        if not self.has_credentials:
+            if self.settings.live_execution_armed:
+                raise BrokerError("Live execution armed but Kraken credentials are unavailable")
+            return 0.0
+        meta = self.resolve_symbol()
+        balances = self.balances()
+        return float(balances.get(meta.base, 0.0))
 
     def sell_quantity(self, quantity: float, *, userref: int | None = None) -> str:
         if quantity <= 0:
@@ -40,7 +51,6 @@ class ManagedKrakenGateway(KrakenGateway):
         if volume <= 0:
             raise BrokerError(f"Managed quantity {quantity} rounds to zero for {meta.key}")
 
-        # A managed quantity can never exceed the current account balance.
         available = self.available_base_quantity()
         if float(volume) > available:
             raise BrokerError(
