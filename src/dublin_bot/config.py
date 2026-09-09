@@ -69,18 +69,23 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_safety(self) -> "Settings":
-        # Preserve precise failure reasons for operators and regression tests.
-        if not self.paper_trading and not self.allow_live_trading:
-            raise ValueError("Live mode blocked: ALLOW_LIVE_TRADING must be true")
-        if self.allow_live_trading:
-            if self.paper_trading:
-                raise ValueError("Live mode blocked: PAPER_TRADING must be false")
-            if self.dry_run:
-                raise ValueError("Live mode blocked: DRY_RUN must be false")
+        # Preserve the existing operator/test failure contracts first.
+        if not self.paper_trading:
+            if not self.allow_live_trading:
+                raise ValueError("Live mode blocked: ALLOW_LIVE_TRADING must be true")
             if self.live_risk_acknowledgement != "I_ACCEPT_LIVE_TRADING_RISK":
                 raise ValueError("Live mode blocked: acknowledgement is missing")
-        if self.live_execution_armed and not self.allow_live_trading:
-            raise ValueError("Live execution arm requires ALLOW_LIVE_TRADING=true")
+            if self.dry_run:
+                raise ValueError("Live mode blocked: DRY_RUN must be false")
+        if self.live_execution_armed:
+            if self.paper_trading:
+                raise ValueError("Live execution arm requires PAPER_TRADING=false")
+            if not self.allow_live_trading:
+                raise ValueError("Live execution arm requires ALLOW_LIVE_TRADING=true")
+            if self.dry_run:
+                raise ValueError("Live execution arm requires DRY_RUN=false")
+            if self.live_risk_acknowledgement != "I_ACCEPT_LIVE_TRADING_RISK":
+                raise ValueError("Live mode blocked: acknowledgement is missing")
 
         if not (self.fast_ema < self.slow_ema < self.regime_ema):
             raise ValueError("EMA periods must satisfy fast < slow < regime")
