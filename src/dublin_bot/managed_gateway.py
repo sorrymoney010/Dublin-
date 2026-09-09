@@ -9,7 +9,28 @@ from .precision import round_volume
 
 
 class ManagedKrakenGateway(KrakenGateway):
-    """Kraken gateway with quantity-scoped exits for Dublin-managed exposure."""
+    """Kraken gateway with quantity-scoped exits and fail-closed live reads."""
+
+    def account_equity(self) -> float:
+        """Fail closed on private account-data errors whenever live execution is armed."""
+        if not self.has_credentials:
+            if self.settings.live_execution_armed:
+                raise BrokerError("Live execution armed but Kraken credentials are unavailable")
+            return self.settings.strategy_equity_usd
+        try:
+            result = self._private("TradeBalance", {"asset": "ZUSD"})
+            value = float(result.get("eb", 0.0))
+            if value <= 0 and self.settings.live_execution_armed:
+                raise BrokerError("Kraken returned non-positive account equity in live mode")
+            return value
+        except BrokerError:
+            if self.settings.live_execution_armed:
+                raise
+            return self.settings.strategy_equity_usd
+
+    def available_base_quantity(self) -> float:
+        positions = self.positions()
+        return float(positions[0]["quantity"]) if positions else 0.0
 
     def sell_quantity(self, quantity: float, *, userref: int | None = None) -> str:
         if quantity <= 0:
@@ -20,8 +41,7 @@ class ManagedKrakenGateway(KrakenGateway):
             raise BrokerError(f"Managed quantity {quantity} rounds to zero for {meta.key}")
 
         # A managed quantity can never exceed the current account balance.
-        positions = self.positions()
-        available = float(positions[0]["quantity"]) if positions else 0.0
+        available = self.available_base_quantity()
         if float(volume) > available:
             raise BrokerError(
                 f"Managed quantity {volume} exceeds available Kraken balance {available}"
