@@ -14,7 +14,7 @@ from .journal import Journal
 from .managed_gateway import ManagedKrakenGateway
 from .managed_position import ManagedPositionStore
 from .market_quality import MarketGuard, MarketQuality
-from .models import Action, DecisionRecord, RiskDecision
+from .models import Action, DecisionRecord, RiskDecision, Signal
 from .risk import RiskManager
 from .state import StateStore
 from .strategy import TrendBreakoutStrategy
@@ -127,7 +127,10 @@ class TradingEngine:
         gates["bars"] = {"count": int(len(bars))}
 
         if hasattr(self.gateway, "check_freshness"):
-            verdict = self.gateway.check_freshness(bars)
+            try:
+                verdict = self.gateway.check_freshness(bars)
+            except BrokerError as exc:
+                return CycleResult(None, "freshness", str(exc), gates)
             gates["freshness"] = verdict.to_dict()
             if not verdict.fresh:
                 return CycleResult(None, "freshness", verdict.reason, gates)
@@ -146,19 +149,77 @@ class TradingEngine:
                 gates["market_quality"] = {"approved": False, "reason": quality_reason}
 
         in_position, managed = self._managed_position_status()
-        exchange_has_position = self.gateway.has_position()
+
+        # Reconciliation is authoritative for managed exposure. If Dublin thinks
+        # it owns more than Kraken reports, live mode halts rather than risking an
+        # invalid or oversized exit.
+        available_quantity = 0.0
+        try:
+            if hasattr(self.gateway, "available_base_quantity"):
+                available_quantity = float(self.gateway.available_base_quantity())
+            else:
+                positions = self.gateway.positions()
+                available_quantity = float(positions[0]["quantity"]) if positions else 0.0
+        except BrokerError as exc:
+            if self.settings.live_execution_armed:
+                return CycleResult(None, "reconciliation", f"Kraken position read failed: {exc}", gates)
+
+        exchange_has_position = available_quantity > 0
+        shortage = bool(in_position and managed is not None and available_quantity + 1e-12 < float(managed.quantity))
         gates["position_reconciliation"] = {
             "managed_position": in_position,
+            "managed_quantity": float(managed.quantity) if managed is not None else 0.0,
+            "exchange_quantity": available_quantity,
             "exchange_base_balance_present": exchange_has_position,
             "orphaned_exchange_holding": bool(exchange_has_position and not in_position),
+            "shortage": shortage,
         }
+        if shortage:
+            reason = (
+                f"Managed quantity {managed.quantity} exceeds Kraken available quantity "
+                f"{available_quantity}; entry/exit halted pending reconciliation"
+            )
+            self.audit.record(AuditEvent.SAFETY_VIOLATION, {"error": reason}, severity="critical")
+            return CycleResult(None, "reconciliation", reason, gates)
+
         signal = self.strategy.evaluate(bars, in_position=in_position)
+
+        # Protective stop is evaluated from the latest ticker, independent of the
+        # slower strategy exit. It can force an exit even if the candle-based COO
+        # model still says HOLD.
+        if in_position and managed is not None and float(managed.stop_price) > 0:
+            try:
+                last_price = float(self.gateway.get_ticker()["last"])
+            except BrokerError as exc:
+                if self.settings.live_execution_armed:
+                    return CycleResult(None, "protective_stop", f"Stop price check failed: {exc}", gates)
+                last_price = 0.0
+            triggered = last_price > 0 and last_price <= float(managed.stop_price)
+            gates["protective_stop"] = {
+                "stop_price": float(managed.stop_price),
+                "last_price": last_price,
+                "triggered": triggered,
+            }
+            if triggered:
+                signal = Signal(
+                    Action.SELL,
+                    100,
+                    f"Protective stop triggered at {last_price:.8f} <= {managed.stop_price:.8f}",
+                    last_price,
+                    stop_price=float(managed.stop_price),
+                )
+
         self.audit.record(AuditEvent.SIGNAL, {
             "action": signal.action.value, "score": signal.score, "reason": signal.reason,
             "price": signal.price, "stop_price": signal.stop_price,
         })
 
-        equity = min(self.gateway.account_equity(), self.settings.strategy_equity_usd)
+        try:
+            equity = min(self.gateway.account_equity(), self.settings.strategy_equity_usd)
+        except BrokerError as exc:
+            self.audit.record(AuditEvent.BROKER_ERROR, {"operation": "account_equity", "error": str(exc)}, severity="critical")
+            return CycleResult(None, "account_data", str(exc), gates)
+
         state = self.state_store.load(equity)
         state.current_equity = equity
         state.peak_equity = max(state.peak_equity, equity)
@@ -257,7 +318,6 @@ class TradingEngine:
         result = self.run_cycle()
         if result.record is not None:
             return result.record
-        from .models import Signal
         signal = Signal(Action.HALT, 0, result.block_reason or "blocked", 0.0)
         record = DecisionRecord(
             symbol=self.settings.symbol, signal=signal,
