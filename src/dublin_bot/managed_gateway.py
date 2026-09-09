@@ -29,12 +29,7 @@ class ManagedKrakenGateway(KrakenGateway):
             return self.settings.strategy_equity_usd
 
     def available_base_quantity(self) -> float:
-        """Read the configured base-asset balance directly.
-
-        This intentionally bypasses the legacy positions() helper because that
-        helper converts broker failures into an empty list. Live reconciliation
-        needs the distinction between "zero balance" and "could not read balance".
-        """
+        """Read the configured base-asset balance directly for live reconciliation."""
         if not self.has_credentials:
             if self.settings.live_execution_armed:
                 raise BrokerError("Live execution armed but Kraken credentials are unavailable")
@@ -51,12 +46,8 @@ class ManagedKrakenGateway(KrakenGateway):
         if volume <= 0:
             raise BrokerError(f"Managed quantity {quantity} rounds to zero for {meta.key}")
 
-        available = self.available_base_quantity()
-        if float(volume) > available:
-            raise BrokerError(
-                f"Managed quantity {volume} exceeds available Kraken balance {available}"
-            )
-
+        # Paper/dry-run exits are local simulations. They must not depend on a
+        # real Kraken balance because no real entry was placed.
         if not self.order_submission_enabled:
             self._log(AuditEvent.ORDER_INTENT, {
                 "mode": "dry_run",
@@ -67,6 +58,14 @@ class ManagedKrakenGateway(KrakenGateway):
                 "userref": userref,
             })
             return f"kraken-dry-managed-sell-{userref or int(time.time())}"
+
+        # Live exits are quantity-scoped and fail closed if Kraken reports less
+        # base asset than Dublin's managed position requires.
+        available = self.available_base_quantity()
+        if float(volume) > available:
+            raise BrokerError(
+                f"Managed quantity {volume} exceeds available Kraken balance {available}"
+            )
 
         self._assert_can_submit()
         params = {
