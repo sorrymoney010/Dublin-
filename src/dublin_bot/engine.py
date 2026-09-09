@@ -1,22 +1,4 @@
-"""Trading engine: the ordered safety pipeline for one decision cycle.
-
-Every cycle runs the same gate sequence, and **any** gate failing aborts before
-an order can be formed:
-
-    1. safety locks        — paper/dry-run/live flags consistent
-    2. market data         — bars fetched, monotonic, no duplicates
-    3. freshness           — bar age and exchange clock skew within tolerance
-    4. market quality      — spread and liquidity acceptable
-    5. strategy signal     — indicator confluence
-    6. risk manager        — sizing, circuit breakers, cooldown, order caps
-    7. precision           — exchange minimums and lot rounding
-    8. idempotency         — this exact intent has not been submitted before
-    9. execution           — dry-run synthetic id, or gated live submission
-
-Gate order is deliberate: cheap local checks precede network calls, and the
-idempotency reservation happens immediately before execution so the persisted
-window of "unknown outcome" is as small as possible.
-"""
+"""Trading engine: ordered safety and execution pipeline."""
 
 from __future__ import annotations
 
@@ -26,16 +8,11 @@ from pathlib import Path
 
 from .audit import AuditEvent, AuditLog
 from .config import Settings
-from .errors import (
-    BrokerError,
-    DuplicateOrderError,
-    PrecisionError,
-    SafetyLockError,
-    StaleDataError,
-)
+from .errors import BrokerError, DuplicateOrderError, PrecisionError, SafetyLockError, StaleDataError
 from .idempotency import IdempotencyLedger, make_intent_key
 from .journal import Journal
 from .kraken_gateway import KrakenGateway
+from .managed_position import ManagedPositionStore
 from .market_quality import MarketGuard, MarketQuality
 from .models import Action, DecisionRecord, RiskDecision
 from .risk import RiskManager
@@ -44,22 +21,15 @@ from .strategy import TrendBreakoutStrategy
 
 
 def build_gateway(settings: Settings, **kwargs):
-    """Factory: returns the configured broker gateway.
-
-    Only Kraken Spot is supported.  Alpaca has been removed — see SAFETY.md.
-    """
+    """Build Kraken with live submission reachable only through explicit arming."""
     if settings.broker == "kraken":
+        kwargs.setdefault("allow_order_submission", settings.live_execution_armed)
         return KrakenGateway(settings, **kwargs)
-    raise ValueError(
-        f"Unsupported broker: {settings.broker!r}. "
-        "Only 'kraken' is supported. Alpaca has been decommissioned."
-    )
+    raise ValueError(f"Unsupported broker: {settings.broker!r}; only Kraken is supported")
 
 
 @dataclass
 class CycleResult:
-    """Full outcome of one engine cycle, including why it stopped."""
-
     record: DecisionRecord | None
     blocked_at: str | None = None
     block_reason: str | None = None
@@ -87,45 +57,24 @@ class TradingEngine:
         self.risk = RiskManager(settings)
         self.journal = Journal(settings.journal_path)
         self.state_store = StateStore(Path("logs/session_state.json"))
+        self.position_store = ManagedPositionStore(Path(settings.managed_position_path))
         self.ledger = IdempotencyLedger(Path(settings.idempotency_path))
         self.market_guard = MarketGuard(
             max_spread_bps=settings.max_spread_bps,
             min_dollar_volume=settings.min_dollar_volume,
         )
 
-    # ── gate 1: safety ───────────────────────────────────────
-
     def assert_safety_locks(self) -> dict:
-        """Verify the declared safety posture is internally consistent.
-
-        Catches the dangerous middle state where live trading has been half
-        enabled — for example ``paper_trading=false`` with ``dry_run`` still on,
-        or live allowed without the typed acknowledgement.
-        """
         s = self.settings
         report = s.safety_report()
-        if not s.paper_trading and not s.allow_live_trading:
-            raise SafetyLockError(
-                "Inconsistent safety config: paper_trading=false requires "
-                "allow_live_trading=true"
-            )
+        if s.live_execution_armed and not s.live_ready:
+            raise SafetyLockError("Live execution is armed but the full live-ready configuration is incomplete")
         if s.allow_live_trading and s.live_risk_acknowledgement != "I_ACCEPT_LIVE_TRADING_RISK":
-            raise SafetyLockError(
-                "allow_live_trading=true requires the exact acknowledgement string"
-            )
+            raise SafetyLockError("allow_live_trading=true requires the exact acknowledgement string")
         self.audit.record(AuditEvent.SAFETY_CHECK, report)
         return report
 
-    # ── restart recovery ─────────────────────────────────────
-
     def recover(self) -> dict:
-        """Resolve intents left ``pending`` by a crash before the next cycle.
-
-        A pending record means the process died between reserving the intent and
-        confirming the outcome, so we cannot know whether the order reached the
-        exchange.  Each is resolved by querying Kraken for its userref: found →
-        confirmed, definitively absent → failed (and therefore retryable).
-        """
         pending = self.ledger.pending()
         resolved: list[dict] = []
         for record in pending:
@@ -138,85 +87,78 @@ class TradingEngine:
                 try:
                     found = self.gateway.find_order_by_userref(record.userref)
                 except BrokerError as exc:
-                    resolved.append({"key": record.key, "outcome": "unresolved",
-                                     "error": str(exc)})
+                    resolved.append({"key": record.key, "outcome": "unresolved", "error": str(exc)})
                     continue
             if found:
                 self.ledger.confirm(record.key, found["id"])
-                resolved.append({"key": record.key, "outcome": "confirmed",
-                                 "order_id": found["id"]})
+                resolved.append({"key": record.key, "outcome": "confirmed", "order_id": found["id"]})
             else:
                 self.ledger.fail(record.key, "no matching order found at exchange")
                 resolved.append({"key": record.key, "outcome": "failed"})
-
         summary = {"pending_found": len(pending), "resolved": resolved}
         if pending:
             self.audit.record(AuditEvent.RECOVERY, summary, severity="warning")
         self.ledger.prune()
         return summary
 
-    # ── main cycle ───────────────────────────────────────────
+    def _managed_position_status(self) -> tuple[bool, object | None]:
+        managed = self.position_store.load()
+        if managed is None:
+            return False, None
+        if managed.symbol.replace("/", "") != self.settings.symbol.replace("/", ""):
+            return False, managed
+        return managed.quantity > 0, managed
 
     def run_cycle(self) -> CycleResult:
         gates: dict[str, object] = {}
-
-        # Gate 1 — safety locks
         try:
             gates["safety"] = self.assert_safety_locks()
         except SafetyLockError as exc:
-            self.audit.record(AuditEvent.SAFETY_VIOLATION, {"error": str(exc)},
-                              severity="critical")
+            self.audit.record(AuditEvent.SAFETY_VIOLATION, {"error": str(exc)}, severity="critical")
             return CycleResult(None, "safety", str(exc), gates)
 
-        # Restart recovery before any new intent can be formed.
         gates["recovery"] = self.recover()
 
-        # Gate 2 — market data
         try:
             bars = self.gateway.get_bars()
         except (BrokerError, StaleDataError) as exc:
-            self.audit.record(AuditEvent.BROKER_ERROR,
-                              {"operation": "get_bars", "error": str(exc)},
-                              severity="error")
+            self.audit.record(AuditEvent.BROKER_ERROR, {"operation": "get_bars", "error": str(exc)}, severity="error")
             return CycleResult(None, "market_data", str(exc), gates)
         gates["bars"] = {"count": int(len(bars))}
 
-        # Gate 3 — freshness
         if hasattr(self.gateway, "check_freshness"):
             verdict = self.gateway.check_freshness(bars)
             gates["freshness"] = verdict.to_dict()
             if not verdict.fresh:
                 return CycleResult(None, "freshness", verdict.reason, gates)
 
-        # Gate 4 — market quality (advisory when the ticker is unavailable)
         quality_ok, quality_reason = True, "not evaluated"
         if hasattr(self.gateway, "market_quality"):
             try:
                 snapshot = self.gateway.market_quality()
-                quality_ok, quality_reason = self.market_guard.approve(
-                    MarketQuality(
-                        bid=snapshot["bid"],
-                        ask=snapshot["ask"],
-                        recent_dollar_volume=snapshot["recent_dollar_volume"],
-                    )
-                )
-                gates["market_quality"] = {**snapshot, "approved": quality_ok,
-                                           "reason": quality_reason}
+                quality_ok, quality_reason = self.market_guard.approve(MarketQuality(
+                    bid=snapshot["bid"], ask=snapshot["ask"], recent_dollar_volume=snapshot["recent_dollar_volume"]
+                ))
+                gates["market_quality"] = {**snapshot, "approved": quality_ok, "reason": quality_reason}
                 self.audit.record(AuditEvent.MARKET_QUALITY, gates["market_quality"])
             except BrokerError as exc:
                 quality_ok, quality_reason = False, f"market quality unavailable: {exc}"
                 gates["market_quality"] = {"approved": False, "reason": quality_reason}
 
-        # Gate 5 — strategy signal
-        in_position = self.gateway.has_position()
+        in_position, managed = self._managed_position_status()
+        exchange_has_position = self.gateway.has_position()
+        gates["position_reconciliation"] = {
+            "managed_position": in_position,
+            "exchange_base_balance_present": exchange_has_position,
+            "orphaned_exchange_holding": bool(exchange_has_position and not in_position),
+        }
+        # Existing wallet holdings must never be mistaken for Dublin exposure.
         signal = self.strategy.evaluate(bars, in_position=in_position)
         self.audit.record(AuditEvent.SIGNAL, {
-            "action": signal.action.value, "score": signal.score,
-            "reason": signal.reason, "price": signal.price,
-            "stop_price": signal.stop_price,
+            "action": signal.action.value, "score": signal.score, "reason": signal.reason,
+            "price": signal.price, "stop_price": signal.stop_price,
         })
 
-        # Gate 6 — risk
         equity = min(self.gateway.account_equity(), self.settings.strategy_equity_usd)
         state = self.state_store.load(equity)
         state.current_equity = equity
@@ -224,109 +166,107 @@ class TradingEngine:
         state.realized_pnl_today = equity - state.start_equity
         risk = self.risk.evaluate(signal, state)
 
-        # An entry requires healthy market quality; an exit must never be
-        # blocked by a wide spread — being trapped in a position is worse.
         if signal.action is Action.BUY and risk.approved and not quality_ok:
             risk = RiskDecision(False, f"Market quality gate: {quality_reason}")
+        if signal.action is Action.BUY and risk.approved and in_position:
+            risk = RiskDecision(False, "Managed Dublin position already open")
 
         self.audit.record(AuditEvent.RISK_DECISION, {
             "approved": risk.approved, "reason": risk.reason,
-            "notional_usd": risk.notional_usd,
-            "planned_loss_usd": risk.planned_loss_usd,
+            "notional_usd": risk.notional_usd, "planned_loss_usd": risk.planned_loss_usd,
             "equity": equity, "orders_today": state.orders_today,
         })
 
         order_id: str | None = None
         bar_timestamp = str(bars.index[-1]) if len(bars) else datetime.now(timezone.utc).isoformat()
 
-        # Gates 7–9 — precision, idempotency, execution
         if signal.action is Action.BUY and risk.approved:
-            order_id, risk = self._execute(
-                side="buy", notional=risk.notional_usd, risk=risk,
-                bar_timestamp=bar_timestamp, state=state, gates=gates,
-            )
-        elif signal.action is Action.SELL and in_position:
-            order_id, risk = self._execute(
-                side="sell", notional=0.0,
-                risk=RiskDecision(True, "Exit signal approved"),
-                bar_timestamp=bar_timestamp, state=state, gates=gates,
-            )
+            order_id, risk = self._execute_buy(risk, signal, bar_timestamp, state, gates)
+        elif signal.action is Action.SELL and in_position and managed is not None:
+            order_id, risk = self._execute_managed_sell(managed, bar_timestamp, state, gates)
 
         self.state_store.save(state)
         record = DecisionRecord(
-            symbol=self.settings.symbol,
-            signal=signal,
-            risk=risk,
-            dry_run=self.settings.dry_run,
-            order_id=order_id,
+            symbol=self.settings.symbol, signal=signal, risk=risk,
+            dry_run=self.settings.dry_run, order_id=order_id,
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
         self.journal.append(record)
         return CycleResult(record, None, None, gates)
 
-    def _execute(self, *, side: str, notional: float, risk: RiskDecision,
-                 bar_timestamp: str, state, gates: dict) -> tuple[str | None, RiskDecision]:
-        """Reserve an idempotency key, then execute. Never resends on ambiguity."""
-        key = make_intent_key(
-            symbol=self.settings.symbol, side=side,
-            notional_usd=notional, bar_timestamp=bar_timestamp,
-        )
+    def _reserve(self, *, side: str, notional: float, bar_timestamp: str, gates: dict):
+        key = make_intent_key(symbol=self.settings.symbol, side=side,
+                              notional_usd=notional, bar_timestamp=bar_timestamp)
         try:
             record = self.ledger.reserve(
-                key=key, symbol=self.settings.symbol, side=side,
-                notional_usd=notional, bar_timestamp=bar_timestamp,
-                dry_run=self.settings.dry_run,
+                key=key, symbol=self.settings.symbol, side=side, notional_usd=notional,
+                bar_timestamp=bar_timestamp, dry_run=self.settings.dry_run,
             )
         except DuplicateOrderError as exc:
             self.audit.record(AuditEvent.ORDER_DUPLICATE_BLOCKED,
                               {"key": key, "error": str(exc)}, severity="warning")
             gates["idempotency"] = {"blocked": True, "reason": str(exc)}
-            return None, RiskDecision(False, f"Duplicate order blocked: {exc}")
-
+            return None, None
         gates["idempotency"] = {"blocked": False, "key": key, "userref": record.userref}
+        return key, record
+
+    def _execute_buy(self, risk: RiskDecision, signal, bar_timestamp: str, state, gates):
+        key, intent = self._reserve(side="buy", notional=risk.notional_usd,
+                                    bar_timestamp=bar_timestamp, gates=gates)
+        if key is None:
+            return None, RiskDecision(False, "Duplicate order blocked")
         try:
-            if side == "buy":
-                order_id = self.gateway.buy_notional(notional, userref=record.userref)
-            else:
-                order_id = self.gateway.close_position(userref=record.userref)
+            sized = self.gateway.size_buy(risk.notional_usd)
+            order_id = self.gateway.buy_notional(risk.notional_usd, userref=intent.userref)
         except PrecisionError as exc:
             self.ledger.fail(key, f"precision: {exc}")
-            self.audit.record(AuditEvent.ORDER_REJECTED,
-                              {"key": key, "reason": str(exc), "gate": "precision"},
-                              severity="warning")
             return None, RiskDecision(False, f"Precision gate: {exc}")
         except (BrokerError, SafetyLockError) as exc:
             self.ledger.fail(key, str(exc))
-            self.audit.record(AuditEvent.ORDER_REJECTED,
-                              {"key": key, "reason": str(exc), "gate": "execution"},
-                              severity="error")
             return None, RiskDecision(False, f"Execution blocked: {exc}")
 
         self.ledger.confirm(key, order_id)
+        self.position_store.save(ManagedPositionStore.new(
+            symbol=self.settings.symbol,
+            quantity=float(sized.volume),
+            entry_price=float(sized.price),
+            stop_price=float(signal.stop_price or 0.0),
+            order_id=order_id,
+        ))
         state.orders_today += 1
         state.last_order_at = datetime.now(timezone.utc)
         return order_id, risk
 
-    # ── backwards-compatible entry point ─────────────────────
+    def _execute_managed_sell(self, managed, bar_timestamp: str, state, gates):
+        notional_marker = round(float(managed.quantity) * max(float(managed.entry_price), 0.01), 2)
+        key, intent = self._reserve(side="sell", notional=notional_marker,
+                                    bar_timestamp=bar_timestamp, gates=gates)
+        if key is None:
+            return None, RiskDecision(False, "Duplicate exit blocked")
+        try:
+            if hasattr(self.gateway, "sell_quantity"):
+                order_id = self.gateway.sell_quantity(managed.quantity, userref=intent.userref)
+            else:
+                raise SafetyLockError("Gateway lacks managed-quantity sell support")
+        except (BrokerError, PrecisionError, SafetyLockError) as exc:
+            self.ledger.fail(key, str(exc))
+            return None, RiskDecision(False, f"Exit blocked: {exc}")
+        self.ledger.confirm(key, order_id)
+        self.position_store.clear()
+        state.orders_today += 1
+        state.last_order_at = datetime.now(timezone.utc)
+        return order_id, RiskDecision(True, "Managed Dublin exit executed")
 
     def run_once(self) -> DecisionRecord:
-        """Legacy API used by the CLI and dashboard.
-
-        Returns a DecisionRecord even when a gate blocked the cycle, so callers
-        that expect a record keep working; the blocking reason is surfaced as a
-        HALT action rather than being silently swallowed.
-        """
         result = self.run_cycle()
         if result.record is not None:
             return result.record
         from .models import Signal
         signal = Signal(Action.HALT, 0, result.block_reason or "blocked", 0.0)
         record = DecisionRecord(
-            symbol=self.settings.symbol,
-            signal=signal,
+            symbol=self.settings.symbol, signal=signal,
             risk=RiskDecision(False, f"Blocked at {result.blocked_at}"),
-            dry_run=self.settings.dry_run,
-            order_id=None,
+            dry_run=self.settings.dry_run, order_id=None,
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
         self.journal.append(record)
