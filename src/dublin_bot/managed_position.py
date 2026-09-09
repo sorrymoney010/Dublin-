@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from math import isfinite
+
+from .errors import BrokerError
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,9 +34,17 @@ class ManagedPositionStore:
             return None
         try:
             raw = json.loads(self.path.read_text())
-            return ManagedPosition(**raw)
-        except (OSError, ValueError, TypeError):
-            return None
+            position = ManagedPosition(**raw)
+            if not isinstance(position.symbol, str) or not position.symbol:
+                raise ValueError("missing symbol")
+            for name in ("quantity", "entry_price", "stop_price"):
+                value = float(getattr(position, name))
+                if not isfinite(value) or value <= 0:
+                    raise ValueError("position values must be finite and positive")
+                setattr(position, name, value)
+            return position
+        except (OSError, ValueError, TypeError) as exc:
+            raise BrokerError("Managed position ledger is unreadable or invalid") from exc
 
     def save(self, position: ManagedPosition) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

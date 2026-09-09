@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from math import isfinite
 
 from .audit import AuditEvent, AuditLog
 from .config import Settings
@@ -15,6 +16,7 @@ from .managed_gateway import ManagedKrakenGateway
 from .managed_position import ManagedPositionStore
 from .market_quality import MarketGuard, MarketQuality
 from .models import Action, DecisionRecord, RiskDecision, Signal
+from .protective import ProtectiveStop, StopMonitor
 from .risk import RiskManager
 from .state import StateStore
 from .strategy import TrendBreakoutStrategy
@@ -120,52 +122,32 @@ class TradingEngine:
         gates["recovery"] = self.recover()
 
         try:
-            bars = self.gateway.get_bars()
-        except (BrokerError, StaleDataError) as exc:
-            self.audit.record(AuditEvent.BROKER_ERROR, {"operation": "get_bars", "error": str(exc)}, severity="error")
-            return CycleResult(None, "market_data", str(exc), gates)
-        gates["bars"] = {"count": int(len(bars))}
-
-        if hasattr(self.gateway, "check_freshness"):
-            try:
-                verdict = self.gateway.check_freshness(bars)
-            except BrokerError as exc:
-                return CycleResult(None, "freshness", str(exc), gates)
-            gates["freshness"] = verdict.to_dict()
-            if not verdict.fresh:
-                return CycleResult(None, "freshness", verdict.reason, gates)
-
-        quality_ok, quality_reason = True, "not evaluated"
-        if hasattr(self.gateway, "market_quality"):
-            try:
-                snapshot = self.gateway.market_quality()
-                quality_ok, quality_reason = self.market_guard.approve(MarketQuality(
-                    bid=snapshot["bid"], ask=snapshot["ask"], recent_dollar_volume=snapshot["recent_dollar_volume"]
-                ))
-                gates["market_quality"] = {**snapshot, "approved": quality_ok, "reason": quality_reason}
-                self.audit.record(AuditEvent.MARKET_QUALITY, gates["market_quality"])
-            except BrokerError as exc:
-                quality_ok, quality_reason = False, f"market quality unavailable: {exc}"
-                gates["market_quality"] = {"approved": False, "reason": quality_reason}
-
-        in_position, managed = self._managed_position_status()
+            in_position, managed = self._managed_position_status()
+            if managed is not None and not in_position:
+                raise BrokerError("Managed position does not match the configured symbol")
+        except BrokerError as exc:
+            return CycleResult(None, "reconciliation", str(exc), gates)
 
         # Reconciliation is authoritative for managed exposure. If Dublin thinks
         # it owns more than Kraken reports, live mode halts rather than risking an
         # invalid or oversized exit.
         available_quantity = 0.0
         try:
-            if hasattr(self.gateway, "available_base_quantity"):
+            if self.settings.paper_trading:
+                # Simulated fills do not create an exchange balance.
+                available_quantity = float(managed.quantity) if managed else 0.0
+            elif hasattr(self.gateway, "available_base_quantity"):
                 available_quantity = float(self.gateway.available_base_quantity())
             else:
-                positions = self.gateway.positions()
-                available_quantity = float(positions[0]["quantity"]) if positions else 0.0
-        except BrokerError as exc:
-            if self.settings.live_execution_armed:
+                raise BrokerError("Live reconciliation requires an authoritative balance reader")
+            if not isfinite(available_quantity) or available_quantity < 0:
+                raise BrokerError("Invalid exchange base quantity")
+        except (BrokerError, ValueError, TypeError, KeyError, IndexError) as exc:
+            if not self.settings.paper_trading:
                 return CycleResult(None, "reconciliation", f"Kraken position read failed: {exc}", gates)
 
         exchange_has_position = available_quantity > 0
-        shortage = bool(in_position and managed is not None and available_quantity + 1e-12 < float(managed.quantity))
+        shortage = bool(in_position and managed is not None and available_quantity < float(managed.quantity))
         gates["position_reconciliation"] = {
             "managed_position": in_position,
             "managed_quantity": float(managed.quantity) if managed is not None else 0.0,
@@ -182,7 +164,7 @@ class TradingEngine:
             self.audit.record(AuditEvent.SAFETY_VIOLATION, {"error": reason}, severity="critical")
             return CycleResult(None, "reconciliation", reason, gates)
 
-        signal = self.strategy.evaluate(bars, in_position=in_position)
+        signal = None
 
         # Protective stop is evaluated from the latest ticker, independent of the
         # slower strategy exit. It can force an exit even if the candle-based COO
@@ -190,11 +172,11 @@ class TradingEngine:
         if in_position and managed is not None and float(managed.stop_price) > 0:
             try:
                 last_price = float(self.gateway.get_ticker()["last"])
-            except BrokerError as exc:
-                if self.settings.live_execution_armed:
-                    return CycleResult(None, "protective_stop", f"Stop price check failed: {exc}", gates)
-                last_price = 0.0
-            triggered = last_price > 0 and last_price <= float(managed.stop_price)
+                triggered = StopMonitor.should_exit(last_price, ProtectiveStop(
+                    managed.symbol, float(managed.stop_price), float(managed.quantity)
+                ))
+            except (BrokerError, ValueError, TypeError, KeyError, IndexError) as exc:
+                return CycleResult(None, "protective_stop", f"Stop price check failed: {exc}", gates)
             gates["protective_stop"] = {
                 "stop_price": float(managed.stop_price),
                 "last_price": last_price,
@@ -209,14 +191,53 @@ class TradingEngine:
                     stop_price=float(managed.stop_price),
                 )
 
+        # Entry data gates must not delay an already-triggered protective exit.
+        bar_timestamp = f"protective-stop:{managed.order_id}" if signal is not None else ""
+        quality_ok, quality_reason = True, "protective exit"
+        if signal is None:
+            try:
+                bars = self.gateway.get_bars()
+            except (BrokerError, StaleDataError) as exc:
+                self.audit.record(AuditEvent.BROKER_ERROR, {"operation": "get_bars", "error": str(exc)}, severity="error")
+                return CycleResult(None, "market_data", str(exc), gates)
+            gates["bars"] = {"count": int(len(bars))}
+
+            if hasattr(self.gateway, "check_freshness"):
+                try:
+                    verdict = self.gateway.check_freshness(bars)
+                except BrokerError as exc:
+                    return CycleResult(None, "freshness", str(exc), gates)
+                gates["freshness"] = verdict.to_dict()
+                if not verdict.fresh:
+                    return CycleResult(None, "freshness", verdict.reason, gates)
+
+            quality_ok, quality_reason = True, "not evaluated"
+            if hasattr(self.gateway, "market_quality"):
+                try:
+                    snapshot = self.gateway.market_quality()
+                    quality_ok, quality_reason = self.market_guard.approve(MarketQuality(
+                        bid=snapshot["bid"], ask=snapshot["ask"], recent_dollar_volume=snapshot["recent_dollar_volume"]
+                    ))
+                    gates["market_quality"] = {**snapshot, "approved": quality_ok, "reason": quality_reason}
+                    self.audit.record(AuditEvent.MARKET_QUALITY, gates["market_quality"])
+                except BrokerError as exc:
+                    quality_ok, quality_reason = False, f"market quality unavailable: {exc}"
+                    gates["market_quality"] = {"approved": False, "reason": quality_reason}
+            signal = self.strategy.evaluate(bars, in_position=in_position)
+            bar_timestamp = (str(bars.index[-1]) if len(bars)
+                             else datetime.now(timezone.utc).isoformat())
+
         self.audit.record(AuditEvent.SIGNAL, {
             "action": signal.action.value, "score": signal.score, "reason": signal.reason,
             "price": signal.price, "stop_price": signal.stop_price,
         })
 
         try:
-            equity = min(self.gateway.account_equity(), self.settings.strategy_equity_usd)
-        except BrokerError as exc:
+            account_equity = float(self.gateway.account_equity())
+            if not isfinite(account_equity) or account_equity <= 0:
+                raise BrokerError("Invalid account equity")
+            equity = min(account_equity, self.settings.strategy_equity_usd)
+        except (BrokerError, ValueError, TypeError, KeyError) as exc:
             self.audit.record(AuditEvent.BROKER_ERROR, {"operation": "account_equity", "error": str(exc)}, severity="critical")
             return CycleResult(None, "account_data", str(exc), gates)
 
@@ -238,7 +259,6 @@ class TradingEngine:
         })
 
         order_id: str | None = None
-        bar_timestamp = str(bars.index[-1]) if len(bars) else datetime.now(timezone.utc).isoformat()
 
         if signal.action is Action.BUY and risk.approved:
             order_id, risk = self._execute_buy(risk, signal, bar_timestamp, state, gates)

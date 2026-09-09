@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from math import isfinite
 
 from .audit import AuditEvent
 from .errors import BrokerError
@@ -12,34 +13,40 @@ class ManagedKrakenGateway(KrakenGateway):
     """Kraken gateway with quantity-scoped exits and fail-closed live reads."""
 
     def account_equity(self) -> float:
-        """Fail closed on private account-data errors whenever live execution is armed."""
+        """Fail closed on private account-data errors in live mode."""
         if not self.has_credentials:
-            if self.settings.live_execution_armed:
-                raise BrokerError("Live execution armed but Kraken credentials are unavailable")
+            if not self.settings.paper_trading:
+                raise BrokerError("Live mode configured but Kraken credentials are unavailable")
             return self.settings.strategy_equity_usd
         try:
             result = self._private("TradeBalance", {"asset": "ZUSD"})
-            value = float(result.get("eb", 0.0))
-            if value <= 0 and self.settings.live_execution_armed:
-                raise BrokerError("Kraken returned non-positive account equity in live mode")
+            value = float(result["eb"])
+            if not isfinite(value) or value <= 0:
+                raise BrokerError("Kraken returned invalid account equity")
             return value
-        except BrokerError:
-            if self.settings.live_execution_armed:
-                raise
+        except (BrokerError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            if not self.settings.paper_trading:
+                raise BrokerError("Kraken account equity unavailable or invalid") from exc
             return self.settings.strategy_equity_usd
 
     def available_base_quantity(self) -> float:
         """Read the configured base-asset balance directly for live reconciliation."""
         if not self.has_credentials:
-            if self.settings.live_execution_armed:
-                raise BrokerError("Live execution armed but Kraken credentials are unavailable")
+            if not self.settings.paper_trading:
+                raise BrokerError("Live mode configured but Kraken credentials are unavailable")
             return 0.0
         meta = self.resolve_symbol()
-        balances = self.balances()
-        return float(balances.get(meta.base, 0.0))
+        try:
+            balances = self.balances()
+            quantity = float(balances.get(meta.base, 0.0))
+            if not isfinite(quantity) or quantity < 0:
+                raise ValueError("base quantity must be finite and nonnegative")
+            return quantity
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise BrokerError("Kraken balance data is invalid") from exc
 
     def sell_quantity(self, quantity: float, *, userref: int | None = None) -> str:
-        if quantity <= 0:
+        if not isfinite(quantity) or quantity <= 0:
             raise BrokerError("Managed sell quantity must be positive")
         meta = self.resolve_symbol()
         volume = round_volume(quantity, meta.to_precision())

@@ -56,7 +56,7 @@ def test_managed_exit_never_uses_entire_wallet_balance(tmp_path, monkeypatch):
         status="online",
     )
     monkeypatch.setattr(gateway, "resolve_symbol", lambda symbol=None: meta)
-    monkeypatch.setattr(gateway, "positions", lambda: [{"quantity": 1.5}])
+    monkeypatch.setattr(gateway, "available_base_quantity", lambda: 1.5)
     events = []
     monkeypatch.setattr(
         gateway,
