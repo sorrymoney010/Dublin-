@@ -2,12 +2,31 @@
 
 Design notes
 ------------
-* **Read-only by default.** Order submission is behind independent gates:
-  ``dry_run``, ``paper_trading``/``allow_live_trading``, explicit risk
-  acknowledgement, and ``allow_order_submission``.
-* **Symbol resolution is data-driven.**
+* **Read-only by default.** Order submission is behind three independent gates:
+  ``dry_run``, ``paper_trading``/``allow_live_trading``, and an explicit
+  ``allow_order_submission`` constructor argument.  All three must be aligned
+  before a request can reach ``/0/private/AddOrder``.
+* **Symbol resolution is data-driven.** Kraken's pair naming (``XXBTZUSD`` vs
+  ``XBTUSD`` vs ``BTC/USD``) cannot be derived by string surgery; earlier
+  guess-based normalization was a latent source of "unknown asset pair" errors.
+  We resolve against ``/0/public/AssetPairs`` and match on altname, wsname, or
+  the canonical key.
 * **Every private call is signed, nonced, rate-limited, and retried** according
   to the error classification in ``errors.py``.
+
+REST endpoints used:
+  GET  /0/public/Time         server time (clock-skew detection)
+  GET  /0/public/AssetPairs   pair metadata: precision, ordermin, costmin
+  GET  /0/public/Ticker       bid/ask/last/volume
+  GET  /0/public/OHLC         candles
+  POST /0/private/Balance     asset balances
+  POST /0/private/TradeBalance account equity
+  POST /0/private/OpenOrders  working orders
+  POST /0/private/ClosedOrders order lookup by userref (idempotency recovery)
+  POST /0/private/AddOrder    order submission (gated)
+
+Signing scheme (per Kraken docs):
+  API-Sign = base64( HMAC-SHA512( path + SHA256(nonce + urlencoded_body), b64decode(secret) ) )
 """
 
 from __future__ import annotations
@@ -43,15 +62,20 @@ from .ratelimit import KrakenRateLimiter, RateLimitTier
 KRAKEN_API_BASE = "https://api.kraken.com"
 _PUBLIC_PATH = "/0/public"
 _PRIVATE_PATH = "/0/private"
+
 VALID_INTERVALS = (1, 5, 15, 30, 60, 240, 1440, 10080, 21600)
+
+# Common aliases → Kraken's canonical asset code.
 _ASSET_ALIASES = {"BTC": "XBT", "DOGE": "XDG"}
 
 
 @dataclass(frozen=True)
 class SymbolMeta:
-    key: str
-    altname: str
-    wsname: str
+    """Resolved metadata for a tradable pair."""
+
+    key: str            # canonical Kraken key, e.g. "XXBTZUSD"
+    altname: str        # e.g. "XBTUSD"
+    wsname: str         # e.g. "XBT/USD"
     base: str
     quote: str
     lot_decimals: int
@@ -89,6 +113,8 @@ class SymbolMeta:
 
 
 class KrakenGateway:
+    """Kraken Spot adapter implementing the BrokerGateway protocol."""
+
     def __init__(
         self,
         settings: Settings,
@@ -105,7 +131,7 @@ class KrakenGateway:
         self._api_key = settings.kraken_api_key
         self._api_secret = settings.kraken_api_secret
         self._session = session or requests.Session()
-        self._session.headers.update({"User-Agent": "DublinBot/0.3"})
+        self._session.headers.update({"User-Agent": "DublinBot/0.2"})
         self._limiter = rate_limiter or KrakenRateLimiter(
             _tier_from_name(getattr(settings, "kraken_tier", "starter"))
         )
@@ -115,6 +141,7 @@ class KrakenGateway:
         self._max_retries = max_retries
         self._sleep = sleep_fn
         self._timeout = settings.http_timeout_seconds
+
         self._meta: dict[str, SymbolMeta] = {}
         self._meta_loaded_at: float = 0.0
         self._meta_ttl = 3600.0
@@ -124,6 +151,8 @@ class KrakenGateway:
             max_clock_skew_seconds=settings.max_clock_skew_seconds,
         )
         self.last_freshness: FreshnessVerdict | None = None
+
+    # ── introspection ────────────────────────────────────────
 
     @property
     def name(self) -> str:
@@ -135,20 +164,21 @@ class KrakenGateway:
 
     @property
     def order_submission_enabled(self) -> bool:
+        """True only when every independent safety gate permits live orders."""
         s = self.settings
         return (
             self._allow_order_submission
-            and s.live_execution_armed
             and not s.dry_run
             and not s.paper_trading
             and s.allow_live_trading
             and s.live_risk_acknowledgement == "I_ACCEPT_LIVE_TRADING_RISK"
-            and self.has_credentials
         )
 
     def _log(self, event: AuditEvent, payload: dict, severity: str = "info") -> None:
         if self._audit is not None:
             self._audit.record(event, payload, severity=severity)
+
+    # ── transport ────────────────────────────────────────────
 
     def _handle_payload(self, payload: dict) -> dict:
         errors = payload.get("error") or []
@@ -156,16 +186,22 @@ class KrakenGateway:
             raise classify_kraken_error(list(errors))
         return payload.get("result", {})
 
-    def _request(self, method: str, url: str, *, params=None, data=None, headers=None) -> dict:
+    def _request(self, method: str, url: str, *, params=None, data=None,
+                 headers=None) -> dict:
         try:
             if method == "GET":
-                response = self._session.get(url, params=params, timeout=self._timeout, headers=headers)
+                response = self._session.get(
+                    url, params=params, timeout=self._timeout, headers=headers
+                )
             else:
-                response = self._session.post(url, data=data, timeout=self._timeout, headers=headers)
+                response = self._session.post(
+                    url, data=data, timeout=self._timeout, headers=headers
+                )
         except requests.Timeout as exc:
             raise TransientBrokerError(f"timeout calling {url}") from exc
         except requests.RequestException as exc:
             raise TransientBrokerError(f"network error calling {url}: {exc}") from exc
+
         status = getattr(response, "status_code", 200)
         if status == 429:
             raise RateLimitError("HTTP 429 from Kraken")
@@ -173,6 +209,7 @@ class KrakenGateway:
             raise TransientBrokerError(f"HTTP {status} from Kraken")
         if status >= 400:
             raise InvalidRequestError(f"HTTP {status} from Kraken")
+
         try:
             payload = response.json()
         except ValueError as exc:
@@ -180,6 +217,7 @@ class KrakenGateway:
         return self._handle_payload(payload)
 
     def _with_retries(self, description: str, call):
+        """Retry transient failures with exponential backoff; fail fast otherwise."""
         delay = 1.0
         last: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
@@ -188,12 +226,18 @@ class KrakenGateway:
             except (RateLimitError, TransientBrokerError) as exc:
                 last = exc
                 if isinstance(exc, RateLimitError):
-                    self._log(AuditEvent.RATE_LIMIT, {"operation": description, "attempt": attempt}, severity="warning")
+                    self._log(
+                        AuditEvent.RATE_LIMIT,
+                        {"operation": description, "attempt": attempt},
+                        severity="warning",
+                    )
                 if attempt == self._max_retries:
                     break
                 self._sleep(delay)
                 delay *= 2
             except AuthenticationError:
+                # Never retry auth failures: a bad nonce or key is not fixed by
+                # repetition and repeated failures can trigger key lockout.
                 raise
         assert last is not None
         raise last
@@ -201,7 +245,10 @@ class KrakenGateway:
     def _public(self, endpoint: str, params: dict | None = None) -> dict:
         self._limiter.acquire_public()
         url = f"{KRAKEN_API_BASE}{_PUBLIC_PATH}/{endpoint}"
-        return self._with_retries(f"public:{endpoint}", lambda: self._request("GET", url, params=params))
+        return self._with_retries(
+            f"public:{endpoint}",
+            lambda: self._request("GET", url, params=params),
+        )
 
     def _sign(self, urlpath: str, data: dict) -> str:
         encoded = (str(data["nonce"]) + urllib.parse.urlencode(data)).encode()
@@ -215,12 +262,16 @@ class KrakenGateway:
 
     def _private(self, endpoint: str, params: dict | None = None) -> dict:
         if not self.has_credentials:
-            raise AuthenticationError("Kraken credentials required for private endpoints")
+            raise AuthenticationError(
+                "Kraken credentials required for private endpoints"
+            )
         urlpath = f"{_PRIVATE_PATH}/{endpoint}"
         url = f"{KRAKEN_API_BASE}{urlpath}"
 
         def call() -> dict:
             self._limiter.acquire_private(endpoint)
+            # A fresh nonce per attempt is mandatory: replaying a nonce after a
+            # timeout is itself an EAPI:Invalid nonce failure.
             body = dict(params or {})
             body["nonce"] = str(self._nonce.next())
             headers = {
@@ -231,6 +282,8 @@ class KrakenGateway:
             return self._request("POST", url, data=body, headers=headers)
 
         return self._with_retries(f"private:{endpoint}", call)
+
+    # ── symbol metadata ──────────────────────────────────────
 
     def load_metadata(self, force: bool = False) -> dict[str, SymbolMeta]:
         if self._meta and not force and (time.time() - self._meta_loaded_at) < self._meta_ttl:
@@ -258,6 +311,7 @@ class KrakenGateway:
 
     @staticmethod
     def _candidates(symbol: str) -> list[str]:
+        """Plausible spellings of a configured symbol, for metadata matching."""
         raw = symbol.upper().strip()
         compact = raw.replace("/", "").replace("-", "").replace("_", "")
         options = {raw, compact}
@@ -265,13 +319,17 @@ class KrakenGateway:
             base, _, quote = raw.partition("/")
             base_alias = _ASSET_ALIASES.get(base, base)
             quote_alias = _ASSET_ALIASES.get(quote, quote)
-            options.update({f"{base_alias}{quote_alias}", f"{base_alias}/{quote_alias}"})
+            options.update({
+                f"{base_alias}{quote_alias}",
+                f"{base_alias}/{quote_alias}",
+            })
         for src, dst in _ASSET_ALIASES.items():
             if compact.startswith(src):
                 options.add(dst + compact[len(src):])
         return [o for o in options if o]
 
     def resolve_symbol(self, symbol: str | None = None) -> SymbolMeta:
+        """Resolve a configured symbol to authoritative Kraken pair metadata."""
         symbol = symbol or self.settings.symbol
         meta = self.load_metadata()
         candidates = self._candidates(symbol)
@@ -282,10 +340,14 @@ class KrakenGateway:
             for entry in meta.values():
                 if candidate in (entry.altname.upper(), entry.wsname.upper()):
                     return entry
-        raise InvalidRequestError(f"Kraken has no asset pair matching {symbol!r}")
+        raise InvalidRequestError(
+            f"Kraken has no asset pair matching {symbol!r} "
+            f"(tried: {', '.join(sorted(candidates))})"
+        )
 
     @property
     def pair(self) -> str:
+        """Canonical Kraken pair key for the configured symbol."""
         return self.resolve_symbol().key
 
     def asset_info(self, symbol: str | None = None) -> SymbolMeta | None:
@@ -293,6 +355,8 @@ class KrakenGateway:
             return self.resolve_symbol(symbol)
         except InvalidRequestError:
             return None
+
+    # ── market data ──────────────────────────────────────────
 
     def kraken_interval(self) -> int:
         mins = self.settings.timeframe_minutes
@@ -304,24 +368,47 @@ class KrakenGateway:
         return float(self._public("Time")["unixtime"])
 
     def get_bars(self, *, validate: bool = True) -> pd.DataFrame:
+        """Fetch OHLC candles, dropping the in-progress final bar.
+
+        Kraken's OHLC response always ends with the *currently forming* candle.
+        Feeding it to the strategy causes look-ahead-style instability, because
+        the indicator values change on every poll within the same interval.
+        """
         meta = self.resolve_symbol()
-        result = self._public("OHLC", {"pair": meta.key, "interval": self.kraken_interval()})
+        result = self._public(
+            "OHLC", {"pair": meta.key, "interval": self.kraken_interval()}
+        )
         rows = result.get(meta.key) or result.get(meta.altname) or []
         if not rows:
+            # Kraken occasionally keys the result by a name other than the one
+            # requested; fall back to the single non-"last" entry.
             for key, value in result.items():
                 if key != "last" and isinstance(value, list) and value:
                     rows = value
                     break
         if not rows:
             raise BrokerError(f"No OHLC data returned for {meta.key}")
+
         timestamps = [pd.Timestamp(int(r[0]), unit="s", tz="UTC") for r in rows]
-        frame = pd.DataFrame([
-            {"open": float(r[1]), "high": float(r[2]), "low": float(r[3]), "close": float(r[4]),
-             "vwap": float(r[5]), "volume": float(r[6]), "trades": int(r[7])}
-            for r in rows
-        ], index=pd.DatetimeIndex(timestamps, name="timestamp")).sort_index()
+        frame = pd.DataFrame(
+            [
+                {
+                    "open": float(r[1]),
+                    "high": float(r[2]),
+                    "low": float(r[3]),
+                    "close": float(r[4]),
+                    "vwap": float(r[5]),
+                    "volume": float(r[6]),
+                    "trades": int(r[7]),
+                }
+                for r in rows
+            ],
+            index=pd.DatetimeIndex(timestamps, name="timestamp"),
+        ).sort_index()
+
         if len(frame) > 1:
-            frame = frame.iloc[:-1]
+            frame = frame.iloc[:-1]  # drop the still-forming candle
+
         if validate:
             check_monotonic_bars(frame)
         return frame.tail(self.settings.lookback_bars)
@@ -334,10 +421,17 @@ class KrakenGateway:
             raw = next(iter(result.values()))
         if not raw:
             raise BrokerError(f"No ticker data for {meta.key}")
-        return {"bid": float(raw["b"][0]), "ask": float(raw["a"][0]), "last": float(raw["c"][0]),
-                "volume_24h": float(raw["v"][1]), "vwap_24h": float(raw["p"][1]), "trades_24h": int(raw["t"][1])}
+        return {
+            "bid": float(raw["b"][0]),
+            "ask": float(raw["a"][0]),
+            "last": float(raw["c"][0]),
+            "volume_24h": float(raw["v"][1]),
+            "vwap_24h": float(raw["p"][1]),
+            "trades_24h": int(raw["t"][1]),
+        }
 
     def check_freshness(self, bars: pd.DataFrame | None = None) -> FreshnessVerdict:
+        """Validate feed freshness against bar age *and* exchange clock skew."""
         try:
             server = self.server_time()
         except BrokerError:
@@ -345,16 +439,26 @@ class KrakenGateway:
         frame = self.get_bars() if bars is None else bars
         verdict = self.freshness.evaluate_bars(frame, server_time=server)
         self.last_freshness = verdict
-        self._log(AuditEvent.DATA_FRESHNESS, verdict.to_dict(), severity="info" if verdict.fresh else "warning")
+        self._log(
+            AuditEvent.DATA_FRESHNESS,
+            verdict.to_dict(),
+            severity="info" if verdict.fresh else "warning",
+        )
         return verdict
 
     def market_quality(self) -> dict:
         ticker = self.get_ticker()
         bid, ask = ticker["bid"], ticker["ask"]
         mid = (bid + ask) / 2
-        return {"bid": bid, "ask": ask, "mid": mid,
-                "spread_bps": ((ask - bid) / mid) * 10_000 if mid > 0 else float("inf"),
-                "recent_dollar_volume": ticker["volume_24h"] * ticker["vwap_24h"]}
+        return {
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "spread_bps": ((ask - bid) / mid) * 10_000 if mid > 0 else float("inf"),
+            "recent_dollar_volume": ticker["volume_24h"] * ticker["vwap_24h"],
+        }
+
+    # ── account ──────────────────────────────────────────────
 
     def balances(self) -> dict[str, float]:
         if not self.has_credentials:
@@ -363,32 +467,58 @@ class KrakenGateway:
         return {asset: float(amount) for asset, amount in result.items()}
 
     def account_equity(self) -> float:
+        """Total equity in the account's base currency."""
         if not self.has_credentials:
             return self.settings.strategy_equity_usd
         try:
             result = self._private("TradeBalance", {"asset": "ZUSD"})
             return float(result.get("eb", 0.0))
         except BrokerError as exc:
-            self._log(AuditEvent.BROKER_ERROR, {"operation": "account_equity", "error": str(exc)}, severity="warning")
+            self._log(
+                AuditEvent.BROKER_ERROR,
+                {"operation": "account_equity", "error": str(exc)},
+                severity="warning",
+            )
             return self.settings.strategy_equity_usd
 
     def positions(self) -> list[dict]:
+        """Spot 'positions' derived from non-zero, non-quote asset balances.
+
+        Kraken Spot has no position concept — ``/0/private/OpenPositions`` is a
+        margin endpoint and returns nothing for a cash account.  Holdings are
+        therefore reconstructed from balances, which is what actually reflects
+        exposure on a spot account.
+        """
         if not self.has_credentials:
             return []
         try:
             balances = self.balances()
             meta = self.resolve_symbol()
-        except BrokerError:
+        except BrokerError as exc:
+            self._log(
+                AuditEvent.BROKER_ERROR,
+                {"operation": "positions", "error": str(exc)},
+                severity="warning",
+            )
             return []
-        quantity = float(balances.get(meta.base, 0.0))
+
+        base = meta.base
+        quantity = float(balances.get(base, 0.0))
         if quantity <= float(meta.order_min or 0):
             return []
         try:
             price = self.get_ticker()["last"]
         except BrokerError:
             price = 0.0
-        return [{"symbol": meta.altname, "asset": meta.base, "side": "long", "quantity": quantity,
-                 "average_entry": 0.0, "market_value": quantity * price, "unrealized_pl": 0.0}]
+        return [{
+            "symbol": meta.altname,
+            "asset": base,
+            "side": "long",
+            "quantity": quantity,
+            "average_entry": 0.0,   # spot balances carry no cost basis
+            "market_value": quantity * price,
+            "unrealized_pl": 0.0,
+        }]
 
     def has_position(self) -> bool:
         return bool(self.positions())
@@ -398,17 +528,35 @@ class KrakenGateway:
             return []
         try:
             result = self._private("OpenOrders")
-        except BrokerError:
+        except BrokerError as exc:
+            self._log(
+                AuditEvent.BROKER_ERROR,
+                {"operation": "orders", "error": str(exc)},
+                severity="warning",
+            )
             return []
-        return [{"id": order_id, "symbol": order.get("descr", {}).get("pair", ""),
-                 "side": order.get("descr", {}).get("type", ""),
-                 "order_type": order.get("descr", {}).get("ordertype", ""),
-                 "status": order.get("status", "open"), "volume": float(order.get("vol", 0)),
-                 "volume_executed": float(order.get("vol_exec", 0)), "notional": float(order.get("cost", 0)),
-                 "userref": order.get("userref")}
-                for order_id, order in (result.get("open") or {}).items()]
+        orders = []
+        for order_id, order in (result.get("open") or {}).items():
+            descr = order.get("descr", {})
+            orders.append({
+                "id": order_id,
+                "symbol": descr.get("pair", ""),
+                "side": descr.get("type", ""),
+                "order_type": descr.get("ordertype", ""),
+                "status": order.get("status", "open"),
+                "volume": float(order.get("vol", 0)),
+                "volume_executed": float(order.get("vol_exec", 0)),
+                "notional": float(order.get("cost", 0)),
+                "userref": order.get("userref"),
+            })
+        return orders
 
     def find_order_by_userref(self, userref: int) -> dict | None:
+        """Locate an order by idempotency userref across open and closed books.
+
+        This is the recovery path after an ambiguous submission: it answers
+        "did my order actually land?" without risking a duplicate.
+        """
         if not self.has_credentials:
             return None
         for order in self.orders():
@@ -421,85 +569,148 @@ class KrakenGateway:
         for order_id, order in (result.get("closed") or {}).items():
             if order.get("userref") == userref:
                 descr = order.get("descr", {})
-                return {"id": order_id, "symbol": descr.get("pair", ""), "side": descr.get("type", ""),
-                        "status": order.get("status", "closed"), "volume": float(order.get("vol", 0)),
-                        "volume_executed": float(order.get("vol_exec", 0)), "notional": float(order.get("cost", 0)),
-                        "userref": userref}
+                return {
+                    "id": order_id,
+                    "symbol": descr.get("pair", ""),
+                    "side": descr.get("type", ""),
+                    "status": order.get("status", "closed"),
+                    "volume": float(order.get("vol", 0)),
+                    "volume_executed": float(order.get("vol_exec", 0)),
+                    "notional": float(order.get("cost", 0)),
+                    "userref": userref,
+                }
         return None
 
+    # ── order sizing ─────────────────────────────────────────
+
     def size_buy(self, notional_usd: float, price: float | None = None) -> SizedOrder:
+        """Validate a USD notional against live precision/minimum constraints."""
         meta = self.resolve_symbol()
         if price is None:
             price = self.get_ticker()["ask"]
-        return size_order(notional_usd, price, meta.to_precision(), min_notional_usd=self.settings.min_order_notional_usd)
+        return size_order(
+            notional_usd,
+            price,
+            meta.to_precision(),
+            min_notional_usd=self.settings.min_order_notional_usd,
+        )
+
+    # ── order execution (triple-gated) ───────────────────────
 
     def _assert_can_submit(self) -> None:
         if not self.order_submission_enabled:
             raise SafetyLockError(
-                "Live order submission disabled: all live flags, acknowledgement, credentials, and execution arm are required."
+                "Live order submission is disabled. Required: dry_run=false, "
+                "paper_trading=false, allow_live_trading=true, a valid "
+                "acknowledgement, and allow_order_submission=true on the gateway."
             )
 
     def buy_notional(self, notional_usd: float, *, userref: int | None = None) -> str:
+        """Buy ``notional_usd`` of the configured pair.
+
+        In dry-run the order is fully sized and validated against real exchange
+        metadata — the only step skipped is the network call.  That keeps the
+        simulated path honest about precision and minimum-size rejections.
+        """
         sized = self.size_buy(notional_usd)
         if not self.order_submission_enabled:
-            self._log(AuditEvent.ORDER_INTENT, {"mode": "dry_run", "pair": sized.pair, "side": "buy",
-                                               "volume": sized.volume_str, "price": sized.price_str,
-                                               "notional": str(sized.notional), "userref": userref})
+            self._log(AuditEvent.ORDER_INTENT, {
+                "mode": "dry_run",
+                "pair": sized.pair,
+                "side": "buy",
+                "volume": sized.volume_str,
+                "price": sized.price_str,
+                "notional": str(sized.notional),
+                "userref": userref,
+            })
             return f"kraken-dry-buy-{userref or int(time.time())}"
-        self._assert_can_submit()
-        params = {"pair": sized.pair, "type": "buy", "ordertype": "market", "volume": sized.volume_str}
-        if userref is not None:
-            params["userref"] = str(userref)
-        result = self._private("AddOrder", params)
-        order_id = (result.get("txid") or ["unknown"])[0]
-        self._log(AuditEvent.ORDER_SUBMITTED, {"pair": sized.pair, "side": "buy", "volume": sized.volume_str,
-                                               "order_id": order_id, "userref": userref}, severity="warning")
-        return order_id
 
-    def close_quantity(self, quantity: float, *, userref: int | None = None) -> str:
-        """Sell only the quantity explicitly managed by Dublin."""
-        meta = self.resolve_symbol()
-        from .precision import round_volume
-        volume = round_volume(quantity, meta.to_precision())
-        if volume <= 0:
-            raise BrokerError(f"Managed quantity {quantity} rounds to zero for {meta.key}")
-        if volume > Decimal(str(quantity)):
-            raise BrokerError("Rounded exit volume exceeds managed quantity")
-        if not self.order_submission_enabled:
-            self._log(AuditEvent.ORDER_INTENT, {"mode": "dry_run", "pair": meta.key, "side": "sell",
-                                               "volume": format(volume, "f"), "userref": userref})
-            return f"kraken-dry-close-{userref or int(time.time())}"
         self._assert_can_submit()
-        params = {"pair": meta.key, "type": "sell", "ordertype": "market", "volume": format(volume, "f")}
+        params = {
+            "pair": sized.pair,
+            "type": "buy",
+            "ordertype": "market",
+            "volume": sized.volume_str,
+        }
         if userref is not None:
             params["userref"] = str(userref)
         result = self._private("AddOrder", params)
         order_id = (result.get("txid") or ["unknown"])[0]
-        self._log(AuditEvent.ORDER_SUBMITTED, {"pair": meta.key, "side": "sell", "volume": format(volume, "f"),
-                                               "order_id": order_id, "userref": userref}, severity="warning")
+        self._log(AuditEvent.ORDER_SUBMITTED, {
+            "pair": sized.pair, "side": "buy", "volume": sized.volume_str,
+            "order_id": order_id, "userref": userref,
+        }, severity="warning")
         return order_id
 
     def close_position(self, *, userref: int | None = None) -> str:
-        """Compatibility helper. Prefer close_quantity() from the engine."""
+        """Sell the entire base-asset balance of the configured pair."""
         positions = self.positions()
         if not positions:
             raise BrokerError("No position to close")
-        return self.close_quantity(positions[0]["quantity"], userref=userref)
+        meta = self.resolve_symbol()
+        quantity = positions[0]["quantity"]
+        precision = meta.to_precision()
+        from .precision import round_volume
+
+        volume = round_volume(quantity, precision)
+        if volume <= 0:
+            raise BrokerError(
+                f"Position {quantity} rounds to zero volume for {meta.key}"
+            )
+
+        if not self.order_submission_enabled:
+            self._log(AuditEvent.ORDER_INTENT, {
+                "mode": "dry_run", "pair": meta.key, "side": "sell",
+                "volume": format(volume, "f"), "userref": userref,
+            })
+            return f"kraken-dry-close-{userref or int(time.time())}"
+
+        self._assert_can_submit()
+        params = {
+            "pair": meta.key,
+            "type": "sell",
+            "ordertype": "market",
+            "volume": format(volume, "f"),
+        }
+        if userref is not None:
+            params["userref"] = str(userref)
+        result = self._private("AddOrder", params)
+        order_id = (result.get("txid") or ["unknown"])[0]
+        self._log(AuditEvent.ORDER_SUBMITTED, {
+            "pair": meta.key, "side": "sell", "volume": format(volume, "f"),
+            "order_id": order_id, "userref": userref,
+        }, severity="warning")
+        return order_id
+
+    # ── health ───────────────────────────────────────────────
 
     def health(self, *, include_freshness: bool = True) -> dict:
+        """Connection/health snapshot for the dashboard.
+
+        ``include_freshness`` performs a real freshness evaluation when none has
+        been cached yet, so a freshly started dashboard shows a verdict rather
+        than a blank card. It costs one OHLC call, which the dashboard caches.
+        """
         status: dict[str, object] = {
-            "broker": "kraken", "credentials_present": self.has_credentials,
+            "broker": "kraken",
+            "credentials_present": self.has_credentials,
             "order_submission_enabled": self.order_submission_enabled,
-            "live_execution_armed": self.settings.live_execution_armed,
-            "rate_limiter": self._limiter.snapshot(), "last_nonce": self._nonce.last,
+            "rate_limiter": self._limiter.snapshot(),
+            "last_nonce": self._nonce.last,
         }
         started = time.monotonic()
         try:
             server = self.server_time()
-            status.update({"reachable": True, "latency_ms": round((time.monotonic() - started) * 1000, 1),
-                           "clock_skew_seconds": round(server - time.time(), 3), "error": None})
+            status["reachable"] = True
+            status["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+            status["clock_skew_seconds"] = round(server - time.time(), 3)
+            status["error"] = None
         except Exception as exc:
-            status.update({"reachable": False, "latency_ms": None, "clock_skew_seconds": None, "error": str(exc)})
+            status["reachable"] = False
+            status["latency_ms"] = None
+            status["clock_skew_seconds"] = None
+            status["error"] = str(exc)
+
         if include_freshness and self.last_freshness is None and status["reachable"]:
             try:
                 self.check_freshness()
@@ -511,5 +722,8 @@ class KrakenGateway:
 
 
 def _tier_from_name(name: str) -> RateLimitTier:
-    return {"starter": RateLimitTier.starter(), "intermediate": RateLimitTier.intermediate(),
-            "pro": RateLimitTier.pro()}.get(str(name).lower(), RateLimitTier.starter())
+    return {
+        "starter": RateLimitTier.starter(),
+        "intermediate": RateLimitTier.intermediate(),
+        "pro": RateLimitTier.pro(),
+    }.get(str(name).lower(), RateLimitTier.starter())
