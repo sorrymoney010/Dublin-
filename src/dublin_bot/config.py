@@ -8,35 +8,25 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    # ── Active broker ──────────────────────────────────────
     broker: str = "kraken"
-
-    # ── Kraken Spot ─────────────────────────────────────────
     kraken_api_key: str = ""
     kraken_api_secret: str = ""
     kraken_tier: str = "starter"
 
-    # ── Transport / reliability ────────────────────────────
     http_timeout_seconds: float = Field(default=15.0, gt=0, le=120)
     max_retries: int = Field(default=3, ge=1, le=6)
-
-    # ── Data freshness ─────────────────────────────────────
     max_bar_age_multiple: float = Field(default=3.0, gt=0, le=20)
     max_clock_skew_seconds: float = Field(default=30.0, gt=0, le=300)
-
-    # ── Market quality gates ───────────────────────────────
     max_spread_bps: float = Field(default=50.0, gt=0)
     min_dollar_volume: float = Field(default=1_000_000.0, ge=0)
 
-    # ── Operational state paths ────────────────────────────
     audit_log_path: Path = Path("logs/audit.jsonl")
     idempotency_path: Path = Path("logs/orders.json")
     nonce_state_path: Path = Path("logs/nonce.json")
     managed_position_path: Path = Path("logs/managed_position.json")
 
-    # ── Execution posture ──────────────────────────────────
-    # Defaults remain locked. LIVE_EXECUTION_ARMED is the final explicit gate
-    # used by the engine when constructing a Kraken gateway.
+    # Execution defaults stay locked. LIVE_EXECUTION_ARMED is the final gate
+    # that makes the engine construct a submission-capable Kraken gateway.
     paper_trading: bool = True
     allow_live_trading: bool = False
     dry_run: bool = True
@@ -47,7 +37,6 @@ class Settings(BaseSettings):
     timeframe_minutes: int = Field(default=60, ge=1)
     lookback_bars: int = Field(default=500, ge=220)
 
-    # ── Capital controls ───────────────────────────────────
     strategy_equity_usd: float = Field(default=25.0, ge=25.0)
     risk_per_trade: float = Field(default=0.01, gt=0, le=0.02)
     max_position_fraction: float = Field(default=0.25, gt=0, le=0.5)
@@ -56,7 +45,6 @@ class Settings(BaseSettings):
     max_orders_per_day: int = Field(default=3, ge=1, le=10)
     cooldown_minutes: int = Field(default=90, ge=0)
 
-    # ── COO strategy ───────────────────────────────────────
     fast_ema: int = Field(default=20, ge=2)
     slow_ema: int = Field(default=50, ge=3)
     regime_ema: int = Field(default=200, ge=10)
@@ -70,6 +58,7 @@ class Settings(BaseSettings):
     min_volume_ratio: float = Field(default=1.10, gt=0)
     min_order_notional_usd: float = Field(default=1.0, ge=1.0)
 
+    # COO weighted decision layer.
     coo_entry_score: int = Field(default=72, ge=50, le=100)
     coo_exit_score: int = Field(default=65, ge=40, le=100)
     coo_min_atr_fraction: float = Field(default=0.002, ge=0.0, le=0.05)
@@ -80,16 +69,19 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_safety(self) -> "Settings":
-        live_requested = not self.paper_trading or self.allow_live_trading or self.live_execution_armed
-        if live_requested:
+        # Preserve precise failure reasons for operators and regression tests.
+        if not self.paper_trading and not self.allow_live_trading:
+            raise ValueError("Live mode blocked: ALLOW_LIVE_TRADING must be true")
+        if self.allow_live_trading:
             if self.paper_trading:
                 raise ValueError("Live mode blocked: PAPER_TRADING must be false")
             if self.dry_run:
                 raise ValueError("Live mode blocked: DRY_RUN must be false")
-            if not self.allow_live_trading:
-                raise ValueError("Live mode blocked: ALLOW_LIVE_TRADING must be true")
             if self.live_risk_acknowledgement != "I_ACCEPT_LIVE_TRADING_RISK":
                 raise ValueError("Live mode blocked: acknowledgement is missing")
+        if self.live_execution_armed and not self.allow_live_trading:
+            raise ValueError("Live execution arm requires ALLOW_LIVE_TRADING=true")
+
         if not (self.fast_ema < self.slow_ema < self.regime_ema):
             raise ValueError("EMA periods must satisfy fast < slow < regime")
         if self.rsi_min >= self.rsi_max:
