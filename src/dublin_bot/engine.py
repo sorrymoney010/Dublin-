@@ -11,7 +11,7 @@ from .config import Settings
 from .errors import BrokerError, DuplicateOrderError, PrecisionError, SafetyLockError, StaleDataError
 from .idempotency import IdempotencyLedger, make_intent_key
 from .journal import Journal
-from .kraken_gateway import KrakenGateway
+from .managed_gateway import ManagedKrakenGateway
 from .managed_position import ManagedPositionStore
 from .market_quality import MarketGuard, MarketQuality
 from .models import Action, DecisionRecord, RiskDecision
@@ -24,7 +24,7 @@ def build_gateway(settings: Settings, **kwargs):
     """Build Kraken with live submission reachable only through explicit arming."""
     if settings.broker == "kraken":
         kwargs.setdefault("allow_order_submission", settings.live_execution_armed)
-        return KrakenGateway(settings, **kwargs)
+        return ManagedKrakenGateway(settings, **kwargs)
     raise ValueError(f"Unsupported broker: {settings.broker!r}; only Kraken is supported")
 
 
@@ -152,7 +152,6 @@ class TradingEngine:
             "exchange_base_balance_present": exchange_has_position,
             "orphaned_exchange_holding": bool(exchange_has_position and not in_position),
         }
-        # Existing wallet holdings must never be mistaken for Dublin exposure.
         signal = self.strategy.evaluate(bars, in_position=in_position)
         self.audit.record(AuditEvent.SIGNAL, {
             "action": signal.action.value, "score": signal.score, "reason": signal.reason,
@@ -244,10 +243,7 @@ class TradingEngine:
         if key is None:
             return None, RiskDecision(False, "Duplicate exit blocked")
         try:
-            if hasattr(self.gateway, "sell_quantity"):
-                order_id = self.gateway.sell_quantity(managed.quantity, userref=intent.userref)
-            else:
-                raise SafetyLockError("Gateway lacks managed-quantity sell support")
+            order_id = self.gateway.sell_quantity(managed.quantity, userref=intent.userref)
         except (BrokerError, PrecisionError, SafetyLockError) as exc:
             self.ledger.fail(key, str(exc))
             return None, RiskDecision(False, f"Exit blocked: {exc}")
