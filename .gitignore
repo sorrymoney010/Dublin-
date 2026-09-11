@@ -21,3 +21,8 @@ _acurast_deploy/
 src/acurast_ceo/
 acurast_data/
 tests/test_acurast_ceo.py
+
+# runtime log churn (dashboard traces, not source)
+logs/dashboard.log
+logs/dashboard.err.log
+logs/dashboard.out.log

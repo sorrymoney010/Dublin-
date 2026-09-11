@@ -197,6 +197,17 @@ class Settings(BaseSettings):
     volume_lookback: int = Field(default=20, ge=2)
     min_volume_ratio: float = Field(default=1.10, gt=0)
     min_order_notional_usd: float = Field(default=1.0, ge=1.0)
+    # ── Fill-model cost assumptions (backtest + paper) ──────
+    # These MUST mirror the real exchange fee schedule or every backtest is
+    # fiction. Kraken's "starter" tier on a ~$2.3k 30d volume account charges
+    # 80 bps taker / 40 bps maker — the old hardcoded 26 bps understated a
+    # round trip by ~1.1% and made losing strategies look profitable.
+    # Override via env (PAPER_TAKER_FEE_BPS etc.) once your tier improves;
+    # `TradeVolume` is the authoritative source.
+    paper_taker_fee_bps: float = Field(default=80.0, ge=0.0)
+    paper_maker_fee_bps: float = Field(default=40.0, ge=0.0)
+    paper_slippage_bps: float = Field(default=10.0, ge=0.0)
+    paper_min_spread_bps: float = Field(default=5.0, ge=0.0)
     # ── Advanced order execution (Kraken full API) ──────────
     # The bot places exchange-native bracket orders (stop-loss + take-profit)
     # and can use limit (maker) entries to cut fees. All still flow through the

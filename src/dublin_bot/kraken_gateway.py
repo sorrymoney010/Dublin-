@@ -550,6 +550,58 @@ class KrakenGateway:
     def has_position(self) -> bool:
         return bool(self.positions())
 
+    def fee_schedule(self, pair: str | None = None) -> dict[str, float] | None:
+        """Live taker/maker fee in BPS from Kraken ``TradeVolume``.
+
+        Kraken's fee depends on 30d volume, so it drifts as the account trades.
+        Backtests and the paper fill model must use the REAL number — a stale
+        or assumed fee (the old hardcoded 26 bps vs an actual 80 bps) makes
+        losing strategies look profitable.
+
+        Returns ``{"taker_bps": float, "maker_bps": float}`` or ``None`` when
+        the schedule cannot be read (caller should then keep its assumption).
+        """
+        if not self.has_credentials:
+            return None
+        # TradeVolume returns ``fees: null`` unless a pair is supplied, so fall
+        # back to the configured symbol's canonical pair.
+        if not pair:
+            try:
+                pair = self.resolve_symbol().key
+            except Exception:
+                return None
+        try:
+            result = self._private("TradeVolume", {"pair": pair})
+        except BrokerError:
+            return None
+        fees = result.get("fees") or {}
+        maker = result.get("fees_maker") or {}
+        if not isinstance(fees, dict) or not fees:
+            return None
+
+        # Each entry is keyed by pair (or "default"): {"fee": "0.8000", ...}
+        def _first_bps(table: dict) -> float | None:
+            for _, entry in table.items():
+                if not isinstance(entry, dict):
+                    continue
+                raw = entry.get("fee")
+                if raw is None:
+                    continue
+                try:
+                    return float(raw) * 100.0  # percent -> bps
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        taker_bps = _first_bps(fees)
+        maker_bps = _first_bps(maker) if maker else None
+        if taker_bps is None:
+            return None
+        return {
+            "taker_bps": taker_bps,
+            "maker_bps": maker_bps if maker_bps is not None else taker_bps,
+        }
+
     def closed_trade_pnl(self, since: int = 0) -> tuple[list[dict], int]:
         """Realized P&L of closed trades since ``since`` (unix SECONDS).
 
@@ -649,6 +701,22 @@ class KrakenGateway:
                     "userref": userref,
                 }
         return None
+
+    def find_children_by_userref(self, userref: int) -> list[dict]:
+        """All open orders carrying ``userref`` (bracket stops/targets).
+
+        Used to recover the exact child txids of a bracket whose ID was not
+        captured at submission time (crash, partial response, or an older
+        build). Cancelling by userref alone is unsafe — it can hit a
+        same-symbol order we do not own — so this only ever *discovers* IDs;
+        callers still cancel by explicit txid.
+        """
+        if not self.has_credentials:
+            return []
+        return [
+            order for order in self.orders()
+            if order.get("userref") == userref
+        ]
 
     def query_order(self, txid: str) -> dict:
         """Return Kraken's authoritative state for one submitted order."""
@@ -932,6 +1000,25 @@ class KrakenGateway:
                       {"operation": "CancelOrder", "txid": txid, "error": str(exc)},
                       severity="warning")
             return False
+
+    def cancel_orders(self, order_ids: list[str]) -> bool:
+        """Cancel only the supplied orders and confirm none still reserve funds.
+
+        Bracket exits must use exact Kraken transaction IDs, not a userref range:
+        userrefs are caller-controlled and may overlap an owner's other orders.
+        An order that fills while cancellation is in flight is also acceptable,
+        because it no longer appears in ``OpenOrders`` and cannot reserve funds.
+        """
+        expected = {str(order_id) for order_id in order_ids if str(order_id)}
+        if not expected:
+            return False
+        for order_id in expected:
+            self.cancel_order(order_id)
+        try:
+            remaining = {str(order.get("id")) for order in self.orders()}
+        except BrokerError:
+            return False
+        return expected.isdisjoint(remaining)
 
     def cancel_attached(self, userref: int) -> int:
         """Cancel any open orders carrying a userref >= base and < base+10.

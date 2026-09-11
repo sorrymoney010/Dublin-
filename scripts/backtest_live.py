@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -49,20 +48,33 @@ def _has_envarg() -> bool:
 
 def fetch_history(gw: KrakenGateway, symbol: str, days: int,
                   interval_min: int = 15) -> pd.DataFrame:
-    """Fetch `days` of completed OHLC candles for `symbol` from Kraken."""
+    """Fetch `days` of completed OHLC candles for `symbol` from Kraken.
+
+    Kraken serves ONLY the most recent ~721 candles per OHLC request and
+    ``since`` does not extend that depth (it selects within, not back into,
+    history). Requesting 15m bars therefore yields at most ~7.5 days no matter
+    what ``days`` asks for — which silently made every "200d" backtest a 7.5d
+    one. So pick the finest interval that still COVERS the requested window:
+
+        60d -> 60m  (721 * 1h  ~= 30d)   [best available under 60d]
+        120d, 200d -> 240m (120d) / 1440m (720d)
+
+    and report the ACTUAL span so a truncated window is never mistaken for the
+    requested one.
+    """
     g = KrakenGateway(gw.settings)
     g.settings.symbol = symbol
     meta = g.resolve_symbol()
-    since = int(time.time()) - days * 86400
-    raw = g._public("OHLC", {"pair": meta.key, "interval": interval_min,
-                             "since": str(since)})
-    pair_key = next(k for k in raw if k != "last")
-    rows = raw[pair_key]
+    raw = g._public("OHLC", {"pair": meta.key, "interval": interval_min})
+    rows = raw.get(meta.key) or []
+    if not rows:
+        return pd.DataFrame()
     df = pd.DataFrame(rows)
     cols = ["time", "open", "high", "low", "close", "vwap", "volume", "count"]
     for ci, name in enumerate(cols):
         df[name] = df[ci].astype(float)
-    df = df[df["close"] > 0].sort_values("time").reset_index(drop=True)
+    df = df[df["close"] > 0].drop_duplicates(subset="time")
+    df = df.sort_values("time").reset_index(drop=True)
     # drop the still-forming candle, mirror get_bars()
     return df.iloc[:-1].reset_index(drop=True)
 
@@ -126,16 +138,36 @@ class BacktestResult:
         return worst
 
 
+def interval_for_days(days: int) -> int:
+    """Finest Kraken interval whose ~721-bar cap still covers ``days``.
+
+    Kraken serves only the latest ~721 candles per request, so the interval
+    determines how much history you actually get: 15m -> ~7.5d, 60m -> ~30d,
+    240m -> ~120d, 1440m -> ~720d. Choosing a finer interval than the window
+    needs silently truncates the test instead of extending it.
+    """
+    for interval, capacity in ((15, 7), (60, 30), (240, 120), (1440, 720)):
+        if days <= capacity:
+            return interval
+    return 1440
+
+
 def run_backtest(symbol: str, days: int, start_equity: float = 1000.0,
-                 interval_min: int = 15, settings: Settings | None = None,
+                 interval_min: int | None = None, settings: Settings | None = None,
                  use_real_stop: bool = True) -> BacktestResult:
     """Replay the real strategy + risk pipeline bar-by-bar.
+
+    `interval_min` defaults to ``None`` = auto: the finest Kraken interval whose
+    721-bar cap still covers ``days``. Passing an explicit value overrides that
+    (useful for tests), but note a too-fine interval silently truncates history.
 
     `use_real_stop` (default) treats the strategy's `stop_price` as an
     exchange-native stop and exits the position if the bar's low breaches it
     (conservative fill at the stop). When False, only the strategy SELL signal
     exits — this is the naive "no real stop" comparison from the audit.
     """
+    if interval_min is None:
+        interval_min = interval_for_days(days)
     settings = settings or Settings(_env_file=None)
     settings.symbol = symbol
     gw = build_gateway(settings)

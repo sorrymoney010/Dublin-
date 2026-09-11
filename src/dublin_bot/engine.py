@@ -20,10 +20,14 @@ window of "unknown outcome" is as small as possible.
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import pandas as pd
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
 
 from .audit import AuditEvent, AuditLog
 from .config import Settings
@@ -48,6 +52,28 @@ from .state import StateStore
 from .strategy import build_strategy
 from .emergency import emergency_stop_active
 from .dca import DCAAccumulator
+
+
+def _norm_pair(value: str) -> str:
+    """Normalize a Kraken pair for comparison (XBTUSD == XXBTZUSD == XBT/USD).
+
+    Kraken reports the same pair under several spellings — OpenOrders uses the
+    altname (``XBTUSD``), metadata uses the canonical key (``XXBTZUSD``), and
+    config uses ``BTC/USD`` with ``BTC`` aliased to ``XBT``. Compare normalized
+    forms so a symbol mismatch never rejects the bot's own order.
+    """
+    raw = str(value).upper().replace("/", "").replace("-", "").replace("_", "")
+    # Kraken spells the same pair three ways: canonical key "XXBTZUSD"
+    # (X-prefixed base + Z-prefixed fiat quote), altname "XBTUSD", and
+    # wsname/config "BTC/USD". Reduce all of them to the altname form.
+    for plain, kraken in (("BTC", "XBT"), ("DOGE", "XDG")):
+        if raw.startswith(plain):
+            raw = kraken + raw[len(plain):]
+    if raw.startswith("XX"):
+        raw = raw[1:]              # XXBTZUSD -> XBTZUSD
+    if raw.endswith("ZUSD"):
+        raw = raw[:-4] + "USD"     # XBTZUSD  -> XBTUSD
+    return raw
 
 
 def build_gateway(settings: Settings, **kwargs):
@@ -118,6 +144,16 @@ class TradingEngine:
         # so a SELL never liquidates holdings the bot did not purchase.
         self._bot_qty_path = Path("logs/bot_positions.json")
         self._bot_qty: dict[str, float] = self._load_bot_qty()
+        # Drop lots the exchange no longer holds before any strategy call, so a
+        # stale phantom lot can never freeze the bot into exit-only WAIT.
+        self._reconcile_bot_qty()
+        # Bracket parent userrefs by bot-owned symbol. A later exit can then
+        # cancel only the stop/target created for that exact bot-owned lot.
+        self._bracket_refs_path = Path("logs/bot_brackets.json")
+        self._bracket_refs: dict[str, dict[str, object]] = self._load_bracket_refs()
+        # Backfill any bracket whose child txids were never captured, so an
+        # exit can still cancel its own stop instead of failing closed forever.
+        self._reconcile_bracket_refs()
         # Pending rotation target (single-position aggressive model): when set,
         # the bot exits the held bot-owned lot on the current symbol and the
         # next cycle enters this coin.
@@ -163,6 +199,42 @@ class TradingEngine:
         if getattr(s, "day_trade_mode", False):
             s.timeframe_minutes = 5
             s.monitor_interval_seconds = 300
+
+    def _refresh_live_realized_pnl(self, state) -> bool:
+        """Set today's realized P&L from Kraken's closed-trade ledger.
+
+        Account equity changes also include deposits, withdrawals, and external
+        holdings. They must never be treated as trading losses and trip the
+        entry circuit breaker. Paper mode updates this value from simulated
+        fills in ``_execute`` instead.
+        """
+        if self.settings.paper_trading or self.settings.dry_run:
+            return True
+        closed_trade_pnl = getattr(self.gateway, "closed_trade_pnl", None)
+        if not callable(closed_trade_pnl):
+            return False
+        local_midnight = datetime.now().astimezone().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        try:
+            result = closed_trade_pnl(since=int(local_midnight.timestamp()))
+        except Exception:
+            return False
+        if not isinstance(result, tuple) or len(result) != 2:
+            return False
+        rows = result[0]
+        if not isinstance(rows, list):
+            return False
+        realized_pnl = 0.0
+        for row in rows:
+            if not isinstance(row, dict):
+                return False
+            try:
+                realized_pnl += float(row["pnl"])
+            except (KeyError, TypeError, ValueError):
+                return False
+        state.realized_pnl_today = realized_pnl
+        return True
 
     # ── gate 1: safety ───────────────────────────────────────
 
@@ -498,7 +570,6 @@ class TradingEngine:
         state = self.state_store.load(equity)
         state.current_equity = equity
         state.peak_equity = max(state.peak_equity, equity)
-        state.realized_pnl_today = equity - state.start_equity
         self.paper_portfolio.load(equity=equity, cash=equity)
 
         # Gate 2 — market data
@@ -642,7 +713,8 @@ class TradingEngine:
         state = self.state_store.load(equity)
         state.current_equity = equity
         state.peak_equity = max(state.peak_equity, equity)
-        state.realized_pnl_today = equity - state.start_equity
+        pnl_synced = self._refresh_live_realized_pnl(state)
+        prior_realized_pnl = state.realized_pnl_today
         open_exposure = 0.0
         try:
             # Aggregate every bot-owned spot lot, not merely the currently
@@ -660,6 +732,8 @@ class TradingEngine:
             open_exposure_usd=open_exposure,
             returns=pd.Series(returns) if returns is not None else None,
         )
+        if signal.action is Action.BUY and not pnl_synced:
+            risk = RiskDecision(False, "Closed-trade P&L ledger unavailable; entry blocked")
 
         # An entry requires healthy market quality; an exit must never be
         # blocked by a wide spread — being trapped in a position is worse.
@@ -726,12 +800,15 @@ class TradingEngine:
             # Exits use the risk manager's verdict (approved for SELL, never
             # blocked by entry breakers). Cancel any attached bracket orders
             # first so the exchange-native stop/target don't fight the close.
-            self._cancel_attached_bracket(state)
-            order_id, risk = self._execute(
-                side="sell", notional=0.0, risk=risk,
-                bar_timestamp=bar_timestamp, state=state, gates=gates,
-                leverage=leverage, signal_price=signal.price,
-            )
+            if self._cancel_attached_bracket(state):
+                order_id, risk = self._execute(
+                    side="sell", notional=0.0, risk=risk,
+                    bar_timestamp=bar_timestamp, state=state, gates=gates,
+                    leverage=leverage, signal_price=signal.price,
+                )
+            else:
+                order_id = None
+                risk = RiskDecision(False, "Exit blocked: owned bracket cancellation unconfirmed")
 
         # Restore the cycle's primary symbol if the DCA sleeve had swapped it.
         # Uses the cycle-start snapshot so in-cycle rotation is preserved and a
@@ -745,16 +822,24 @@ class TradingEngine:
         if rotation_target is not None:
             self.settings.symbol = rotation_target
 
-        self.state_store.save(state)
         # Adapt risk scaling from the session's realized P&L streak. In live
         # mode the per-cycle equity delta equals the realized P&L of any trade
         # closed this cycle; in paper mode the per-trade update already ran in
         # the SELL path. Either way the win/loss streak drives the scale (#6).
-        cycle_pnl = state.current_equity - equity
+        if (
+            not (self.settings.paper_trading or self.settings.dry_run)
+            and signal.action is Action.SELL
+            and order_id is not None
+            and self._refresh_live_realized_pnl(state)
+        ):
+            cycle_pnl = state.realized_pnl_today - prior_realized_pnl
+        else:
+            cycle_pnl = state.current_equity - equity
         if abs(cycle_pnl) > 1e-9:
             self.risk.update_scale_from_trade(cycle_pnl, state)
         else:
             self.risk.update_scale(state)
+        self.state_store.save(state)
         record = DecisionRecord(
             symbol=self.settings.symbol,
             signal=signal,
@@ -793,6 +878,14 @@ class TradingEngine:
                 if bracket_plan is not None:
                     # Advanced path: submit the bracket/limit order via AddOrder.
                     bracket_plan.userref = record.userref
+                    if not (self.settings.paper_trading or self.settings.dry_run):
+                        # Persist before the exchange call. If submission is
+                        # ambiguous or the process crashes, the next engine
+                        # rebuild blocks its exit until the bracket is manually
+                        # reconciled instead of selling against a reserved stop.
+                        self._record_bracket_ref(
+                            self.settings.symbol, "", [], complete=False
+                        )
                     params = bracket_plan.to_addorder_params()
                     order_id = self.gateway.add_order(params, signal_price=signal_price)
                     if self.settings.paper_trading or self.settings.dry_run:
@@ -979,6 +1072,21 @@ class TradingEngine:
             bar_timestamp=bar_timestamp, state=state, gates=gates,
             leverage=leverage, bracket_plan=plan, signal_price=signal_price,
         )
+        bracket_child_ids: list[str] = []
+        native_stop_id: str | None = None
+        take_profit_id: str | None = None
+        if use_bracket and res[0] is not None and not (s.paper_trading or s.dry_run):
+            query_order = getattr(self.gateway, "query_order", None)
+            if callable(query_order):
+                try:
+                    entry = query_order(res[0])
+                    if isinstance(entry, dict):
+                        stop_id = str(entry.get("closetxid", ""))
+                        if stop_id:
+                            bracket_child_ids.append(stop_id)
+                            native_stop_id = stop_id
+                except (BrokerError, SafetyLockError, ValueError):
+                    pass
         # Take-profit: a separate resting limit order (avoids close[1] which
         # this tier rejects). Only on a real entry with bracket enabled.
         if use_bracket and s.take_profit_pct > 0 and res[0] is not None:
@@ -989,11 +1097,23 @@ class TradingEngine:
                     userref=(plan.userref or 0) + 2 if plan.userref else None,
                     pair_decimals=meta.pair_decimals,
                 )
-                self.gateway.add_order(tp_params)
+                take_profit_id = self.gateway.add_order(tp_params)
+                if not (s.paper_trading or s.dry_run) and take_profit_id:
+                    bracket_child_ids.append(str(take_profit_id))
             except (BrokerError, SafetyLockError):
                 pass
         if res[0] is not None:
             self._record_bot_buy(s.symbol, float(volume))
+            if use_bracket and plan.userref is not None:
+                # An empty child list is deliberately persisted too: a future
+                # exit must fail closed instead of risking a SELL against a
+                # stop whose exact exchange ID could not be reconciled.
+                bracket_complete = native_stop_id is not None and (
+                    s.take_profit_pct <= 0 or take_profit_id is not None
+                )
+                self._record_bracket_ref(
+                    s.symbol, str(res[0]), bracket_child_ids, complete=bracket_complete
+                )
         return res
 
     # ── bot-owned lot ledger (audit finding #3) ─────────────
@@ -1003,6 +1123,153 @@ class TradingEngine:
             return json.loads(self._bot_qty_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
+
+    def _reconcile_bot_qty(self) -> None:
+        """Drop bot-owned lots the exchange no longer holds.
+
+        ``logs/bot_positions.json`` is the sole source of truth for
+        ``in_position``. If a lot is closed outside the bot (manual sale,
+        bracket stop, exchange-side liquidation) the file keeps claiming the
+        bot owns it, so the strategy is called with ``in_position=True``
+        forever and returns WAIT — the "stale-phantom-lot freeze": the bot
+        looks alive, cycles every interval, and never trades again.
+
+        Reconciliation compares each persisted lot against the live balance
+        for that pair's base asset and clears any lot the exchange reports as
+        zero. A live read failure is NOT treated as "position closed" — that
+        would silently discard real lots. It leaves the ledger untouched and
+        lets the next cycle retry.
+        """
+        if self.settings.paper_trading or self.settings.dry_run:
+            return
+        if not self._bot_qty:
+            return
+        try:
+            balances = self.gateway.balances()
+        except Exception:
+            # Cannot verify -> keep the persisted lots. Failing closed here
+            # means an unverified read never deletes a real position.
+            return
+        if not balances:
+            return
+
+        cleared: list[dict[str, object]] = []
+        for symbol in list(self._bot_qty):
+            try:
+                base = self.gateway.resolve_symbol(symbol).base
+            except Exception:
+                # Unknown/unresolvable pair: without a base asset we cannot
+                # verify the lot, so leave it alone rather than guess.
+                continue
+            held = float(balances.get(base, 0.0) or 0.0)
+            if held > 0.0:
+                continue
+            qty = self._bot_qty.pop(symbol, None)
+            cleared.append({"symbol": symbol, "asset": base, "qty": qty})
+
+        if not cleared:
+            return
+        self._save_bot_qty()
+        self.audit.record(
+            AuditEvent.SIGNAL,
+            {
+                "event": "phantom_lot_reconciled",
+                "cleared": cleared,
+                "reason": "exchange balance is zero for a bot-owned lot",
+            },
+        )
+
+    def _reconcile_bracket_refs(self) -> None:
+        """Recover missing bracket child txids for lots the bot still owns.
+
+        When a bracket's child IDs were never captured (crash between submit
+        and persist, an older build, or ``closetxid`` missing from the query)
+        the record stays incomplete and every later exit fails closed — the
+        bot can never sell its own lot. This rediscovers the IDs by scanning
+        the open book for orders whose **userref** matches the one the
+        idempotency ledger recorded for this entry.
+
+        Two independent guards prevent adopting a foreign order: the userref
+        must match the bot's own entry intent, AND the order's pair must match
+        the bracket's symbol. A lookup failure leaves the record untouched.
+        """
+        if self.settings.paper_trading or self.settings.dry_run:
+            return
+        if not self._bracket_refs or not self._bot_qty:
+            return
+        find_children = getattr(self.gateway, "find_children_by_userref", None)
+        if not callable(find_children):
+            return
+
+        for symbol, ref in list(self._bracket_refs.items()):
+            if ref.get("complete"):
+                continue
+            if float(self._bot_qty.get(symbol, 0.0)) <= 0.0:
+                continue
+            entry_id = str(ref.get("entry_order_id") or "")
+            if not entry_id:
+                continue
+            # userref is derived from the intent key, not the order id, so it
+            # can only be recovered from the ledger that recorded the intent.
+            userref = self._userref_for_order(entry_id)
+            if userref is None:
+                continue
+            try:
+                children = find_children(userref)
+                pair = self.gateway.resolve_symbol(symbol).key
+            except Exception:
+                continue
+            if not children:
+                continue
+            # Kraken's OpenOrders reports the pair as the *altname* (XBTUSD)
+            # while resolve_symbol() returns the canonical key (XXBTZUSD), so a
+            # raw string compare would reject the bot's own stop. Normalize
+            # both sides before matching — and never match on a bare substring.
+            known = {str(x) for x in (ref.get("child_order_ids") or [])}
+            expected_pairs = {_norm_pair(pair)}
+            try:
+                expected_pairs.add(_norm_pair(
+                    self.gateway.resolve_symbol(symbol).altname
+                ))
+            except Exception:
+                pass
+            existing_ids = ref.get("child_order_ids")
+            merged: list[str] = [str(x) for x in existing_ids] if isinstance(existing_ids, list) else []
+            recovered: list[str] = []
+            for order in children:
+                # Both checks required: never absorb another order that merely
+                # shares a symbol or happens to reuse a userref.
+                if _norm_pair(str(order.get("symbol", ""))) not in expected_pairs:
+                    continue
+                order_id = str(order.get("id", ""))
+                if order_id and order_id not in known:
+                    recovered.append(order_id)
+            if not recovered:
+                continue
+            ref["child_order_ids"] = merged + recovered
+            ref["complete"] = True
+            self._save_bracket_refs()
+            self.audit.record(
+                AuditEvent.SIGNAL,
+                {
+                    "event": "bracket_children_recovered",
+                    "symbol": symbol,
+                    "entry_order_id": entry_id,
+                    "recovered": recovered,
+                },
+            )
+
+    def _userref_for_order(self, order_id: str) -> int | None:
+        """Userref the ledger recorded for ``order_id``, if any."""
+        records = getattr(getattr(self, "ledger", None), "_records", None)
+        if not isinstance(records, dict):
+            return None
+        for record in records.values():
+            if str(getattr(record, "order_id", "")) == order_id:
+                value = getattr(record, "userref", None)
+                if isinstance(value, int):
+                    return value
+        return None
 
     def _save_bot_qty(self) -> None:
         # Never persist the lot ledger in paper/dry-run mode. A diagnostic or
@@ -1030,6 +1297,74 @@ class TradingEngine:
             else:
                 self._bot_qty[symbol] = remaining
         self._save_bot_qty()
+
+    def _load_bracket_refs(self) -> dict[str, dict[str, object]]:
+        try:
+            data = json.loads(self._bracket_refs_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {}
+            records: dict[str, dict[str, object]] = {}
+            for symbol, value in data.items():
+                if not isinstance(value, dict):
+                    # Old userref-only records cannot prove order ownership.
+                    records[str(symbol)] = {"child_order_ids": []}
+                    continue
+                entry_id = value.get("entry_order_id")
+                child_ids = value.get("child_order_ids")
+                if not isinstance(entry_id, str) or not isinstance(child_ids, list):
+                    records[str(symbol)] = {"child_order_ids": []}
+                    continue
+                records[str(symbol)] = {
+                    "entry_order_id": entry_id,
+                    "child_order_ids": [str(order_id) for order_id in child_ids if str(order_id)],
+                    "complete": bool(value.get("complete", False)),
+                }
+            return records
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _save_bracket_refs(self) -> None:
+        if self.settings.paper_trading or self.settings.dry_run:
+            return
+        self._bracket_refs_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(
+            dir=str(self._bracket_refs_path.parent), prefix=".bot_brackets.", suffix=".tmp"
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(self._bracket_refs, handle)
+            os.replace(temporary, self._bracket_refs_path)
+        except OSError:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+            raise
+
+    def _record_bracket_ref(
+        self, symbol: str, entry_order_id: str, child_order_ids: list[str], *, complete: bool = True
+    ) -> None:
+        next_record = {
+            "entry_order_id": entry_order_id,
+            "child_order_ids": list(child_order_ids),
+            "complete": complete,
+        }
+        prior = self._bracket_refs.get(symbol)
+        self._bracket_refs[symbol] = next_record
+        try:
+            self._save_bracket_refs()
+        except OSError:
+            if prior is None:
+                self._bracket_refs.pop(symbol, None)
+            else:
+                self._bracket_refs[symbol] = prior
+            raise
+
+    def _bracket_ref_for(self, symbol: str) -> dict[str, object] | None:
+        return self._bracket_refs.get(symbol)
+
+    def _clear_bracket_ref(self, symbol: str) -> None:
+        self._bracket_refs.pop(symbol, None)
+        self._save_bracket_refs()
 
     def _bot_open_exposure_usd(self) -> float:
         """Market value of all bot-owned spot lots across symbols."""
@@ -1079,15 +1414,27 @@ class TradingEngine:
         # Long position: stop breached when price <= stop.
         return price <= stop_price
 
-    def _cancel_attached_bracket(self, state) -> None:
-        """Cancel any exchange-native stop/target still attached to the open trade."""
-        ref = getattr(state, "open_userref", None)
-        if ref is None:
-            return
+    def _cancel_attached_bracket(self, state) -> bool:
+        """Release only verified child orders before a bot-owned SELL."""
+        record = self._bracket_ref_for(self.settings.symbol)
+        if record is None:
+            return True
+        if record.get("complete") is not True:
+            return False
+        child_ids = record.get("child_order_ids")
+        if not isinstance(child_ids, list) or not child_ids:
+            return False
+        cancel_orders = getattr(self.gateway, "cancel_orders", None)
+        if not callable(cancel_orders):
+            return False
         try:
-            self.gateway.cancel_attached(int(ref))
+            cancelled = cancel_orders([str(order_id) for order_id in child_ids])
         except (BrokerError, SafetyLockError, ValueError):
-            pass
+            return False
+        if not cancelled:
+            return False
+        self._clear_bracket_ref(self.settings.symbol)
+        return True
 
     # ── backwards-compatible entry point ─────────────────────
 

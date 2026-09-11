@@ -17,6 +17,8 @@ from dublin_bot.errors import SafetyLockError
 from dublin_bot.kraken_gateway import KrakenGateway
 from dublin_bot.models import Action
 from dublin_bot.ratelimit import KrakenRateLimiter, RateLimitTier
+from dublin_bot.risk import SessionState
+from dublin_bot.state import StateStore
 from .conftest import ohlc_payload, ticker_payload, time_payload
 
 
@@ -50,6 +52,25 @@ def test_cycle_completes_under_safe_defaults(settings, fake_session):
     assert result.record is not None
     assert "safety" in result.gates
     assert result.gates["safety"]["safety_locked"] is True
+
+
+def test_cash_equity_change_is_not_realized_trading_loss(settings_factory, fake_session):
+    """Withdrawals/deposits must not trip the daily trading-loss breaker."""
+    settings = settings_factory()
+    fake_session.routes["Balance"] = {"error": [], "result": {"ZUSD": "100.0000"}}
+    fake_session.routes["TradeBalance"] = {"error": [], "result": {"eb": "100.0000", "tb": "100.0000"}}
+    fake_session.routes["TradesHistory"] = {"error": [], "result": {"trades": {}}}
+    store = StateStore(settings.session_state_path)
+    store.save(SessionState(
+        start_equity=110.0,
+        peak_equity=110.0,
+        current_equity=100.0,
+        realized_pnl_today=0.0,
+    ))
+
+    build_engine(settings, fake_session).run_cycle()
+
+    assert store.load(100.0).realized_pnl_today == 0.0
 
 
 def test_stale_data_blocks_before_any_order(settings, fake_session):
