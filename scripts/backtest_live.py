@@ -168,6 +168,10 @@ def run_backtest(symbol: str, days: int, start_equity: float = 1000.0,
     """
     if interval_min is None:
         interval_min = interval_for_days(days)
+    # ORDER_TYPE=limit means the bot posts passive entries (maker fee, no
+    # spread crossing). Model that or the backtest silently charges taker and
+    # understates the edge of a limit config.
+    use_limit = getattr(settings, "order_type", "market") == "limit" if settings else False
     settings = settings or Settings(_env_file=None)
     settings.symbol = symbol
     gw = build_gateway(settings)
@@ -210,10 +214,17 @@ def run_backtest(symbol: str, days: int, start_equity: float = 1000.0,
                 )
                 decision = risk.evaluate(sig, state)
                 if decision.approved and decision.notional_usd > 0:
-                    # Enter at the ASK (+ slippage), like a live market buy.
+                    # Market fills cross the spread (ask + slippage). A limit
+                    # entry is passive: it fills at the bid side and pays the
+                    # maker fee, which is what ORDER_TYPE=limit does live.
                     ask = float(row.get("ask", price * 1.0005)) if "ask" in row else price
-                    entry = fill.buy(price=price, volume=decision.notional_usd / price,
-                                     bid=ask - 0.0005 * ask, ask=ask)
+                    entry = fill.buy(
+                        price=price,
+                        volume=decision.notional_usd / price,
+                        bid=ask - 0.0005 * ask,
+                        ask=ask,
+                        maker=use_limit,
+                    )
                     qty = decision.notional_usd / entry.price
                     entry_qty = qty
                     entry_notional = qty * entry.price
