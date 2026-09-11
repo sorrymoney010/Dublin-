@@ -161,6 +161,29 @@ def test_phantom_lot_reconciliation_keeps_lots_when_balance_read_fails(
     assert engine._bot_qty == {"PUMP/USD": 2693.6}
 
 
+def test_limit_price_respects_pair_decimals():
+    """Kraken rejects over-precise prices (BTC/USD allows 1 decimal)."""
+    assert fmt_price(77617.2, 1) == "77617.2"
+    assert fmt_price(0.00378022, 6) == "0.00378"  # trailing zeros trimmed
+    # No decimals given -> legacy trim behaviour, unchanged.
+    assert fmt_price(1.5) == "1.5"
+    assert fmt_price(0.003876) == "0.003876"
+    # Never exceed the pair's precision.
+    assert len(fmt_price(1234.56789, 1).split(".")[-1]) <= 1
+    assert len(fmt_price(0.0012345678, 6).split(".")[-1]) <= 6
+
+
+def test_limit_entry_price_rounds_to_pair_precision():
+    """A rounded entry must still sit inside the spread to earn the maker fee."""
+    # BTC: 1 decimal. Raw 0.1% off 77638.0 = 77560.362 -> 77560.4
+    p = limit_entry_price("buy", 77638.0, 0.001, 1)
+    assert round(p, 1) == p
+    assert p < 77638.0
+    # PUMP: 6 decimals.
+    p2 = limit_entry_price("buy", 0.003784, 0.001, 6)
+    assert p2 < 0.003784
+
+
 def test_norm_pair_unifies_kraken_spellings():
     """XBTUSD / XXBTZUSD / BTC/USD are one pair; a mismatch must not reject it."""
     from dublin_bot.engine import _norm_pair

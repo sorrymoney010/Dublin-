@@ -1048,7 +1048,20 @@ class TradingEngine:
 
         entry_price = None
         if use_limit:
-            entry_price = fmt_price(limit_entry_price("buy", touch, s.limit_offset_pct))
+            # Round to the pair's price precision or Kraken rejects the order
+            # (BTC/USD allows 1 decimal). A rounded price that lands on or
+            # through the touch would fill as a taker, so nudge it one tick
+            # further inside the spread to keep the maker fee.
+            entry_price = fmt_price(
+                limit_entry_price("buy", touch, s.limit_offset_pct,
+                                  meta.pair_decimals),
+                meta.pair_decimals,
+            )
+            if float(entry_price) >= touch:
+                tick = 10.0 ** (-int(meta.pair_decimals))
+                entry_price = fmt_price(
+                    max(0.0, float(entry_price) - tick), meta.pair_decimals
+                )
         sl = None
         if use_bracket:
             # Exchange-side protective stop. Use the config stop-loss percentage

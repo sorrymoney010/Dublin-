@@ -24,22 +24,45 @@ from typing import Literal
 Side = Literal["buy", "sell"]
 
 
-def fmt_price(p: float) -> str:
-    """Format a price as a plain string Kraken accepts (no trailing zeros)."""
-    s = f"{p:.8f}".rstrip("0").rstrip(".")
+def fmt_price(p: float, decimals: int | None = None) -> str:
+    """Format a price the way Kraken accepts for a given pair precision.
+
+    Kraken rejects over-precise prices per pair — BTC/USD allows 1 decimal
+    ("price can only be specified up to 1 decimals"). ``fmt_price`` used to
+    emit up to 8 decimals, so a limit entry on a 1-decimal pair was always
+    rejected. Pass the pair's ``pair_decimals`` to round to what the exchange
+    actually accepts. ``decimals=None`` keeps the old plain-trim behaviour.
+    """
+    if decimals is None:
+        s = f"{p:.8f}".rstrip("0").rstrip(".")
+        return s if s else "0"
+    decimals = max(0, int(decimals))
+    s = f"{p:.{decimals}f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
     return s if s else "0"
 
 
-def limit_entry_price(side: str, touch: float, offset_pct: float) -> float:
+def limit_entry_price(side: str, touch: float, offset_pct: float,
+                      decimals: int | None = None) -> float:
     """Price to post a limit order inside the spread.
 
     Buy: slightly below the ask (better price, still likely to fill).
     Sell: slightly above the bid. ``offset_pct`` is the fraction of ``touch``
     used as the improvement (e.g. 0.001 = 0.1%).
+
+    When ``decimals`` is given the result is rounded to that precision so the
+    posted price survives Kraken's per-pair decimal check. The rounded price
+    must stay strictly inside the spread, otherwise the limit degenerates into
+    a market order and pays the taker fee anyway.
     """
     if side == "buy":
-        return touch * (1.0 - offset_pct)
-    return touch * (1.0 + offset_pct)
+        raw = touch * (1.0 - offset_pct)
+    else:
+        raw = touch * (1.0 + offset_pct)
+    if decimals is None:
+        return raw
+    return round(raw, max(0, int(decimals)))
 
 
 @dataclass
