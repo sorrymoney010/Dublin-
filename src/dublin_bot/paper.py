@@ -188,13 +188,16 @@ class PaperPortfolio:
             if symbol not in self._portfolio.positions:
                 self._portfolio.positions[symbol] = Position(symbol=symbol, opened_at=when)
             position = self._portfolio.positions[symbol]
+            # Always add to quantity first
+            position.quantity += quantity
             if position.quantity <= 1e-12:
+                # Should not happen after adding, but safety check
                 position.entry_price = fill_price
                 position.fees_paid = fee
             else:
-                old_cost = position.quantity * position.entry_price + position.fees_paid
+                # For additional buys, update weighted average entry
+                old_cost = (position.quantity - quantity) * position.entry_price + position.fees_paid
                 new_cost = quantity * fill_price + fee
-                position.quantity += quantity
                 position.entry_price = (old_cost + new_cost) / position.quantity
                 position.fees_paid += fee
             position.trades += 1
@@ -220,3 +223,26 @@ class PaperPortfolio:
                 del self._portfolio.positions[symbol]
             self._save_unlocked()
             return realized_pl
+
+    def record_trade(
+        self,
+        symbol: str,
+        action: str,
+        price: float,
+        quantity: float,
+        pnl: float = 0.0,
+    ) -> None:
+        """Simplified record_trade for the trading agent."""
+        if action.upper() == "BUY":
+            self.record_buy(symbol, quantity, price, 0.0, datetime.now(timezone.utc).isoformat())
+        elif action.upper() == "SELL":
+            self.record_sell(symbol, quantity, price, 0.0, datetime.now(timezone.utc).isoformat())
+
+    def holdings(self) -> dict[str, float]:
+        """Return current holdings as {symbol: quantity}."""
+        with self._lock:
+            return {
+                symbol: position.quantity
+                for symbol, position in self._portfolio.positions.items()
+                if position.quantity > 1e-12
+            }
