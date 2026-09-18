@@ -82,7 +82,10 @@ class BoundedDashboardHTTPServer(ThreadingHTTPServer):
         self._request_slots = BoundedSemaphore(self.max_request_threads)
 
     def process_request(self, request: Any, client_address: Any) -> None:
-        self._request_slots.acquire()
+        # Admission runs on the listener: never block its shutdown on capacity.
+        if not self._request_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
         try:
             super().process_request(request, client_address)
         except BaseException:
@@ -1954,41 +1957,392 @@ def serve_dashboard(settings: Settings, run: bool = True) -> int:
     if not run:
         return 0
 
-    # Multi-platform: launch one trading monitor per configured broker account.
-    # Each account trades the SAME engine/strategy independently, sharing the
-    # audit log and the dashboard. Single-account setups (no `accounts` list)
-    # just run the one `broker`.
-    accounts = list(getattr(settings, "accounts", []) or [])
-    if not accounts:
-        accounts = [settings.broker]
-    monitors: list["TradingMonitor"] = []
-    for broker in accounts:
-        acct_settings = settings.model_copy(deep=True)
-        acct_settings.broker = broker
-        # Per-broker credentials: kraken_api_key/secret, binance_api_key/secret,
-        # coinbase_api_key/secret. Copy the matching pair onto the Settings
-        # instance so build_gateway reads them.
-        key_attr = f"{broker}_api_key"
-        secret_attr = f"{broker}_api_secret"
-        if hasattr(settings, key_attr):
-            setattr(acct_settings, key_attr, getattr(settings, key_attr, ""))
-            setattr(acct_settings, secret_attr, getattr(settings, secret_attr, ""))
-        m = TradingMonitor(acct_settings)
-        if getattr(acct_settings, "auto_start_monitor", False):
-            m.start()
-        monitors.append(m)
-        state = "started" if m.status()["running"] else "ready (stopped)"
-        print(f"[multi-platform] monitor {state} for broker={broker}")
+    # The CLI is also read-only: never create a monitor, even if autostart is configured.
+    from contextlib import ExitStack
+    from queue import Queue
 
-    server = BoundedDashboardHTTPServer((HOST, PORT), make_handler(settings, monitors[0]))
-    print(f"Dublin Terminal v2: http://{HOST}:{PORT}")
-    print("Press Control-C to stop.")
+    completed = Queue()
+
+    def listen(server):
+        try:
+            server.serve_forever()
+        except BaseException as exc:
+            completed.put(exc)
+        else:
+            completed.put(None)
+
+    def stop(server, thread):
+        try:
+            if thread.is_alive():
+                server.shutdown()
+        finally:
+            thread.join()
+
     try:
-        server.serve_forever()
+        with ExitStack() as cleanup:
+            servers = []
+            for address, handler in [
+                (("127.0.0.1", 8766), SimpleDashboardHandler),
+                (("127.0.0.1", 8765), DashboardRedirectHandler),
+            ]:
+                server = BoundedDashboardHTTPServer(address, handler)
+                cleanup.callback(server.server_close)
+                servers.append(server)
+            print("Dublin read-only terminal: http://127.0.0.1:8766/gunbot")
+            for server in servers:
+                thread = Thread(target=listen, args=(server,), name="dashboard-listener")
+                thread.start()
+                cleanup.callback(stop, server, thread)
+            for _ in servers:
+                error = completed.get()
+                if error is not None:
+                    raise error
     except KeyboardInterrupt:
         pass
-    finally:
-        for m in monitors:
-            m.stop()
-        server.server_close()
     return 0
+
+
+# Read-only Gunbot-inspired surface. Legacy dashboard APIs above remain compatible.
+# This handler never constructs a TradingMonitor or TradingEngine.
+from pathlib import Path as _Path
+from urllib.parse import urlparse as _urlparse, parse_qs as _parse_qs
+import math as _math
+import threading
+from datetime import timezone
+
+_DASH_BASE = _Path(__file__).resolve().parents[2]
+_DASH_STATIC = _Path(__file__).resolve().parent / "static"
+_DASH_PAIRS = {"BTC/USD": "XBTUSD", "PUMP/USD": "PUMPUSD", "XRP/USD": "XRPUSD"}
+_DASH_CACHE = {}
+_DASH_LOCKS = {}
+_DASH_GUARD = threading.Lock()
+
+
+def _dash_number(value):
+    if value is None:
+        return None
+    number = float(value)
+    if not _math.isfinite(number):
+        raise ValueError("Non-finite exchange number")
+    return number
+
+
+class DashboardPrivateReader:
+    """One serialized account collector with shared cooldown and last-read evidence."""
+    def __init__(self, gateway, clock=time.monotonic):
+        self.gateway, self.clock = gateway, clock
+        self.lock = threading.Lock()
+        self.cache = {}
+        self.blocked_until = 0
+        self.last_error = None
+
+    def _private(self, endpoint, params=None):
+        if endpoint not in {"Balance", "TradeBalance", "TradesHistory", "OpenOrders", "ClosedOrders"}:
+            raise ValueError("Read-only endpoint not allowed")
+        key = (endpoint, json.dumps(params or {}, sort_keys=True))
+        with self.lock:
+            now = self.clock()
+            previous = self.cache.get(key)
+            if previous and now - previous[0] < 60:
+                return dict(previous[1])
+            try:
+                if now < self.blocked_until:
+                    raise RuntimeError(f"Private API cooldown active; retry in {max(1, int(self.blocked_until - now))}s; last error: {self.last_error}")
+                try:
+                    result = self.gateway._private(endpoint, params)
+                except Exception as exc:
+                    # Only these allowlisted reads are retried, never an order.
+                    # A concurrent coordinator request can overtake a nonce.
+                    if str(exc).strip() != "EAPI:Invalid nonce":
+                        raise
+                    time.sleep(0.25)
+                    result = self.gateway._private(endpoint, params)
+                self.cache[key] = (self.clock(), dict(result), datetime.now(timezone.utc).isoformat())
+                return dict(result)
+            except Exception as exc:
+                if now >= self.blocked_until:
+                    self.blocked_until = self.clock() + 120
+                    self.last_error = str(exc)
+                if previous:
+                    return {**previous[1], "_dashboard_stale": {"error": str(exc), "verified_at": previous[2]}}
+                raise
+
+
+_DASH_READER = None
+_DASH_READER_INIT = threading.Lock()
+
+
+def _dash_private_gateway():
+    global _DASH_READER
+    with _DASH_READER_INIT:
+        if _DASH_READER is None:
+            _DASH_READER = DashboardPrivateReader(_dash_gateway())
+        return _DASH_READER
+
+
+def _dash_evidence(result, endpoint, data):
+    result = dict(result)
+    stale = result.pop("_dashboard_stale", None)
+    if stale:
+        data["errors"][endpoint] = "STALE — verified " + stale["verified_at"] + ": " + stale["error"]
+    return result
+
+
+def _dash_gateway():
+    from .kraken_gateway import KrakenGateway
+    s = Settings(_env_file=str(_DASH_BASE / ".env"))
+    s.http_timeout_seconds = 8
+    return KrakenGateway(s, allow_order_submission=False, max_retries=1)
+
+
+def load_live_portfolio(gateway=None):
+    g = gateway or _dash_private_gateway()
+    data = {"equity": None, "cash": None, "holdings": None,
+            "total_pnl": None, "win_rate": None, "errors": {},
+            "scope": "Kraken account — not bot-owned inventory",
+            "last_updated": datetime.now(timezone.utc).isoformat()}
+    try:
+        balances = _dash_evidence(g._private("Balance"), "Balance", data)
+        if not isinstance(balances, dict):
+            raise ValueError("Malformed Balance response")
+        data["cash"] = _dash_number(balances.get("ZUSD", "0"))
+        aliases = {"XXBT": "BTC", "XBT": "BTC", "XXRP": "XRP", "ZUSD": "USD"}
+        data["holdings"] = [
+            {"asset": aliases.get(asset, asset), "exchange_asset": asset,
+             "quantity": _dash_number(amount), "cost_basis": None,
+             "unrealized_pnl": None, "attribution": "account / unverified bot ownership"}
+            for asset, amount in balances.items() if _dash_number(amount) != 0
+        ]
+    except Exception as exc:
+        data["errors"]["Balance"] = str(exc)
+    try:
+        balance = _dash_evidence(g._private("TradeBalance", {"asset": "ZUSD"}), "TradeBalance", data)
+        data["equity"] = _dash_number(balance["eb"])
+    except Exception as exc:
+        data["errors"]["TradeBalance"] = str(exc)
+    return data
+
+
+def _dash_symbol(raw):
+    return {"XXBTZUSD": "BTC/USD", "XBTUSD": "BTC/USD", "XBT/USD": "BTC/USD",
+            "BTCUSD": "BTC/USD", "PUMPUSD": "PUMP/USD", "XXRPZUSD": "XRP/USD",
+            "XRPUSD": "XRP/USD"}.get(raw, raw)
+
+
+def load_saved_fills(path=None):
+    """Historical exchange captures; never presented as a fresh account read."""
+    import sqlite3
+    path = _Path(path) if path is not None else _DASH_BASE / "logs" / "executions.sqlite3"
+    data = {"source": "local exchange execution capture", "live_verified": False,
+            "fills": None, "error": None, "limit": 100}
+    try:
+        with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                "SELECT order_id, symbol, side, status, fill_price, volume, cost, fee, filled_at "
+                "FROM executions WHERE volume > 0 AND fill_price > 0 "
+                "ORDER BY filled_at DESC LIMIT 100"
+            ).fetchall()
+        data["fills"] = [{"order_id": row["order_id"], "symbol": _dash_symbol(row["symbol"]),
+                          "side": row["side"], "status": row["status"],
+                          "price": _dash_number(row["fill_price"]),
+                          "quantity": _dash_number(row["volume"]),
+                          "cost": _dash_number(row["cost"]), "fee": _dash_number(row["fee"]),
+                          "captured_at": row["filled_at"], "pnl": None}
+                         for row in rows]
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        data["error"] = str(exc)
+    return data
+
+
+def load_exchange_history(gateway=None, offset=0):
+    g = gateway or _dash_private_gateway()
+    data = {"fills": None, "orders": [], "fills_total": None,
+            "fills_has_more": None, "closed_total": None, "closed_has_more": None,
+            "offset": offset, "errors": {}, "scope": "Kraken account history; bot attribution unverified",
+            "last_updated": datetime.now(timezone.utc).isoformat()}
+    try:
+        result = g._private("TradesHistory", {"type": "all", "trades": True, "ofs": offset})
+        result = _dash_evidence(result, "TradesHistory", data)
+        rows = result["trades"]
+        data["fills_total"] = int(result["count"])
+        data["fills"] = [{"id": tid, "order_id": t.get("ordertxid"),
+            "symbol": _dash_symbol(t.get("pair")), "side": t.get("type"),
+            "time": _dash_number(t.get("time")),
+            "price": _dash_number(t.get("price")), "quantity": _dash_number(t.get("vol")),
+            "cost": _dash_number(t.get("cost")), "fee": _dash_number(t.get("fee")),
+            "pnl": None, "attribution": "account / unverified bot ownership"}
+            for tid, t in rows.items()]
+        data["fills"].sort(key=lambda t: t["time"] or 0, reverse=True)
+        data["fills_has_more"] = offset + len(rows) < data["fills_total"]
+    except Exception as exc:
+        data["fills"] = None
+        data["errors"]["TradesHistory"] = str(exc)
+    for endpoint, key in (("OpenOrders", "open"), ("ClosedOrders", "closed")):
+        try:
+            result = g._private(endpoint, {"trades": True, **({"ofs": offset} if key == "closed" else {})})
+            result = _dash_evidence(result, endpoint, data)
+            rows = result[key]
+            if key == "closed":
+                data["closed_total"] = int(result["count"])
+                data["closed_has_more"] = offset + len(rows) < data["closed_total"]
+            normalized = []
+            for oid, order in rows.items():
+                desc = order.get("descr", {})
+                executed = _dash_number(order.get("vol_exec"))
+                volume = _dash_number(order.get("vol"))
+                normalized.append({"id": oid, "symbol": _dash_symbol(desc.get("pair")),
+                    "side": desc.get("type"), "order_type": desc.get("ordertype"),
+                    "status": order.get("status"), "quantity": volume,
+                    "executed": executed, "filled": executed is not None and volume is not None and volume > 0 and executed >= volume,
+                    "time": _dash_number(order.get("closetm", order.get("opentm"))),
+                    "price": _dash_number(order.get("price")),
+                    "attribution": "account / unverified bot ownership"})
+            data["orders"].extend(normalized)
+        except Exception as exc:
+            data["errors"][endpoint] = str(exc)
+    data["orders"].sort(key=lambda o: o["time"] or 0, reverse=True)
+    data["performance"] = [{"symbol": symbol, "realized_pnl": None,
+        "unrealized_pnl": None, "win_rate": None,
+        "reason": "Cost basis and complete attributable lot history not verified"}
+        for symbol in _DASH_PAIRS]
+    return data
+
+
+def load_chart(symbol, interval=15, gateway=None):
+    if symbol not in _DASH_PAIRS or interval not in (1, 5, 15, 30, 60, 240, 1440):
+        raise ValueError("Unsupported pair or timeframe")
+    g = gateway or _dash_gateway()
+    result = g._public("OHLC", {"pair": _DASH_PAIRS[symbol], "interval": interval})
+    rows = next(value for key, value in result.items() if key != "last")
+    candles = [{"time": int(r[0]), "open": _dash_number(r[1]), "high": _dash_number(r[2]),
+                "low": _dash_number(r[3]), "close": _dash_number(r[4]), "volume": _dash_number(r[6])}
+               for r in rows]
+    return {"symbol": symbol, "interval": interval, "candles": candles,
+            "source": "Kraken public OHLC; final candle is in progress",
+            "last_updated": datetime.now(timezone.utc).isoformat()}
+
+
+def _dash_cached(key, ttl, loader):
+    with _DASH_GUARD:
+        lock = _DASH_LOCKS.setdefault(key, threading.Lock())
+    if not lock.acquire(timeout=1):
+        raise TimeoutError("Refresh already in progress; retry shortly")
+    try:
+        entry = _DASH_CACHE.get(key)
+        if entry and time.monotonic() - entry[0] < ttl:
+            return entry[1]
+        result = loader()
+        _DASH_CACHE[key] = (time.monotonic(), result)
+        return result
+    finally:
+        lock.release()
+
+
+class SimpleDashboardHandler(BaseHTTPRequestHandler):
+    """Local, read-only routes only; no legacy monitor control routes exposed."""
+    def log_message(self, *_args):
+        pass
+
+    def _send(self, body, content_type, code=200):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def do_GET(self):
+        parsed = _urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        params = _parse_qs(parsed.query)
+        assets = {"/gunbot": ("dashboard.html", "text/html; charset=utf-8"),
+                  "": ("dashboard.html", "text/html; charset=utf-8"),
+                  "/static/dashboard.js": ("dashboard.js", "text/javascript"),
+                  "/static/dashboard.css": ("dashboard.css", "text/css"),
+                  "/static/lightweight-charts.js": ("lightweight-charts.js", "text/javascript")}
+        try:
+            if path in assets:
+                name, content_type = assets[path]
+                return self._send((_DASH_STATIC / name).read_bytes(), content_type)
+            if path == "/gunbot/stats":
+                data = _dash_cached("account", 30, load_live_portfolio)
+            elif path == "/gunbot/saved-fills":
+                data = _dash_cached("saved-fills", 30, load_saved_fills)
+            elif path in ("/gunbot/trades", "/gunbot/history"):
+                offset = int(params.get("offset", ["0"])[0])
+                if not 0 <= offset <= 100000:
+                    raise ValueError("Invalid offset")
+                data = _dash_cached(("history", offset), 60, lambda: load_exchange_history(offset=offset))
+            elif path == "/gunbot/ohlc":
+                symbol = params.get("symbol", ["BTC/USD"])[0]
+                interval = int(params.get("interval", ["15"])[0])
+                if symbol not in _DASH_PAIRS or interval not in (1, 5, 15, 30, 60, 240, 1440):
+                    raise ValueError("Unsupported pair or timeframe")
+                data = _dash_cached((symbol, interval), 20, lambda: load_chart(symbol, interval))
+            elif path in ("/health", "/gunbot/health"):
+                data = {"dashboard": "read-only", "order_submission_enabled": False,
+                        "engine_status": dashboard_engine_observation()}
+            else:
+                return self._send("Not found", "text/plain", 404)
+            self._send(json.dumps(data, allow_nan=False), "application/json")
+        except Exception as exc:
+            self._send(json.dumps({"error": str(exc)}), "application/json", 400 if isinstance(exc, ValueError) else 502)
+
+
+def dashboard_engine_observation(process_text=None, log_path=None):
+    import subprocess
+    import shlex
+    result = {"state": "unknown", "coordinator_pids": [], "trading_verified": False,
+              "process_source": "ps -axo pid=,command=; exact python -m module match",
+              "log_modified_at": None,
+              "note": "Process presence and log modification do not prove healthy heartbeat or fills."}
+    try:
+        if process_text is None:
+            process_text = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True,
+                                          text=True, timeout=4, check=True).stdout
+        for line in process_text.splitlines():
+            try:
+                parts = shlex.split(line)
+                if len(parts) >= 4 and parts[2:4] == ["-m", "dublin_bot.coordinator"] and "python" in _Path(parts[1]).name.lower():
+                    result["coordinator_pids"].append(int(parts[0]))
+            except ValueError:
+                continue
+        result["state"] = "process observed" if result["coordinator_pids"] else "process not found"
+    except Exception as exc:
+        result["error"] = str(exc)
+    if log_path is not None:
+        log = _Path(log_path)
+    else:
+        live_log = _DASH_BASE / "logs" / "live_trading.log"
+        log = live_log if live_log.exists() else _DASH_BASE / "logs" / "coordinator.log"
+    result["log_source"] = str(log)
+    try:
+        result["log_modified_at"] = datetime.fromtimestamp(log.stat().st_mtime, timezone.utc).isoformat()
+    except OSError:
+        pass
+    return result
+
+
+class DashboardRedirectHandler(BaseHTTPRequestHandler):
+    """Legacy port is a redirect only: no second collector, no trading controls."""
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header("Location", "http://127.0.0.1:8766/gunbot")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_POST(self):
+        self.send_response(405)
+        self.send_header("Allow", "GET")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass

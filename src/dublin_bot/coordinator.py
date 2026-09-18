@@ -14,6 +14,7 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import signal
 import sys
 import time
@@ -22,7 +23,10 @@ from pathlib import Path
 
 from dublin_bot.config import Settings
 from dublin_bot.agents.trading_agent import TradingAgent
+
 from dublin_bot.agents.monitoring_agent import MonitoringAgent
+
+logger = logging.getLogger(__name__)
 
 
 class TradingSystem:
@@ -65,17 +69,27 @@ class TradingSystem:
         self.monitoring_agent.report_callback = self._dispatch_report
     
     def _dispatch_report(self, report: dict):
-        """Dispatch report to all callbacks."""
+        """Keep console reporting active when subscribers are registered."""
+        self._on_report(report)
         for cb in self._report_callbacks:
             try:
                 cb(report)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.error("Report callback failed (%s)", type(exc).__name__)
     
     def _on_report(self, report: dict):
         """Default report handler - prints to console."""
-        self._print_report(report)
+        # Individual confirmation events also reach subscribers; the complete
+        # cycle report owns console output so a fill is not printed twice.
+        if "stats" in report or "anomalies" in report:
+            self._print_summary(report)
     
+    @staticmethod
+    def _format_metric(value, *, percent=False):
+        if value is None:
+            return "unavailable"
+        return f"{value * 100:.1f}%" if percent else f"{value:.2f}"
+
     def _print_report(self, report: dict):
         """Print a human-readable report."""
         timestamp = report.get("timestamp", "unknown")
@@ -95,11 +109,12 @@ class TradingSystem:
             print(f"    Mode:       {trade.get('mode')}")
             print(f"    Status:     {trade.get('status')}")
             
-            if trade.get("pnl"):
-                pnl = trade["pnl"]
-                sign = "+" if pnl > 0 else ""
-                print(f"    PnL:        {sign}{pnl:.2f} ({sign}{trade.get('return_pct', 0):.2f}%)")
-                print(f"    RESULT:     {'WIN' if pnl > 0 else 'LOSS'}")
+            pnl = trade.get("pnl")
+            print(f"    PnL:        {self._format_metric(pnl)}")
+            if trade.get("return_pct") is not None:
+                print(f"    Return:     {trade['return_pct']:.2f}%")
+            if pnl is not None:
+                print(f"    RESULT:     {'WIN' if pnl > 0 else ('LOSS' if pnl < 0 else 'EVEN')}")
         
         if report.get("stats"):
             stats = report["stats"]
@@ -107,15 +122,12 @@ class TradingSystem:
             print(f"    Total trades:  {stats.get('total_confirmed_trades')}")
             print(f"    Wins:          {stats.get('wins')}")
             print(f"    Losses:        {stats.get('losses')}")
-            print(f"    Win rate:      {stats.get('win_rate', 0)*100:.1f}%")
-            print(f"    Total PnL:     {stats.get('total_pnl', 0):.2f}")
-            print(f"    Avg win:       {stats.get('average_win', 0):.2f}")
-            print(f"    Avg loss:      {stats.get('average_loss', 0):.2f}")
+            print(f"    Win rate:      {self._format_metric(stats.get('win_rate'), percent=True)}")
+            print(f"    Total PnL:     {self._format_metric(stats.get('total_pnl'))}")
+            print(f"    Avg win:       {self._format_metric(stats.get('average_win'))}")
+            print(f"    Avg loss:      {self._format_metric(stats.get('average_loss'))}")
         
-        if report.get("anomalies"):
-            print(f"\n!!! ANOMALIES !!!")
-            for a in report["anomalies"]:
-                print(f"    - {a}")
+        self._print_issues(report)
         
         print(f"{'='*60}\n")
     
@@ -150,10 +162,8 @@ class TradingSystem:
         while self._running:
             try:
                 # Get report from monitoring agent (which checks trading agent)
-                report = self.monitoring_agent.force_check()
-                
-                # Print summary
-                self._print_summary(report)
+                # The monitoring callback owns console output for both loops.
+                self.monitoring_agent.force_check()
                 
             except Exception as e:
                 print(f"ERROR in trading loop: {e}")
@@ -163,24 +173,46 @@ class TradingSystem:
             # Wait before next cycle
             time.sleep(self.check_interval)
     
+    def _print_issues(self, report: dict):
+        """Print each anomaly or blocked execution reason once per report."""
+        issues = list(report.get("anomalies") or [])
+        decision = report.get("agent_decision") or {}
+        result = decision.get("order_result") or {}
+        if result.get("error"):
+            issues.append(result["error"])
+        if not decision.get("executed") and decision.get("best_reason"):
+            issues.append(decision["best_reason"])
+        risk = decision.get("risk") or {}
+        if risk.get("allowed") is False and risk.get("reason"):
+            issues.append(risk["reason"])
+        for item in decision.get("decisions") or []:
+            if item.get("error"):
+                issues.append(item["error"])
+            elif item.get("signal") in {"HALT", "BLOCKED", "NO_DATA"} and item.get("reason"):
+                issues.append(item["reason"])
+        mode = "PAPER" if report.get("paper_trading") else "LIVE"
+        for issue in dict.fromkeys(issues):
+            print(f"[{mode}] ALERT: {issue}")
+
     def _print_summary(self, report: dict):
         """Print a quick summary (not full report every time)."""
+        self._print_issues(report)
         mode = "PAPER" if report.get("paper_trading") else "LIVE"
-        position = report.get("last_trade", {}).get("symbol", "NONE")
-        action = report.get("last_trade", {}).get("action", "-")
+        last_trade = report.get("last_trade") or {}
+        position = last_trade.get("symbol", "NONE")
+        action = last_trade.get("action", "-")
         
         # Only print if something happened
         if report.get("last_confirmed_trade"):
             trade = report["last_confirmed_trade"]
-            pnl = trade.get("pnl", 0)
-            sign = "+" if pnl > 0 else ""
-            result = "WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "EVEN")
-            print(f"[{mode}] {trade.get('action')} {trade.get('symbol')} @ {trade.get('price')} | PnL: {sign}{pnl:.2f} | {result}")
+            pnl = trade.get("pnl")
+            result = "" if pnl is None else ("WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "EVEN"))
+            print(f"[{mode}] {trade.get('action')} {trade.get('symbol')} @ {trade.get('price')} | PnL: {self._format_metric(pnl)} | {result}")
         
         # Print periodic stats
         stats = report.get("stats", {})
         if stats.get("total_confirmed_trades", 0) % 5 == 0 and stats.get("total_confirmed_trades", 0) > 0:
-            print(f"[{mode}] Stats: {stats.get('wins')}W/{stats.get('losses')}L | Win rate: {stats.get('win_rate', 0)*100:.1f}% | PnL: {stats.get('total_pnl', 0):.2f}")
+            print(f"[{mode}] Stats: {stats.get('wins')}W/{stats.get('losses')}L | Win rate: {self._format_metric(stats.get('win_rate'), percent=True)} | PnL: {self._format_metric(stats.get('total_pnl'))}")
     
     def stop(self):
         """Stop the trading system."""

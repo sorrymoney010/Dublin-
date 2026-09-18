@@ -1,15 +1,13 @@
 """
 Multi-symbol market data adapter for the rotation strategy.
 
-Wraps a KrakenGateway to fetch bars for multiple symbols by temporarily
-reconfiguring the gateway's symbol resolution for each call.
-
-The Kraken gateway's get_bars() uses settings.symbol internally, so we
-need to switch symbols between calls to scan the full universe.
+Wraps a KrakenGateway with per-call settings views to fetch multiple symbols.
+The shared gateway settings are never mutated while another caller uses them.
 """
 
 from __future__ import annotations
 
+from copy import copy
 from typing import Optional
 
 from dublin_bot.kraken_gateway import KrakenGateway, SymbolMeta
@@ -20,14 +18,24 @@ class MultiSymbolGateway:
     """
     Wraps KrakenGateway to support multi-symbol bar fetching.
     
-    Temporarily swaps the settings.symbol to fetch each coin's bars,
-    then restores the original symbol.
+    Uses a symbol-scoped copy to fetch each coin without changing shared settings.
     """
 
     def __init__(self, gateway: KrakenGateway, settings: Settings):
         self.gateway = gateway
         self.settings = settings
         self._original_symbol = settings.symbol
+
+    def for_symbol(self, symbol: str):
+        """Bind one call without mutating shared gateway settings or metadata.
+
+        The transport, nonce generator and rate limiter stay shared; symbol and
+        last-fill state belong to this view. Do not use a view as ownership proof.
+        """
+        scoped = copy(self.gateway)
+        scoped.settings = copy(self.gateway.settings)
+        scoped.settings.symbol = symbol
+        return scoped
 
     def get_bars_for(self, symbol: str) -> Optional[object]:
         """
@@ -39,20 +47,12 @@ class MultiSymbolGateway:
         Returns:
             pandas DataFrame with OHLCV data, or None on failure
         """
-        original = self.settings.symbol
         try:
-            self.settings.symbol = symbol
-            # Force metadata reload for the new symbol
-            self.gateway._meta = {}
-            bars = self.gateway.get_bars(validate=False)
-            return bars
+            return self.for_symbol(symbol).get_bars(validate=False)
         except Exception as e:
             # Log but don't crash - just return None for this symbol
             print(f"Warning: Failed to fetch bars for {symbol}: {e}")
             return None
-        finally:
-            # Always restore original symbol
-            self.settings.symbol = original
 
     def get_bars_for_all(self, symbols: list[str]) -> dict[str, Optional[object]]:
         """
@@ -80,17 +80,11 @@ class MultiSymbolGateway:
         Returns:
             Ticker dict with bid/ask/last/volume, or None on failure
         """
-        original = self.settings.symbol
         try:
-            self.settings.symbol = symbol
-            self.gateway._meta = {}
-            ticker = self.gateway.get_ticker()
-            return ticker
+            return self.for_symbol(symbol).get_ticker()
         except Exception as e:
             print(f"Warning: Failed to fetch ticker for {symbol}: {e}")
             return None
-        finally:
-            self.settings.symbol = original
 
     def get_current_prices(self, symbols: list[str]) -> dict[str, float]:
         """

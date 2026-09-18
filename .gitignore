@@ -17,12 +17,12 @@ logs/*.sqlite3-wal
 .DS_Store
 
 # acurast CEO SaaS (unrelated to Dublin trading bot)
+.acurast/
+_acurast_new/
 _acurast_deploy/
 src/acurast_ceo/
 acurast_data/
 tests/test_acurast_ceo.py
 
-# runtime log churn (dashboard traces, not source)
-logs/dashboard.log
-logs/dashboard.err.log
-logs/dashboard.out.log
+# Runtime state and diagnostics stay on disk, never in source control.
+/logs/

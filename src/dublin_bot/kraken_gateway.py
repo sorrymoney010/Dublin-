@@ -34,6 +34,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import fcntl
+import os
+import tempfile
+from contextlib import contextmanager
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -111,6 +115,26 @@ class SymbolMeta:
             "cost_min": str(self.cost_min),
             "status": self.status,
         }
+
+
+@contextmanager
+def private_request_lock(api_key):
+    """Same OS user + API key, independent of checkout/nonce-file location.
+
+    flock is held from before nonce allocation through response decoding. Never
+    unlink this lock inode, and never reset the separate nonce high-water ledger.
+    Other signers must adopt this same lock protocol before deployment.
+    """
+    directory = Path.home() / ".dublin" / "private-request-locks"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = directory / (hashlib.sha256(api_key.encode()).hexdigest() + ".lock")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield path.with_suffix(".nonce")
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 class KrakenGateway:
@@ -273,18 +297,40 @@ class KrakenGateway:
 
         def call() -> dict:
             self._limiter.acquire_private(endpoint)
-            # A fresh nonce per attempt is mandatory: replaying a nonce after a
-            # timeout is itself an EAPI:Invalid nonce failure.
-            body = dict(params or {})
-            body["nonce"] = str(self._nonce.next())
-            headers = {
-                "API-Key": self._api_key,
-                "API-Sign": self._sign(urlpath, body),
-                "Content-Type": "application/x-www-form-urlencoded",
-            }
-            return self._request("POST", url, data=body, headers=headers)
+            with private_request_lock(self._api_key) as highwater:
+                # A fresh nonce per attempt is mandatory: replaying a nonce after a
+                # timeout is itself an EAPI:Invalid nonce failure.
+                body = dict(params or {})
+                previous = int(highwater.read_text()) if highwater.exists() else 0
+                if previous < 0:
+                    raise AuthenticationError("Corrupt shared nonce watermark")
+                nonce = max(self._nonce.next(), previous + 1)
+                # Preserve the configured NonceGenerator ledger AND add a
+                # key-scoped high-water for signers in different checkouts.
+                # Persist before sending; any I/O failure prevents dispatch.
+                fd, name = tempfile.mkstemp(dir=highwater.parent, prefix=".nonce-")
+                try:
+                    with os.fdopen(fd, "w") as out:
+                        out.write(str(nonce)); out.flush(); os.fsync(out.fileno())
+                    os.replace(name, highwater)
+                    directory = os.open(highwater.parent, os.O_RDONLY)
+                    try: os.fsync(directory)
+                    finally: os.close(directory)
+                finally:
+                    if os.path.exists(name): os.unlink(name)
+                body["nonce"] = str(nonce)
+                headers = {
+                    "API-Key": self._api_key,
+                    "API-Sign": self._sign(urlpath, body),
+                    "Content-Type": "application/x-www-form-urlencoded",
+                }
+                return self._request("POST", url, data=body, headers=headers)
 
-        return self._with_retries(f"private:{endpoint}", call)
+        # Unknown endpoints are mutations until explicitly classified read-only.
+        reads = {"Balance", "BalanceEx", "TradeBalance", "OpenOrders", "ClosedOrders",
+                 "QueryOrders", "TradesHistory", "QueryTrades", "Ledgers", "QueryLedgers",
+                 "TradeVolume", "OpenPositions", "GetApiKeyInfo"}
+        return self._with_retries(f"private:{endpoint}", call) if endpoint in reads else call()
 
     # ── symbol metadata ──────────────────────────────────────
 
