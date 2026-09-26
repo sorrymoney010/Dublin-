@@ -60,7 +60,7 @@ def main() -> None:
     safe = args.symbol.replace("/", "-")
     tagged = write_deploy(report, Path(f"logs/wfo_deploy_{safe}.json"))
     h = report["holdout"]
-    print(f"target bot      : 70815a54-2ca8-4b85-9474-d90be603bcbd")
+    print("target bot      : 70815a54-2ca8-4b85-9474-d90be603bcbd")
     print(f"symbol          : {args.symbol}")
     print(f"folds           : {report['n_folds']}")
     print(f"OOS trades/fold : {report['oos_trades']}")
