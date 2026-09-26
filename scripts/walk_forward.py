@@ -1,6 +1,6 @@
-"""Walk-forward CLI. No orders.
+"""Walk-forward CLI. Default target: PUMP/USD. No orders.
 
-    PYTHONPATH=src:. python scripts/walk_forward.py --symbol XRP/USD --days 365 --interval 60
+    PYTHONPATH=src:. python scripts/walk_forward.py --symbol PUMP/USD --days 365 --interval 60
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from dublin_bot.walk_forward import run_walk_forward, write_deploy
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Walk-forward optimizer (stitched OOS curve)")
-    ap.add_argument("--symbol", default="XRP/USD")
+    ap.add_argument("--symbol", default="PUMP/USD")
     ap.add_argument("--days", type=int, default=365)
     ap.add_argument("--interval", type=int, default=60, help="minutes")
     ap.add_argument("--equity", type=float, default=1000.0)
@@ -57,7 +57,10 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2))
     deploy = write_deploy(report)
+    safe = args.symbol.replace("/", "-")
+    tagged = write_deploy(report, Path(f"logs/wfo_deploy_{safe}.json"))
     h = report["holdout"]
+    print(f"target bot      : 70815a54-2ca8-4b85-9474-d90be603bcbd")
     print(f"symbol          : {args.symbol}")
     print(f"folds           : {report['n_folds']}")
     print(f"OOS trades/fold : {report['oos_trades']}")
@@ -69,7 +72,7 @@ def main() -> None:
     print(f"holdout Sharpe  : {h['sharpe']:.2f}  DD {h['max_dd']*100:.1f}%  trades {h['n_trades']}")
     print(f"deploy params   : {report['deploy_params']}")
     print(f"verdict         : {report['verdict']}")
-    print(f"wrote           : {out}  {deploy}")
+    print(f"wrote           : {out}  {deploy}  {tagged}")
     if report["verdict"] in {"DO_NOT_DEPLOY", "FOLDS_TOO_THIN"}:
         sys.exit(2)
 
