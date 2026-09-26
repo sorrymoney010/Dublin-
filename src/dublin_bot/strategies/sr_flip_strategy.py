@@ -186,7 +186,7 @@ class SRFlipStrategy:
 
             # Find first bar that clearly broke above resistance.
             broke_i: Optional[int] = None
-            for j, (ph, pc) in enumerate(zip(post_high, post_close)):
+            for j, (ph, pc) in enumerate(zip(post_high, post_close, strict=False)):
                 if _break_ok(float(max(ph, pc)), level, atr, min_atr, min_pct, above=True):
                     broke_i = j
                     break
@@ -235,7 +235,7 @@ class SRFlipStrategy:
         # Fresh resistance break on the current bar (no retest required):
         # prior close at/below a confirmed pivot high, current close clearly above.
         prior = float(close[-2])
-        for idx, level in reversed(piv_h):
+        for _idx, level in reversed(piv_h):
             if prior <= level < price and _break_ok(price, level, atr, min_atr, min_pct, above=True):
                 stop_price = max(0.0, level - atr * float(s.atr_stop_multiplier))
                 return Signal(

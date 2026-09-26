@@ -9,7 +9,6 @@ import pytest
 from dublin_bot.config import Settings
 from dublin_bot.indicators import (
     adx_trend_allowed,
-    compute_adx,
     enrich,
     fee_edge_ok,
 )
@@ -243,7 +242,7 @@ def test_momentum_allows_when_adx_trending_and_edge_ok():
 
 
 def test_settings_reject_inverted_adx_bands():
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         _settings(adx_enter_above=15.0, adx_exit_below=20.0)
 
 

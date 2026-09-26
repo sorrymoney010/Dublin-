@@ -66,7 +66,7 @@ def load(symbol: str, tf: int) -> tuple[pd.DataFrame, str]:
 
 
 def fmt_row(cols: list, widths: list[int]) -> str:
-    return " ".join(str(c).rjust(w) if i else str(c).ljust(w) for i, (c, w) in enumerate(zip(cols, widths)))
+    return " ".join(str(c).rjust(w) if i else str(c).ljust(w) for i, (c, w) in enumerate(zip(cols, widths, strict=False)))
 
 
 def main() -> None:

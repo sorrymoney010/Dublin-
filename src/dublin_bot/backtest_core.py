@@ -171,7 +171,7 @@ def simulate(d: pd.DataFrame, spec: Spec, costs: Costs) -> list[Trade]:
     """Replay one strategy over an indicator-enriched frame."""
     p = spec.params
     n = len(d)
-    o, h, l, c = (d[k].to_numpy(float) for k in ("open", "high", "low", "close"))
+    o, h, l, c = (d[k].to_numpy(float) for k in ("open", "high", "low", "close"))  # noqa: E741
     v = d["volume"].to_numpy(float)
     t = d["time"].to_numpy()
     atr = d["atr"].to_numpy(float)

@@ -75,7 +75,6 @@ def test_detect_breakout_fires_on_high_and_volume():
     n = 30
     closes = np.full(n, 100.0)
     closes[-1] = 105.0  # breakout close
-    highs_extra = np.zeros(n)
     # Prior bars: high capped near 101 (close*1.001 + 0)
     vols = np.full(n, 1000.0)
     vols[-1] = 2500.0  # > avg

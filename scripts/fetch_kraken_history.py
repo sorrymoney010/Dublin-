@@ -143,7 +143,7 @@ def cmd_trades(symbols: list[str], days: int, pause: float) -> None:
         stop_at = time.time() - 900  # stop once within the last 15m
         print(f"{sym}: paging trades from {pd.to_datetime(cursor, unit='ns')} UTC", flush=True)
 
-        def flush(final: bool = False) -> None:
+        def flush(final: bool = False, buckets=buckets, sym=sym) -> None:
             if not buckets:
                 return
             keys = sorted(buckets)
