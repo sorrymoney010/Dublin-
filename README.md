@@ -13,12 +13,21 @@ transparent decisions, and testable strategies with a native Kraken Spot connect
 |---|---|
 | [SAFETY.md](SAFETY.md) | Safety model, residual risks, pre-live checklist |
 | [RUNBOOK.md](RUNBOOK.md) | Daily operation, incident response, state files |
+| [docs/WALKFORWARD.md](docs/WALKFORWARD.md) | Fee-aware walk-forward backtest, adaptive learner, current paper config |
+| [docs/MEANREV_SLEEVE.md](docs/MEANREV_SLEEVE.md) | 4h mean-reversion paper sleeve (limit entries) running beside regime_trend |
 
 ## Current scope
 
 - **Kraken Spot** native connector (Alpaca retained as fallback)
 - BTC/USD first, with a reusable multi-asset architecture
 - $25 strategy budget by default; dollar-notional sizing
+- Conservative risk defaults: `RISK_PER_TRADE=0.01` (alias `RISK_PCT`),
+  `MAX_POSITION_FRACTION=0.25`, `MAX_LEVERAGE=1.0` (sizer cap, spot only),
+  `MARGIN_EXPOSURE_FRACTION=0`
+- Paper loop runs two sleeves on one paper book: `regime_trend@1h` plus a 4h
+  mean-reversion sleeve with post-only limit entries on BTC/ETH/SOL
+  (see docs/MEANREV_SLEEVE.md). Shared max-positions and risk caps, and no
+  symbol collisions between sleeves
 - No leverage, no shorting, **no withdrawal access**
 - Trend + breakout confirmation with ATR-based risk sizing
 - Daily loss, drawdown, cooldown, and order-count circuit breakers
@@ -81,7 +90,7 @@ ruff check .     # lint the complete project
 pytest -q        # run the complete offline test suite
 ```
 
-Current verified result: **392 tests passed**. The suite is fully offline — no
+Current verified result: **489 tests passed**. The suite is fully offline — no
 network calls, no real orders.
 `tests/test_safety_locks.py` fails loudly if the trading locks are relaxed.
 

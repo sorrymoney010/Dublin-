@@ -14,6 +14,11 @@ def test_safe_defaults_are_paper_and_dry_run():
     assert settings.monitor_interval_seconds == 900
     assert settings.cooldown_minutes == 10
     assert settings.rapid_mode is True
+    # Conservative risk defaults (ported from the Dublin repo).
+    assert settings.max_leverage == 1.0
+    assert settings.margin_exposure_fraction == 0.0
+    assert settings.risk_per_trade == 0.01
+    assert settings.max_position_fraction == 0.25
 
 
 def test_live_mode_requires_explicit_acknowledgement():

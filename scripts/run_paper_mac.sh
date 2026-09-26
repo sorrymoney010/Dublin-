@@ -27,6 +27,10 @@ export PAPER_MAKER_FEE_BPS=25
 export LEARNER_GATE_ENABLED=true
 export LEARNER_MIN_SAMPLE=8
 export LEARNER_BENCH_HOURS=72
+# Second PAPER sleeve: 4h mean reversion with post-only limit entries on
+# BTC/ETH/SOL (walk-forward meanrev_mk@240m; small sample — experiment only).
+# Shares the $500 book, max 3 positions and the risk caps with regime_trend.
+export MEANREV_SLEEVE_ENABLED=true
 # Unset any mangled list envs so Settings reads clean JSON from .env file
 unset COIN_BASKET BREAKOUT_SYMBOLS UNIVERSE_ALLOWLIST LIVE_READY_UNIVERSE
 exec /Users/musicmancheef/mayo-bot/.venv/bin/python /Users/musicmancheef/mayo-bot/scripts/paper_trader_loop.py

@@ -85,6 +85,12 @@ trades) and +92 bps at 4h (10 trades) — unconfirmed.
 BTC/ETH/SOL, max 3 positions, 1% risk, $500 paper book (`PAPER_USE_LEDGER_EQUITY=true`),
 paper fill model 40/25 bps + 10 bps slippage.
 
+**Second paper sleeve (added 2026-09-26):** `meanrev_mk@240m`: 4h mean reversion with
+post-only limit entries on BTC/ETH/SOL (RSI≤38 & close<EMA50, limit 0.1% under the close valid
+one bar then expires, exit RSI≥55 or close≥EMA50, 3% stop, 25% TP). It shares the book, the
+max-positions and risk caps, and the learner (scored separately by key) with the regime sleeve. See
+[MEANREV_SLEEVE.md](MEANREV_SLEEVE.md). BTC+ETH+SOL OOS: 17 trades, ≈ +121 bps/trade. That is a small sample.
+
 ## Adaptive learner (`learner.gate`)
 
 * Every paper exit is recorded with its cost basis → net bps after fees, tagged with the strategy

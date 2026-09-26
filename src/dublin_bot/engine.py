@@ -322,7 +322,31 @@ class TradingEngine:
         return self.gateway.account_equity()
 
     def _open_bot_position_count(self) -> int:
-        return sum(1 for qty in self._bot_qty.values() if float(qty) > 1e-9)
+        """Held lots (every sleeve) plus other sleeves' resting paper orders."""
+        held = {sym for sym, qty in self._bot_qty.items() if float(qty) > 1e-9}
+        return len(held) + len(set(self._foreign_pending()) - held)
+
+    # ── multi-sleeve paper ownership (see sleeve_registry) ────
+    def _sleeve_registry(self):
+        """Paper-only registry of lots/orders owned by OTHER paper sleeves."""
+        if not (self.settings.paper_trading or self.settings.dry_run):
+            return None
+        try:
+            from .sleeve_registry import SleeveRegistry
+            return SleeveRegistry()
+        except Exception:
+            return None
+
+    def _foreign_symbols(self) -> set[str]:
+        """Symbols held or pending by another paper sleeve (never ours to trade)."""
+        from .sleeve_registry import PRIMARY
+        reg = self._sleeve_registry()
+        return reg.foreign_symbols(PRIMARY) if reg is not None else set()
+
+    def _foreign_pending(self) -> dict[str, dict]:
+        from .sleeve_registry import PRIMARY
+        reg = self._sleeve_registry()
+        return reg.foreign_pending(PRIMARY) if reg is not None else {}
 
     def _breakout_universe(self) -> list[str]:
         """Canonical BTC/ETH/SOL (or configured) list for the breakout sleeve."""
@@ -391,7 +415,12 @@ class TradingEngine:
         universe = self._breakout_universe()
         if not universe:
             return
-        held = [sym for sym, qty in self._bot_qty.items() if float(qty) > 1e-9]
+        held_all = [sym for sym, qty in self._bot_qty.items() if float(qty) > 1e-9]
+        # Lots / resting orders owned by another paper sleeve (e.g. meanrev_4h)
+        # are never exited, monitored, or entered by this engine, but they DO
+        # count toward the shared concurrent-position cap.
+        foreign = self._foreign_symbols()
+        held = [sym for sym in held_all if sym not in foreign]
         # 1) Exit priority: any held name that hit stop/TP.
         for sym in held:
             saved = s.symbol
@@ -416,7 +445,7 @@ class TradingEngine:
                 return  # s.symbol already set to sym
             s.symbol = saved
 
-        open_n = len(held)
+        open_n = self._open_bot_position_count()
         max_n = int(getattr(s, "max_concurrent_positions", 3) or 3)
 
         # 2) Room for a new entry — scan non-held names for BUY breakouts.
@@ -425,10 +454,11 @@ class TradingEngine:
             cap = equity * s.max_position_fraction
             candidates = [
                 sym for sym in universe
-                if sym not in held and self._can_size(sym, cap)
+                if sym not in held_all and sym not in foreign and self._can_size(sym, cap)
             ]
             if not candidates:
-                candidates = [sym for sym in universe if sym not in held]
+                candidates = [sym for sym in universe
+                              if sym not in held_all and sym not in foreign]
             best_sym: str | None = None
             best_score = -1.0
             saved = s.symbol
@@ -478,9 +508,11 @@ class TradingEngine:
             s.symbol = held_sorted[0]
             return
 
-        # 4) Flat — default to first universe symbol so bars/gates still run.
-        if s.symbol not in universe:
-            s.symbol = universe[0]
+        # 4) Flat — default to first universe symbol so bars/gates still run
+        #    (skipping symbols another sleeve owns).
+        free = [sym for sym in universe if sym not in foreign]
+        if s.symbol not in universe or s.symbol in foreign:
+            s.symbol = free[0] if free else universe[0]
 
     def _select_symbol(self) -> None:
         """Autonomously pick the best tradeable coin for THIS cycle.
@@ -968,6 +1000,17 @@ class TradingEngine:
             if in_position and (self.settings.paper_trading or self.settings.dry_run):
                 signal = self._apply_paper_protective_exit(signal, bars)
 
+            # Multi-sleeve guard: a lot / resting order owned by another paper
+            # sleeve is never traded here (no entry, no exit, no stop/TP).
+            foreign = self._foreign_symbols()
+            if self.settings.symbol in foreign:
+                in_position = False
+                signal = Signal(
+                    Action.WAIT, 0,
+                    f"{self.settings.symbol} is owned by another paper sleeve; primary skips it",
+                    signal.price, signal.atr,
+                )
+
             # Gate 5.5 — sentiment confirmation filter (Stage 1).
             # Sentiment never originates a trade; it only (a) blocks a fresh BUY when
             # the coin's mood is bearish, and (b) forces a protective SELL when mood
@@ -1103,6 +1146,9 @@ class TradingEngine:
             # Aggregate every bot-owned spot lot, not merely the currently
             # selected symbol. Kraken execution is permanently spot-only.
             open_exposure = self._bot_open_exposure_usd()
+            # Other paper sleeves' resting limit orders count as exposure.
+            open_exposure += sum(float(p.get("notional", 0.0) or 0.0)
+                                 for p in self._foreign_pending().values())
         except Exception:
             # Margin/positions endpoint errors must never block trading or
             # crash the cycle — exposure is advisory (risk still caps per-trade).
