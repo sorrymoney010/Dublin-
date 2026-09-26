@@ -19,9 +19,15 @@ transparent decisions, and testable strategies with a native Kraken Spot connect
 - **Kraken Spot** native connector (Alpaca retained as fallback)
 - BTC/USD first, with a reusable multi-asset architecture
 - $25 strategy budget by default; dollar-notional sizing
-- No leverage, no shorting, **no withdrawal access**
-- Trend + breakout confirmation with ATR-based risk sizing
+- No leverage, no shorting, **no withdrawal access** (spot-only; the sizer's
+  `MAX_LEVERAGE` cap defaults to 1.0 = never size above 1x equity)
+- Default strategy `STRATEGY=momentum` (trend + breakout confirmation,
+  `TrendBreakoutStrategy`) with ATR-based risk sizing; `mean_reversion` is opt-in
+- Default universe `UNIVERSE_MODE=basket`: only the fixed `COIN_BASKET`
+  allowlist is traded; `all_usd` (scan every Kraken */USD pair) is opt-in
 - Daily loss, drawdown, cooldown, and order-count circuit breakers
+  (defaults: 1% risk/trade, 25% max position, 3 orders/day, 15-min cooldown,
+  3% daily loss, 10% drawdown — see SAFETY.md §5)
 - Market-data freshness validation and exchange clock-skew detection
 - Exchange precision and minimum-order enforcement (`Decimal`, round-down)
 - Strictly monotonic, restart-safe nonces; client-side rate limiting
@@ -42,8 +48,8 @@ safety locks → market data → freshness → market quality → strategy
 ## Setup on macOS
 
 ```bash
-git clone https://github.com/sorrymoney010/mayo-bot.git
-cd mayo-bot
+git clone https://github.com/sorrymoney010/Dublin-.git
+cd Dublin-
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
@@ -81,7 +87,7 @@ ruff check .     # lint the complete project
 pytest -q        # run the complete offline test suite
 ```
 
-Current verified result: **392 tests passed**. The suite is fully offline — no
+Current verified result: **410 tests passed**. The suite is fully offline — no
 network calls, no real orders.
 `tests/test_safety_locks.py` fails loudly if the trading locks are relaxed.
 
