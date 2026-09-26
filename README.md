@@ -87,7 +87,7 @@ ruff check .     # lint the complete project
 pytest -q        # run the complete offline test suite
 ```
 
-Current verified result: **410 tests passed**. The suite is fully offline — no
+Current verified result: **472 tests passed**. The suite is fully offline — no
 network calls, no real orders.
 `tests/test_safety_locks.py` fails loudly if the trading locks are relaxed.
 
