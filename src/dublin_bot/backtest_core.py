@@ -102,6 +102,26 @@ def regime_signals(d: pd.DataFrame, p: dict) -> dict[str, np.ndarray]:
             "chandelier": chandelier, "chandelier_exit": close < chandelier}
 
 
+def meanrev_signals(d: pd.DataFrame, p: dict) -> dict[str, np.ndarray]:
+    """Per-bar entry/exit arrays for the mean-reversion family.
+
+    Shared by the backtester (family "meanrev" / "meanrev_mk") and the live
+    paper ``MeanReversion4hStrategy`` so both evaluate the identical rule set
+    on CLOSED bars:
+
+    * entry: RSI(14) <= ``rsi_os`` AND close < EMA(``ema``, default 50)
+    * exit ("reverted"): RSI(14) >= ``rsi_exit`` OR close >= EMA
+    """
+    n_ema = int(p.get("ema", 50))
+    ema = d["ema50"] if n_ema == 50 and "ema50" in d else _ema(d["close"], n_ema)
+    close = d["close"].to_numpy(float)
+    ema_a = ema.to_numpy(float)
+    rsi = d["rsi"].to_numpy(float)
+    entry = (rsi <= float(p.get("rsi_os", 38.0))) & (close < ema_a)
+    exit_ = (rsi >= float(p.get("rsi_exit", 55.0))) | (close >= ema_a)
+    return {"entry": entry, "exit": exit_, "ema": ema_a, "rsi": rsi}
+
+
 def classify_adx_regime(bars: pd.DataFrame, enter: float = 25.0, exit_: float = 20.0) -> str:
     """'trend' | 'chop' | 'volatile_chop' for the last closed bar (learner key)."""
     if bars is None or len(bars) < 60:
@@ -184,6 +204,7 @@ def simulate(d: pd.DataFrame, spec: Spec, costs: Costs) -> list[Trade]:
     prior_high = d["high"].shift(1).rolling(lb).max().to_numpy(float)
     vol_avg = d["volume"].shift(1).rolling(lb).mean().to_numpy(float)
     rsig = regime_signals(d, p) if spec.name == "regime" else None
+    msig = meanrev_signals(d, p) if spec.name == "meanrev" else None
 
     warm = 210
     trades: list[Trade] = []
@@ -201,8 +222,9 @@ def simulate(d: pd.DataFrame, spec: Spec, costs: Costs) -> list[Trade]:
         elif spec.name == "regime":
             sig = bool(rsig["entry"][i])
         elif spec.name == "meanrev":
-            # Mirrors strategy.MeanReversionStrategy: RSI washed out AND below slow EMA.
-            sig = rsi[i] <= p.get("rsi_os", 38.0) and c[i] < ema50[i]
+            # RSI washed out AND below slow EMA (shared with the live
+            # MeanReversion4hStrategy via ``meanrev_signals``).
+            sig = bool(msig["entry"][i])
         else:
             raise ValueError(spec.name)
         if not sig or not math.isfinite(atr[i]):
@@ -253,9 +275,7 @@ def simulate(d: pd.DataFrame, spec: Spec, costs: Costs) -> list[Trade]:
             sig_exit = False
             if spec.name == "momentum" and c[j] < ema50[j]:
                 sig_exit, reason = True, "below_ema50"
-            elif spec.name == "meanrev" and (
-                rsi[j] >= p.get("rsi_exit", 55.0) or c[j] >= ema50[j]
-            ):
+            elif spec.name == "meanrev" and msig["exit"][j]:
                 sig_exit, reason = True, "reverted"
             elif spec.name == "regime":
                 # Stateless chandelier (same rule the live RegimeTrendStrategy

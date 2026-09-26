@@ -138,6 +138,29 @@ class Settings(BaseSettings):
     regime_lookback: int = Field(default=20, ge=2)
     regime_atr_mult: float = Field(default=3.0, gt=0)
     regime_min_atr_rank: float = Field(default=0.0, ge=0.0, le=1.0)
+    # ── 4h mean-reversion sleeve (PAPER ONLY, second sleeve) ──────
+    # Runs in the same paper loop as the primary (e.g. regime_trend@1h)
+    # sleeve. Parameters are the walk-forward default spec that was selected
+    # in every fold for BTC/ETH/SOL at 240m ("meanrev_mk": RSI<=38 & close <
+    # EMA50, resting limit 0.1% under the signal close valid for ONE bar, exit
+    # RSI>=55 or close>=EMA50, 3% stop, 25% TP). See docs/MEANREV_SLEEVE.md.
+    # The sleeve never submits exchange orders; it is disabled whenever any
+    # safety lock is off (paper_trading/dry_run/allow_live_trading).
+    meanrev_sleeve_enabled: bool = Field(default=True)
+    meanrev_symbols: list[str] = Field(
+        default_factory=lambda: ["BTC/USD", "ETH/USD", "SOL/USD"]
+    )
+    meanrev_timeframe_minutes: int = Field(default=240, ge=15)
+    meanrev_rsi_entry: float = Field(default=38.0, gt=0, lt=100)
+    meanrev_rsi_exit: float = Field(default=55.0, gt=0, lt=100)
+    meanrev_ema_period: int = Field(default=50, ge=5)
+    meanrev_stop_pct: float = Field(default=0.03, gt=0, le=0.2)
+    meanrev_take_profit_pct: float = Field(default=0.25, gt=0, le=1.0)
+    meanrev_limit_offset_pct: float = Field(default=0.001, ge=0.0, le=0.02)
+    # Paper limit order lifetime in bars of meanrev_timeframe_minutes. An
+    # unfilled limit EXPIRES (it never converts to a market order).
+    meanrev_limit_valid_bars: int = Field(default=1, ge=1, le=6)
+    meanrev_state_path: Path = Path("logs/meanrev_sleeve.json")
     # ── Sentiment agent (Stage 1) ──────────────────────────────
     # When enabled, live news/Reddit sentiment acts as a confirmation filter:
     # bearish mood blocks fresh BUYs, a collapse forces a protective SELL. It
@@ -201,15 +224,24 @@ class Settings(BaseSettings):
     # Legacy compatibility setting only. Kraken execution is permanently spot-only;
     # the gateway strips leverage from every submitted order.
     margin_enabled: bool = Field(default=False)
-    max_leverage: float = Field(default=2.0, gt=0, le=5.0)
-    margin_exposure_fraction: float = Field(default=0.25, gt=0, le=0.5)
+    # Conservative defaults ported from the Dublin repo (sorrymoney010/Dublin-).
+    # max_leverage is NOT exchange leverage. It is only the cap the vol-target
+    # sizer (dublin_bot.sizing) applies to its vol scale and target notional
+    # (notional <= equity * max_leverage). 1.0 = never size above 1x equity,
+    # which matches spot-only execution.
+    max_leverage: float = Field(default=1.0, gt=0, le=5.0)
+    # Only read by RiskManager when margin_enabled=True (legacy; margin is
+    # never used on Kraken). Default 0 so enabling margin by accident caps
+    # exposure at zero instead of silently allowing 25%.
+    margin_exposure_fraction: float = Field(default=0.0, ge=0, le=0.5)
+    # RISK_PCT is kept as an alias for RISK_PER_TRADE.
     risk_per_trade: float = Field(
-        default=0.02,
+        default=0.01,
         gt=0,
         le=0.02,
         validation_alias=AliasChoices("RISK_PER_TRADE", "RISK_PCT"),
     )
-    max_position_fraction: float = Field(default=0.40, gt=0, le=0.5)
+    max_position_fraction: float = Field(default=0.25, gt=0, le=0.5)
     # Vol-target / fractional-Kelly sizing (see dublin_bot.sizing).
     target_vol: float = Field(default=0.12, gt=0, le=1.0)
     kelly_fraction: float = Field(default=0.25, gt=0, le=0.5)

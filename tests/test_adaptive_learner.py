@@ -33,7 +33,7 @@ def test_bench_at_min_sample_negative_expectancy(tmp_path):
     _trades(la, "BTC/USD", [-100] * 6 + [150, -50])  # mean -68.75 over 8
     d = la.gate("BTC/USD", now=2_000_000)
     assert d.allow is False and d.state == "benched" and d.size_mult == 0.0
-    assert "BTC/USD" in la.benches
+    assert la.bench_for("BTC/USD") is not None
     # persists across reload
     la2 = _agent(tmp_path)
     assert la2.gate("BTC/USD", now=2_000_100).allow is False
@@ -66,7 +66,7 @@ def test_bench_expiry_probation_then_rebench_or_clear(tmp_path):
     assert la.gate("BTC/USD", now=later).state == "probation"
     _trades(la, "BTC/USD", [2000], t0=later + 1)
     d = la.gate("BTC/USD", now=later + 10)
-    assert d.allow and d.state in ("ok", "weak") and "BTC/USD" not in la.benches
+    assert d.allow and d.state in ("ok", "weak") and la.bench_for("BTC/USD") is None
 
 
 def test_regime_level_bench_only_blocks_that_regime(tmp_path):
@@ -96,7 +96,7 @@ def test_backtest_prior_shrinks_size_before_live_evidence(tmp_path):
     eth = la.gate("ETH/USD")
     assert eth.state == "neutral" and eth.prior_bps is None
     # A prior alone can never bench (needs live sample >= min_sample).
-    assert "BTC/USD" not in la.benches
+    assert la.bench_for("BTC/USD") is None
 
 
 def test_live_evidence_outweighs_prior(tmp_path):

@@ -56,6 +56,7 @@ def _as_dict(result):
 def main() -> None:
     from dublin_bot.config import Settings
     from dublin_bot.engine import TradingEngine
+    from dublin_bot.meanrev_sleeve import MeanRevSleeve, sleeve_active
 
     settings = Settings()
     live = (
@@ -89,6 +90,17 @@ def main() -> None:
         f"paper={settings.paper_trading} dry_run={settings.dry_run} "
         f"allow_live={settings.allow_live_trading}"
     )
+    mr_on, mr_why = sleeve_active(settings)
+    log(
+        f"SLEEVES primary={settings.strategy}@{settings.timeframe_minutes}m "
+        f"meanrev_4h={'on' if mr_on else 'off'} ({mr_why}) "
+        f"key=meanrev_mk@{settings.meanrev_timeframe_minutes}m "
+        f"symbols={','.join(settings.meanrev_symbols)} rsi<={settings.meanrev_rsi_entry:g} "
+        f"exit rsi>={settings.meanrev_rsi_exit:g}|close>=ema{settings.meanrev_ema_period} "
+        f"stop={settings.meanrev_stop_pct:.2%} tp={settings.meanrev_take_profit_pct:.2%} "
+        f"limit=-{settings.meanrev_limit_offset_pct:.2%} valid={settings.meanrev_limit_valid_bars}bar "
+        f"max_pos={settings.max_concurrent_positions} (shared)"
+    )
 
     try:
         probe = TradingEngine(settings)
@@ -106,6 +118,21 @@ def main() -> None:
         del probe
     except Exception as exc:  # noqa: BLE001 — logging only
         log(f"LEARNER summary unavailable: {type(exc).__name__}: {exc}")
+    if mr_on:
+        try:
+            mr_probe = MeanRevSleeve(settings)
+            verdicts = mr_probe.learner.adaptive_summary(mr_probe.universe())
+            log(
+                f"LEARNER key={mr_probe.strategy_key} priors={len(mr_probe.learner.priors)} "
+                + " | ".join(
+                    f"{v['key']}:{v['state']} x{v['size_mult']:g} "
+                    f"(live n={v['live_n']} bps={v['live_bps']}, prior n={v['prior_n']} bps={v['prior_bps']})"
+                    for v in verdicts
+                )
+            )
+            del mr_probe
+        except Exception as exc:  # noqa: BLE001 — logging only
+            log(f"LEARNER meanrev summary unavailable: {type(exc).__name__}: {exc}")
 
     while _running:
         try:
@@ -121,8 +148,9 @@ def main() -> None:
                 if not isinstance(sig, dict):
                     sig = {}
                 log(
-                    "CYCLE action={action} symbol={sym} dry_run={dry} order_id={oid} "
+                    "CYCLE sleeve={sleeve} action={action} symbol={sym} dry_run={dry} order_id={oid} "
                     "score={score} reason={reason}".format(
+                        sleeve=settings.strategy,
                         action=sig.get("action"),
                         sym=decision.get("symbol"),
                         dry=decision.get("dry_run"),
@@ -132,7 +160,7 @@ def main() -> None:
                     )
                 )
             else:
-                log(f"CYCLE ok type={type(result).__name__}")
+                log(f"CYCLE sleeve={settings.strategy} ok type={type(result).__name__}")
             gates = getattr(engine, "last_cycle_gates", None)
             if isinstance(gates, dict) and isinstance(gates.get("learner"), dict):
                 lv = gates["learner"]
@@ -142,8 +170,27 @@ def main() -> None:
                 json.dumps(payload, default=str, indent=2), encoding="utf-8"
             )
         except Exception as exc:  # noqa: BLE001
-            log(f"ERROR {type(exc).__name__}: {exc}")
+            log(f"ERROR sleeve={settings.strategy} {type(exc).__name__}: {exc}")
             traceback.print_exc()
+
+        # Second PAPER sleeve (4h mean reversion, limit entries). Isolated so a
+        # failure here can never block the primary sleeve, and vice versa.
+        if mr_on:
+            try:
+                res = MeanRevSleeve(settings).run_cycle()
+                d = res.to_dict()
+                acts = ",".join(f"{a['event']}:{a['symbol']}" for a in d["actions"]) or "none"
+                syms = " | ".join(f"{k}: {v}" for k, v in d["symbols"].items())
+                log(f"CYCLE sleeve=meanrev_4h active={d['active']} actions={acts} errors={len(d['errors'])} "
+                    f"| {syms}"[:900])
+                for err in d["errors"]:
+                    log(f"WARN sleeve=meanrev_4h {err}"[:300])
+                (ROOT / "logs" / "last_cycle_meanrev.json").write_text(
+                    json.dumps(d, default=str, indent=2), encoding="utf-8"
+                )
+            except Exception as exc:  # noqa: BLE001
+                log(f"ERROR sleeve=meanrev_4h {type(exc).__name__}: {exc}")
+                traceback.print_exc()
 
         for _ in range(INTERVAL):
             if not _running:

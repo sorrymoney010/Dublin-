@@ -116,8 +116,14 @@ class LearningAgent:
         self.last_regime = data.get("last_regime", "unknown")
         self.sync_cursor = int(data.get("sync_cursor", 0))
         self._seen = set(data.get("seen_txids", []))
-        self.benches = dict(data.get("benches") or {})
-        self.last_decisions = dict(data.get("last_decisions") or {})
+        # Benches / decision labels are scoped per strategy key ("<key>::SYM[|regime]")
+        # so two sleeves sharing learner.json are scored and benched separately.
+        # Legacy unscoped entries belong to the strategy that saved the file.
+        legacy_key = str(data.get("strategy_key") or self.strategy_key)
+        self.benches = {self._scoped(k, legacy_key): v
+                        for k, v in (data.get("benches") or {}).items()}
+        self.last_decisions = {self._scoped(k, legacy_key): v
+                               for k, v in (data.get("last_decisions") or {}).items()}
         self.open_entries = dict(data.get("open_entries") or {})
         for sym, c in (data.get("coins") or {}).items():
             self.coins[sym] = CoinStats(
@@ -129,6 +135,18 @@ class LearningAgent:
                 regime_pnl=dict(c.get("regime_pnl", {})),
                 history=list(c.get("history", [])),
             )
+
+    @staticmethod
+    def _scoped(key: str, strategy_key: str) -> str:
+        return key if "::" in key else f"{strategy_key}::{key}"
+
+    def _sk(self, key: str) -> str:
+        """Strategy-scoped storage key for benches / decision labels."""
+        return self._scoped(key, self.strategy_key)
+
+    def bench_for(self, key: str) -> dict | None:
+        """This strategy's bench record for ``key`` ("SYM" or "SYM|regime")."""
+        return self.benches.get(self._sk(key))
 
     def save(self) -> None:
         data = {
@@ -322,7 +340,7 @@ class LearningAgent:
         if live or w > 0:
             d.blended_bps = ((d.prior_bps or 0.0) * w + sum(live)) / (w + len(live))
 
-        bench = self.benches.get(key)
+        bench = self.benches.get(self._sk(key))
         if bench:
             if now < float(bench["until"]):
                 d.allow, d.size_mult, d.state = False, 0.0, "benched"
@@ -338,15 +356,15 @@ class LearningAgent:
                 self._bench(key, now, total, f"still negative after probation "
                                              f"({d.live_bps:.0f}bps over {d.live_n})")
                 d.allow, d.size_mult, d.state = False, 0.0, "benched"
-                d.reason = self.benches[key]["reason"]
+                d.reason = self.benches[self._sk(key)]["reason"]
                 return d
-            self.benches.pop(key, None)
+            self.benches.pop(self._sk(key), None)
 
         if d.live_n >= self.min_sample and d.live_bps is not None and d.live_bps < 0:
             self._bench(key, now, total, f"expectancy {d.live_bps:.0f}bps/trade after fees "
                                          f"over last {d.live_n} closed trades")
             d.allow, d.size_mult, d.state = False, 0.0, "benched"
-            d.reason = self.benches[key]["reason"]
+            d.reason = self.benches[self._sk(key)]["reason"]
             return d
 
         if d.blended_bps is None:
@@ -364,7 +382,7 @@ class LearningAgent:
         return d
 
     def _bench(self, key: str, now: float, total: int, reason: str) -> None:
-        self.benches[key] = {
+        self.benches[self._sk(key)] = {
             "since": now, "until": now + self.bench_hours * 3600.0,
             "trades_at_bench": int(total), "reason": reason,
         }
@@ -394,9 +412,9 @@ class LearningAgent:
 
     def _log_change(self, d: GateDecision, now: float) -> None:
         label = f"{d.state}:{d.size_mult:g}"
-        if self.last_decisions.get(d.key) == label:
+        if self.last_decisions.get(self._sk(d.key)) == label:
             return
-        self.last_decisions[d.key] = label
+        self.last_decisions[self._sk(d.key)] = label
         try:
             self.decisions_log.parent.mkdir(parents=True, exist_ok=True)
             with self.decisions_log.open("a", encoding="utf-8") as fh:
