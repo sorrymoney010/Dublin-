@@ -1,13 +1,13 @@
 """Walk-forward optimizer for Dublin- strategies.
 
-Maximizes the *stitched out-of-sample equity curve*, not in-sample luck.
-
+Maximizes the stitched out-of-sample equity curve, not in-sample luck.
 This module does not place orders.
 """
 
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -19,6 +19,8 @@ from dublin_bot.config import Settings
 from dublin_bot.models import Action
 from dublin_bot.sizing import EdgeEstimate, PositionSizer, SizingConfig
 from dublin_bot.strategy import build_strategy
+
+MIN_OOS_TRADES = 5
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,17 @@ class SignalParams:
         settings.atr_stop_multiplier = self.atr_stop_multiplier
         settings.breakout_lookback = self.breakout_lookback
         return settings
+
+    def key(self) -> tuple:
+        return (
+            self.strategy,
+            round(self.rsi_min, 1),
+            round(self.rsi_max, 1),
+            round(self.rsi_oversold, 1),
+            round(self.rsi_exit, 1),
+            round(self.atr_stop_multiplier, 2),
+            int(self.breakout_lookback),
+        )
 
 
 @dataclass
@@ -70,6 +83,7 @@ class FoldResult:
     params: dict[str, Any]
     is_score: float
     oos: dict[str, float]
+    thin: bool
 
 
 DEFAULT_GRID: list[SignalParams] = [
@@ -168,7 +182,9 @@ def replay(
             sig = strat.evaluate(window, in_position=False)
             if sig.action is not Action.BUY:
                 continue
-            stop = sig.stop_price or (px - max(float(getattr(sig, "atr", 0.0) or 0.0), px * 0.01) * settings.atr_stop_multiplier)
+            stop = sig.stop_price or (
+                px - max(float(sig.atr or 0.0), px * 0.01) * settings.atr_stop_multiplier
+            )
             stop_dist = max(px - float(stop), px * 0.005)
             sized = sizer.size(
                 equity=equity,
@@ -250,6 +266,22 @@ def plateau_pick(scored: list[tuple[float, SignalParams]], top_k: int = 3) -> Si
     )
 
 
+def consensus_params(chosen: list[SignalParams], fallback: SignalParams) -> SignalParams:
+    """Mode of fold params. Ties → plateau of the chosen set."""
+    if not chosen:
+        return fallback
+    counts = Counter(p.key() for p in chosen)
+    best_n = max(counts.values())
+    winners = [k for k, n in counts.items() if n == best_n]
+    if len(winners) == 1:
+        key = winners[0]
+        for p in chosen:
+            if p.key() == key:
+                return p
+    scored = [(1.0, p) for p in chosen]
+    return plateau_pick(scored, top_k=len(chosen))
+
+
 def run_walk_forward(
     bars: pd.DataFrame,
     base: Settings,
@@ -275,7 +307,7 @@ def run_walk_forward(
         raise ValueError("No WFO splits — shorten is_bars / oos_bars")
 
     folds: list[FoldResult] = []
-    last_params: SignalParams | None = None
+    chosen_params: list[SignalParams] = []
     bars_per_year = int(365 * 24 * 60 / max(base.timeframe_minutes, 1))
 
     for sp in splits:
@@ -287,9 +319,10 @@ def run_walk_forward(
             is_m = replay(is_px, s, start_equity=start_equity, periods_per_year=min(365, bars_per_year))
             scored.append((is_m.score, params))
         chosen = plateau_pick(scored)
-        last_params = chosen
+        chosen_params.append(chosen)
         s = chosen.apply(base.model_copy(deep=True))
         oos_m = replay(oos_px, s, start_equity=start_equity, periods_per_year=min(365, bars_per_year))
+        thin = oos_m.n_trades < MIN_OOS_TRADES
         folds.append(
             FoldResult(
                 fold=sp.fold,
@@ -304,13 +337,16 @@ def run_walk_forward(
                     "total_return": oos_m.total_return,
                     "expectancy": oos_m.expectancy,
                 },
+                thin=thin,
             )
         )
 
     oos_sharpes = [f.oos["sharpe"] for f in folds]
     oos_scores = [f.oos["score"] for f in folds]
     oos_rets = [f.oos["total_return"] for f in folds]
-    deploy = last_params or grid[0]
+    oos_trades = [int(f.oos["n_trades"]) for f in folds]
+    thin_frac = float(np.mean([1.0 if f.thin else 0.0 for f in folds])) if folds else 1.0
+    deploy = consensus_params(chosen_params, grid[0])
     hold_m = replay(
         holdout,
         deploy.apply(base.model_copy(deep=True)),
@@ -327,11 +363,15 @@ def run_walk_forward(
         "fee_bps": base.paper_taker_fee_bps,
         "slippage_bps": base.paper_slippage_bps,
         "folds": [asdict(f) for f in folds],
+        "oos_trades": oos_trades,
+        "oos_median_trades": float(np.median(oos_trades)) if oos_trades else 0.0,
+        "thin_fold_frac": thin_frac,
         "oos_median_sharpe": float(np.median(oos_sharpes)) if oos_sharpes else 0.0,
         "oos_p5_sharpe": float(np.percentile(oos_sharpes, 5)) if oos_sharpes else 0.0,
         "oos_median_score": float(np.median(oos_scores)) if oos_scores else 0.0,
         "oos_win_fold_frac": float(np.mean([1.0 if r > 0 else 0.0 for r in oos_rets])) if oos_rets else 0.0,
         "deploy_params": asdict(deploy),
+        "deploy_source": "fold_mode",
         "holdout": {
             "bars": len(holdout),
             "score": hold_m.score,
@@ -342,13 +382,20 @@ def run_walk_forward(
             "total_return": hold_m.total_return,
             "final_equity": hold_m.equity[-1] if hold_m.equity else start_equity,
         },
-        "verdict": _verdict(oos_sharpes, oos_rets, hold_m),
+        "verdict": _verdict(oos_sharpes, oos_rets, hold_m, thin_frac),
     }
 
 
-def _verdict(sharpes: list[float], rets: list[float], hold: ReplayMetrics) -> str:
+def _verdict(
+    sharpes: list[float],
+    rets: list[float],
+    hold: ReplayMetrics,
+    thin_frac: float,
+) -> str:
     if not sharpes:
         return "INSUFFICIENT_FOLDS"
+    if thin_frac > 0.5:
+        return "FOLDS_TOO_THIN"
     med = float(np.median(sharpes))
     p5 = float(np.percentile(sharpes, 5))
     win_frac = float(np.mean([1.0 if r > 0 else 0.0 for r in rets]))
@@ -366,7 +413,10 @@ def write_deploy(report: dict[str, Any], path: Path = Path("logs/wfo_deploy.json
     payload = {
         "verdict": report["verdict"],
         "params": report["deploy_params"],
+        "deploy_source": report.get("deploy_source", "fold_mode"),
         "oos_median_sharpe": report["oos_median_sharpe"],
+        "oos_median_trades": report.get("oos_median_trades"),
+        "thin_fold_frac": report.get("thin_fold_frac"),
         "holdout": report["holdout"],
     }
     path.write_text(json.dumps(payload, indent=2))
