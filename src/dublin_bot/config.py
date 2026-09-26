@@ -78,7 +78,8 @@ class Settings(BaseSettings):
     # are NOT loosened — only the data resolution and polling speed change.
     # Applied at startup by TradingEngine._apply_performance_profile().
     day_trade_mode: bool = False
-    strategy_equity_usd: float = Field(default=100.0, ge=25.0)
+    # Conservative documented default: $25 strategy budget (floor $25).
+    strategy_equity_usd: float = Field(default=25.0, ge=25.0)
     # Auto-scale risk per trade based on session win/loss streak. The base risk
     # (risk_per_trade) is multiplied by this factor, which the engine moves
     # between min_risk_scale and max_risk_scale as the bot wins/loses — so a
@@ -87,21 +88,19 @@ class Settings(BaseSettings):
     min_risk_scale: float = Field(default=0.5, gt=0, le=1.0)
     max_risk_scale: float = Field(default=2.0, gt=1.0)
     risk_step: float = Field(default=0.15, gt=0, le=0.5)
-    # When the real account balance is too small to trade the configured symbol
-    # at the minimum notional, automatically fall back to a cheaper allowed coin.
-    auto_cheaper_symbol: bool = Field(default=True)
-    fallback_symbols: list[str] = Field(default_factory=lambda: ["PUMP/USD", "XRP/USD", "UNI/USD", "BTC/USD"])
     # Canonical, always-allowed basket. Defaults to DEFAULT_COIN_BASKET and is
     # intentionally independent of the mutable ``symbol`` selection, so BTC/USD
     # (and the rest of the basket) is never lost when a different coin is pinned.
     coin_basket: list[str] = Field(default_factory=lambda: list(DEFAULT_COIN_BASKET))
     # ── Trading universe: how the bot discovers tradeable coins ──────
-    # "basket"  -> only the coins in ``coin_basket`` (hard allowlist, default)
+    # "basket"  -> only the coins in ``coin_basket`` (hard allowlist, DEFAULT)
     # "all_usd" -> every active Kraken */USD spot pair above the min notional.
     #   The bot autonomously ranks the full market by strategy setup + learned
     #   expectancy and trades whatever coin the market is offering. This is the
     #   "full API access" mode — no manual coin section.
-    universe_mode: str = Field(default="all_usd")
+    # Conservative default is "basket"; "all_usd" must be opted into via
+    # UNIVERSE_MODE=all_usd in .env.
+    universe_mode: str = Field(default="basket")
     # Hard safety allowlist applied ON TOP of the universe. Coins here are the
     # only ones the bot may ever touch. Default = the set with POSITIVE
     # backtested expectancy for the live mean-reversion strategy (audit #8:
@@ -160,20 +159,27 @@ class Settings(BaseSettings):
     # Legacy compatibility setting only. Kraken execution is permanently spot-only;
     # the gateway strips leverage from every submitted order.
     margin_enabled: bool = Field(default=False)
-    max_leverage: float = Field(default=2.0, gt=0, le=5.0)
-    margin_exposure_fraction: float = Field(default=0.25, gt=0, le=0.5)
-    risk_per_trade: float = Field(default=0.02, gt=0, le=0.02)
-    max_position_fraction: float = Field(default=0.40, gt=0, le=0.5)
+    # max_leverage is NOT exchange leverage. It is only the cap the vol-target
+    # sizer (dublin_bot.sizing) applies to its vol scale and target notional
+    # (notional <= equity * max_leverage). 1.0 = never size above 1x equity,
+    # which matches spot-only execution.
+    max_leverage: float = Field(default=1.0, gt=0, le=5.0)
+    # Only read by RiskManager when margin_enabled=True (legacy; margin is
+    # never used on Kraken). Default 0 so enabling margin by accident caps
+    # exposure at zero instead of silently allowing 25%.
+    margin_exposure_fraction: float = Field(default=0.0, ge=0, le=0.5)
+    risk_per_trade: float = Field(default=0.01, gt=0, le=0.02)
+    max_position_fraction: float = Field(default=0.25, gt=0, le=0.5)
     # Vol-target / fractional-Kelly sizing (see dublin_bot.sizing).
     target_vol: float = Field(default=0.12, gt=0, le=1.0)
     kelly_fraction: float = Field(default=0.25, gt=0, le=0.5)
     max_exposure_fraction: float = Field(default=0.5, gt=0, le=1.0)
     max_daily_loss_fraction: float = Field(default=0.03, gt=0, le=0.05)
     max_drawdown_fraction: float = Field(default=0.10, gt=0, le=0.20)
-    # Daily order cap. Set to 0 for unlimited orders per day (cooldown still
-    # applies between entries). Bounded at 10 when a cap is used.
-    max_orders_per_day: int = Field(default=0, ge=0, le=10)
-    cooldown_minutes: int = Field(default=10, ge=0)
+    # Daily order cap (default 3). Set to 0 for unlimited orders per day
+    # (cooldown still applies between entries). Bounded at 10 when a cap is used.
+    max_orders_per_day: int = Field(default=3, ge=0, le=10)
+    cooldown_minutes: int = Field(default=15, ge=0)
     monitor_interval_seconds: int = Field(default=900, ge=60, le=86400)
     candle_close_delay_seconds: int = Field(default=2, ge=1, le=30)
     # Dashboard startup is observational by default. An operator must press

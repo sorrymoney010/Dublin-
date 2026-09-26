@@ -99,8 +99,13 @@ Hard ceilings enforced by pydantic validators — configuration cannot exceed th
 | Max drawdown breaker | 10% | 20% |
 | Orders per day | 3 | 10 |
 | Strategy equity | $25 | floor $25 |
+| Sizer leverage cap (`MAX_LEVERAGE`) | 1.0 (spot, ≤1x equity) | 5.0 |
+| Margin exposure (legacy, margin disabled) | 0 | 50% |
 
-Plus: 15-minute cooldown between entries (rapid mode), and a stop-distance
+Other conservative defaults: `STRATEGY=momentum` (trend + breakout),
+`UNIVERSE_MODE=basket` (fixed `COIN_BASKET` allowlist only; `all_usd` is opt-in).
+
+Plus: 15-minute cooldown between entries (`COOLDOWN_MINUTES=15`), and a stop-distance
 requirement (an entry with no valid stop is rejected). Risk/loss/exposure
 ceilings are unchanged. SELL exits from an existing position are never blocked
 by the cooldown, daily order cap, daily-loss, or drawdown entry breakers — a

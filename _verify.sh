@@ -1,6 +1,8 @@
 #!/bin/bash
+# Run lint + tests from the repo root (wherever this checkout lives).
+set -euo pipefail
 export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-cd /Users/musicmancheef/Documents/Codex/2026-08-03/referenced-chatgpt-conversation-this-is-an-2/Dublin-local
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 .venv/bin/pip install -e . --quiet 2>&1 | tail -3
 echo "=== RUFF ==="
 .venv/bin/ruff check src/ tests/
