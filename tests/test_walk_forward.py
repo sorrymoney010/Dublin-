@@ -7,6 +7,7 @@ from dublin_bot.config import Settings
 from dublin_bot.walk_forward import (
     DEFAULT_GRID,
     SignalParams,
+    consensus_params,
     plateau_pick,
     replay,
     rolling_splits,
@@ -54,6 +55,14 @@ def test_plateau_prefers_cluster_not_outlier():
     assert picked.atr_stop_multiplier < 3.0
 
 
+def test_consensus_uses_mode_not_last_fold():
+    a = SignalParams("mean_reversion", 35, 75, 35, 55, 1.5, 20)
+    b = SignalParams("momentum", 32, 75, 38, 55, 2.0, 24)
+    picked = consensus_params([a, a, a, b], fallback=b)
+    assert picked.strategy == "mean_reversion"
+    assert picked.breakout_lookback == 20
+
+
 def test_replay_and_wfo_run_on_synthetic():
     bars = _bars()
     settings = Settings(_env_file=None)
@@ -74,6 +83,13 @@ def test_replay_and_wfo_run_on_synthetic():
         holdout_frac=0.12,
     )
     assert report["n_folds"] >= 2
-    assert report["verdict"] in {"PAPER_DEPLOY", "WATCH_ONLY", "DO_NOT_DEPLOY", "HOLD_OUT_TOO_THIN"}
-    assert "deploy_params" in report
+    assert "oos_trades" in report
+    assert report["deploy_source"] == "fold_mode"
+    assert report["verdict"] in {
+        "PAPER_DEPLOY",
+        "WATCH_ONLY",
+        "DO_NOT_DEPLOY",
+        "HOLD_OUT_TOO_THIN",
+        "FOLDS_TOO_THIN",
+    }
     _ = score_metrics(m)
