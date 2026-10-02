@@ -102,6 +102,12 @@ def main() -> None:
         f"max_pos={settings.max_concurrent_positions} (shared)"
     )
 
+    if getattr(settings, "pipeline_enabled", False):
+        log(f"PIPELINE on data={settings.pipeline_data_dir} symbols={','.join(settings.pipeline_symbols)} "
+            f"stale_after={settings.pipeline_stale_seconds:g}s (tick bars first, REST OHLC fallback)")
+    else:
+        log("PIPELINE off (REST OHLC bars)")
+
     try:
         probe = TradingEngine(settings)
         universe = probe._breakout_universe() if probe._is_breakout_sleeve() else [settings.symbol]
@@ -191,6 +197,17 @@ def main() -> None:
             except Exception as exc:  # noqa: BLE001
                 log(f"ERROR sleeve=meanrev_4h {type(exc).__name__}: {exc}")
                 traceback.print_exc()
+
+        if getattr(settings, "pipeline_enabled", False):
+            try:
+                from dublin_bot.pipeline.source import get_source, pipeline_summary
+
+                src = get_source(settings.pipeline_data_dir,
+                                 stale_seconds=float(settings.pipeline_stale_seconds),
+                                 symbols=list(settings.pipeline_symbols))
+                log(f"PIPELINE {pipeline_summary(src)}"[:900])
+            except Exception as exc:  # noqa: BLE001 — logging only
+                log(f"PIPELINE status unavailable: {type(exc).__name__}: {exc}")
 
         for _ in range(INTERVAL):
             if not _running:

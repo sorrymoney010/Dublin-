@@ -31,6 +31,12 @@ export LEARNER_BENCH_HOURS=72
 # BTC/ETH/SOL (walk-forward meanrev_mk@240m; small sample — experiment only).
 # Shares the $500 book, max 3 positions and the risk caps with regime_trend.
 export MEANREV_SLEEVE_ENABLED=true
+# Market-data pipeline: bars for BTC/ETH/SOL come from the local tick store
+# (written by com.mayo.kraken.ticks / scripts/tick_collector.py) with Kraken
+# REST OHLC as fallback for missing/short/stale history. docs/PIPELINE.md.
+export PIPELINE_ENABLED=true
+export PIPELINE_DATA_DIR=/Users/musicmancheef/mayo-bot/data
+export PIPELINE_STALE_SECONDS=600
 # Unset any mangled list envs so Settings reads clean JSON from .env file
-unset COIN_BASKET BREAKOUT_SYMBOLS UNIVERSE_ALLOWLIST LIVE_READY_UNIVERSE
+unset COIN_BASKET BREAKOUT_SYMBOLS UNIVERSE_ALLOWLIST LIVE_READY_UNIVERSE PIPELINE_SYMBOLS
 exec /Users/musicmancheef/mayo-bot/.venv/bin/python /Users/musicmancheef/mayo-bot/scripts/paper_trader_loop.py

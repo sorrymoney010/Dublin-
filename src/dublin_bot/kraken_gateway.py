@@ -440,7 +440,36 @@ class KrakenGateway:
     def server_time(self) -> float:
         return float(self._public("Time")["unixtime"])
 
+    def pipeline_source(self):
+        """The tick pipeline bar source when enabled and it covers this symbol/tf."""
+        s = self.settings
+        if not getattr(s, "pipeline_enabled", False):
+            return None
+        from .pipeline.source import get_source
+
+        src = get_source(getattr(s, "pipeline_data_dir", "data"),
+                         stale_seconds=float(getattr(s, "pipeline_stale_seconds", 600.0)),
+                         symbols=list(getattr(s, "pipeline_symbols", []) or []))
+        return src if src.handles(s.symbol, self.kraken_interval()) else None
+
     def get_bars(self, *, validate: bool = True) -> pd.DataFrame:
+        """Closed bars for the active symbol/timeframe.
+
+        With ``PIPELINE_ENABLED`` and a pipeline symbol (BTC/ETH/SOL) this is
+        the tick-built pipeline with REST OHLC as fallback/backfill
+        (``pipeline.source``); otherwise plain REST OHLC.
+        """
+        src = self.pipeline_source()
+        if src is None:
+            return self.get_rest_bars(validate=validate)
+        frame = src.get_bars(self.settings.symbol, self.kraken_interval(),
+                             int(self.settings.lookback_bars),
+                             rest_fetch=lambda: self.get_rest_bars(validate=False))
+        if validate:
+            check_monotonic_bars(frame)
+        return frame
+
+    def get_rest_bars(self, *, validate: bool = True) -> pd.DataFrame:
         """Fetch OHLC candles, dropping the in-progress final bar.
 
         Kraken's OHLC response always ends with the *currently forming* candle.

@@ -21,30 +21,15 @@ from typing import Any, Callable, Iterable
 import numpy as np
 import pandas as pd
 
-from .indicators import compute_adx
+from .technicals import add_technicals, atr, ema, flow_filter_mask, rsi
 
 
 # ── indicators ────────────────────────────────────────────────
-
-def _ema(s: pd.Series, n: int) -> pd.Series:
-    return s.ewm(span=n, adjust=False).mean()
-
-
-def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
-    d = close.diff()
-    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
-    rs = up / dn.replace(0, np.nan)
-    return (100 - 100 / (1 + rs)).fillna(50.0)
-
-
-def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    prev = df["close"].shift(1)
-    tr = pd.concat(
-        [df["high"] - df["low"], (df["high"] - prev).abs(), (df["low"] - prev).abs()],
-        axis=1,
-    ).max(axis=1)
-    return tr.ewm(alpha=1 / n, adjust=False).mean()
+# Implemented once in ``technicals`` (shared by live strategies, the
+# walk-forward backtester and the order-flow study).
+_ema = ema
+_rsi = rsi
+_atr = atr
 
 
 def adx_hysteresis(adx: pd.Series, enter: float, exit_: float) -> pd.Series:
@@ -62,17 +47,8 @@ def adx_hysteresis(adx: pd.Series, enter: float, exit_: float) -> pd.Series:
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
-    d["ema20"] = _ema(d["close"], 20)
-    d["ema50"] = _ema(d["close"], 50)
-    d["ema200"] = _ema(d["close"], 200)
-    d["rsi"] = _rsi(d["close"], 14)
-    d["atr"] = _atr(d, 14)
-    d["atr_pct"] = d["atr"] / d["close"]
-    d["adx"] = compute_adx(d["high"], d["low"], d["close"], 14)
-    # ATR% percentile vs the trailing 200 bars (volatility-expansion gate).
-    d["atr_rank"] = d["atr_pct"].rolling(200, min_periods=50).rank(pct=True)
-    return d
+    """Indicator-enriched copy of a bar frame (see ``technicals.add_technicals``)."""
+    return add_technicals(df)
 
 
 def regime_signals(d: pd.DataFrame, p: dict) -> dict[str, np.ndarray]:
@@ -97,9 +73,11 @@ def regime_signals(d: pd.DataFrame, p: dict) -> dict[str, np.ndarray]:
         & (close > np.nan_to_num(prior_high, nan=np.inf))
         & np.isfinite(atr)
     )
+    flt_ok = flow_filter_mask(d, p.get("flt"))
+    entry = entry & flt_ok
     chandelier = hh22 - float(p.get("atr_mult", 3.0)) * atr
     return {"adx_on": adx_on, "entry": entry, "vol_ok": vol_ok, "prior_high": prior_high,
-            "chandelier": chandelier, "chandelier_exit": close < chandelier}
+            "chandelier": chandelier, "chandelier_exit": close < chandelier, "flt_ok": flt_ok}
 
 
 def meanrev_signals(d: pd.DataFrame, p: dict) -> dict[str, np.ndarray]:
@@ -111,15 +89,17 @@ def meanrev_signals(d: pd.DataFrame, p: dict) -> dict[str, np.ndarray]:
 
     * entry: RSI(14) <= ``rsi_os`` AND close < EMA(``ema``, default 50)
     * exit ("reverted"): RSI(14) >= ``rsi_exit`` OR close >= EMA
+    * optional ``flt``: an order-flow entry filter from ``technicals.FLOW_FILTERS``
     """
     n_ema = int(p.get("ema", 50))
     ema = d["ema50"] if n_ema == 50 and "ema50" in d else _ema(d["close"], n_ema)
     close = d["close"].to_numpy(float)
     ema_a = ema.to_numpy(float)
     rsi = d["rsi"].to_numpy(float)
-    entry = (rsi <= float(p.get("rsi_os", 38.0))) & (close < ema_a)
+    flt_ok = flow_filter_mask(d, p.get("flt"))
+    entry = (rsi <= float(p.get("rsi_os", 38.0))) & (close < ema_a) & flt_ok
     exit_ = (rsi >= float(p.get("rsi_exit", 55.0))) | (close >= ema_a)
-    return {"entry": entry, "exit": exit_, "ema": ema_a, "rsi": rsi}
+    return {"entry": entry, "exit": exit_, "ema": ema_a, "rsi": rsi, "flt_ok": flt_ok}
 
 
 def classify_adx_regime(bars: pd.DataFrame, enter: float = 25.0, exit_: float = 20.0) -> str:

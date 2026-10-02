@@ -138,6 +138,10 @@ class Settings(BaseSettings):
     regime_lookback: int = Field(default=20, ge=2)
     regime_atr_mult: float = Field(default=3.0, gt=0)
     regime_min_atr_rank: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Optional order-flow entry filter (technicals.FLOW_FILTERS, e.g. "ofi_pos").
+    # Empty = off. Only set after it passes the walk-forward promotion rules in
+    # docs/PIPELINE.md; fails closed when bars carry no tick order flow.
+    regime_flow_filter: str = Field(default="")
     # ── 4h mean-reversion sleeve (PAPER ONLY, second sleeve) ──────
     # Runs in the same paper loop as the primary (e.g. regime_trend@1h)
     # sleeve. Parameters are the walk-forward default spec that was selected
@@ -160,7 +164,22 @@ class Settings(BaseSettings):
     # Paper limit order lifetime in bars of meanrev_timeframe_minutes. An
     # unfilled limit EXPIRES (it never converts to a market order).
     meanrev_limit_valid_bars: int = Field(default=1, ge=1, le=6)
+    # Optional order-flow entry filter for the 4h sleeve (see regime_flow_filter).
+    meanrev_flow_filter: str = Field(default="")
     meanrev_state_path: Path = Path("logs/meanrev_sleeve.json")
+    # ── Market-data pipeline (Data -> Ticks -> Bars -> Technicals) ──
+    # When enabled, gateway.get_bars() for BTC/ETH/SOL at 1/15/60/240m serves
+    # tick-built bars (with order-flow columns) from PIPELINE_DATA_DIR, written
+    # by scripts/tick_collector.py, and stitches Kraken REST OHLC in for any
+    # missing/short/stale history. Off by default (tests and other deploys
+    # keep the plain REST path). See docs/PIPELINE.md. Read-only market data;
+    # no effect on order routing or the safety locks.
+    pipeline_enabled: bool = Field(default=False)
+    pipeline_data_dir: Path = Path("data")
+    pipeline_symbols: list[str] = Field(
+        default_factory=lambda: ["BTC/USD", "ETH/USD", "SOL/USD"]
+    )
+    pipeline_stale_seconds: float = Field(default=600.0, gt=0)
     # ── Sentiment agent (Stage 1) ──────────────────────────────
     # When enabled, live news/Reddit sentiment acts as a confirmation filter:
     # bearish mood blocks fresh BUYs, a collapse forces a protective SELL. It

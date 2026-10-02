@@ -41,6 +41,7 @@ class RegimeTrendStrategy:
             "adx_enter": float(getattr(s, "adx_enter_above", 25.0)),
             "adx_exit": float(getattr(s, "adx_exit_below", 20.0)),
             "stop": float(getattr(s, "stop_loss_pct", 0.03)),
+            "flt": str(getattr(s, "regime_flow_filter", "") or ""),
         }
 
     def evaluate(self, bars: pd.DataFrame, in_position: bool = False) -> Signal:
@@ -89,4 +90,6 @@ class RegimeTrendStrategy:
                 why.append("EMA20<=EMA50")
             if not (price > sig["prior_high"][i]):
                 why.append(f"no {p['lookback']}-bar high break")
+            if p["flt"] and not sig["flt_ok"][i]:
+                why.append(f"order-flow filter {p['flt']} not met")
         return Signal(Action.WAIT, 10, f"No regime entry [{reg}]: " + "; ".join(why), price, atr)

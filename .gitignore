@@ -37,3 +37,8 @@ build/
 data/*.csv
 data/.trades_state_*.json
 data/*.log
+
+# Market-data pipeline stores (tick/quote files, 1m bar cache) — large, re-creatable.
+data/ticks/
+data/quotes/
+data/bars1m/
