@@ -59,3 +59,55 @@ def backfill_range(store: TickStore, client: KrakenPublic, symbol: str, since_ts
                      f"written={written}")
     return {"symbol": sym, "pages": pages, "written": written, "last_id": last_id,
             "stop": stop_reason}
+
+
+def verify_hole(client: KrakenPublic, symbol: str, lo: int, hi: int, ts_before: float,
+                *, max_pages: int = 3) -> bool:
+    """True if Kraken's own REST history jumps from ``lo - 1`` straight to ``hi + 1``.
+
+    That means ids ``lo..hi`` were never published (an exchange-side hole, not
+    a collection gap), so it is safe to treat the stream as continuous there.
+    """
+    pair = PAIRS[canonical(symbol)][0]
+    cursor: str = str(int(ts_before) - 1)
+    for _ in range(max_pages):
+        ticks, last = client.trades(pair, cursor)
+        ids = [t.trade_id for t in ticks]
+        for a, b in zip(ids, ids[1:], strict=False):
+            if a == lo - 1:
+                return b == hi + 1
+            if a >= lo:
+                return False
+        if not ticks or ids[-1] >= lo or not last or last == cursor:
+            return False
+        cursor = last
+    return False
+
+
+def fill_gaps(store: TickStore, client: KrakenPublic, symbol: str, *, max_pages: int = 400,
+              progress: Callable[[str], None] | None = None) -> dict:
+    """Fill every id hole in the store from REST; record holes Kraken itself has."""
+    from .tickstore import find_gaps
+
+    sym = canonical(symbol)
+    known = store.verified_holes(sym)
+    gaps = [g for g in find_gaps(store.read(sym)) if (g[0], g[1]) not in known]
+    filled = verified = still_open = 0
+    for lo, hi, ts_before, _ts_after in gaps:
+        backfill_range(store, client, sym, ts_before - 1, after_id=lo - 1, until_id=hi + 1,
+                       max_pages=max_pages)
+        lo_day = store.read(sym, ts_before - 1, _ts_after + 1)
+        rem = [g for g in find_gaps(lo_day) if g[0] >= lo and g[1] <= hi]
+        if not rem:
+            filled += 1
+            continue
+        for rlo, rhi, rts, _ in rem:
+            if verify_hole(client, sym, rlo, rhi, rts):
+                store.add_verified_hole(sym, rlo, rhi)
+                verified += 1
+            else:
+                still_open += 1
+        if progress:
+            progress(f"{sym} gap {lo}-{hi}: {len(rem)} sub-hole(s) remain after REST fill")
+    return {"symbol": sym, "gaps": len(gaps), "filled": filled, "exchange_holes": verified,
+            "open": still_open}

@@ -158,6 +158,24 @@ class TickStore:
         tmp.write_text(json.dumps({"symbol": symbol, **info}, default=str), encoding="utf-8")
         tmp.replace(p)
 
+    # Kraken occasionally never publishes a range of trade ids (verified by a
+    # REST page that itself jumps over them). Such exchange-side holes are
+    # recorded here so they do not break coverage forever.
+    def verified_holes(self, symbol: str) -> set[tuple[int, int]]:
+        try:
+            data = json.loads((self.sym_dir(symbol) / "_holes.json").read_text(encoding="utf-8"))
+            return {(int(a), int(b)) for a, b in data.get("verified", [])}
+        except (OSError, ValueError, TypeError, AttributeError):
+            return set()
+
+    def add_verified_hole(self, symbol: str, lo: int, hi: int) -> None:
+        holes = self.verified_holes(symbol) | {(int(lo), int(hi))}
+        p = self.sym_dir(symbol) / "_holes.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"verified": sorted([list(h) for h in holes])}), encoding="utf-8")
+        tmp.replace(p)
+
     def read_status(self, symbol: str) -> dict:
         try:
             data = json.loads(self.status_path(symbol).read_text(encoding="utf-8"))

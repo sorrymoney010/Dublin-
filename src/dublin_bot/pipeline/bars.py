@@ -83,23 +83,29 @@ def ticks_to_1m(ticks: pd.DataFrame, quotes: pd.DataFrame | None = None) -> pd.D
     return out[BAR_COLS]
 
 
-def summarize(ticks: pd.DataFrame, day: str) -> DaySummary:
+def summarize(ticks: pd.DataFrame, day: str,
+              exchange_holes: set[tuple[int, int]] | None = None) -> DaySummary:
+    """Coverage summary; id holes Kraken itself never published are not holes."""
     if ticks is None or not len(ticks):
         return DaySummary(day, 0, None, None, None, None, [])
     ids = ticks["trade_id"].to_numpy(np.int64)
     ts = ticks["ts"].to_numpy(float)
-    holes = np.nonzero(np.diff(ids) > 1)[0]
+    holes = [i for i in np.nonzero(np.diff(ids) > 1)[0]
+             if not exchange_holes or (int(ids[i] + 1), int(ids[i + 1] - 1)) not in exchange_holes]
     return DaySummary(day, int(len(ids)), int(ids[0]), float(ts[0]), int(ids[-1]), float(ts[-1]),
                       [(float(ts[i]), float(ts[i + 1])) for i in holes])
 
 
 def coverage_runs(days: list[DaySummary], *, live_through: float | None = None,
-                  live_last_id: int | None = None) -> list[tuple[float, float]]:
+                  live_last_id: int | None = None,
+                  exchange_holes: set[tuple[int, int]] | None = None) -> list[tuple[float, float]]:
     """Merge per-day summaries into [(start_ts, end_ts)] runs of id-continuous ticks."""
     runs: list[list[float]] = []
     prev_last_id: int | None = None
     for s in sorted((d for d in days if d.n), key=lambda d: d.first_id):
-        if runs and prev_last_id is not None and s.first_id == prev_last_id + 1:
+        if runs and prev_last_id is not None and (
+                s.first_id == prev_last_id + 1
+                or (exchange_holes and (prev_last_id + 1, s.first_id - 1) in exchange_holes)):
             pass  # continues the previous run across the day boundary
         else:
             runs.append([s.first_ts, s.first_ts])
@@ -197,8 +203,9 @@ class BarBuilder:
         now = time.time() if now is None else now
         tick_files = [p for p in self.store.day_files(symbol) if p.name.startswith(day)]
         quote_files = [p for p in self.store.day_files(symbol, "quotes") if p.name.startswith(day)]
+        xholes = self.store.verified_holes(symbol)
         sig = {"v": CACHE_VERSION, "ticks": self._signature(tick_files),
-               "quotes": self._signature(quote_files)}
+               "quotes": self._signature(quote_files), "xholes": sorted(list(h) for h in xholes)}
         closed = day < utc_day(now)
         cdir = self._cache_dir(symbol)
         meta_p, bars_p = cdir / f"{day}.json", cdir / f"{day}.csv.gz"
@@ -219,7 +226,7 @@ class BarBuilder:
         ticks = self.store.read(symbol, lo, hi)
         quotes = self.store.read_quotes(symbol, lo, hi)
         m1 = ticks_to_1m(ticks, quotes)
-        summ = summarize(ticks, day)
+        summ = summarize(ticks, day, xholes)
         if closed and summ.n:
             cdir.mkdir(parents=True, exist_ok=True)
             tmp = bars_p.with_name(bars_p.name + ".tmp")
@@ -247,7 +254,8 @@ class BarBuilder:
         m1 = m1[~m1.index.duplicated(keep="last")].sort_index()
         status = status if status is not None else self.store.read_status(symbol)
         live_through = status.get("live_through") if status.get("in_sync", True) else None
-        runs = coverage_runs(sums, live_through=live_through, live_last_id=status.get("last_trade_id"))
+        runs = coverage_runs(sums, live_through=live_through, live_last_id=status.get("last_trade_id"),
+                             exchange_holes=self.store.verified_holes(symbol))
         bars = resample(m1, tf_minutes, runs, now=end_ts)
         if len(bars):
             sec = bars.index.asi8 // 10**9
@@ -259,4 +267,5 @@ class BarBuilder:
         sums = [self.day(symbol, d, now=now)[1] for d in days]
         st = self.store.read_status(symbol)
         return coverage_runs(sums, live_through=st.get("live_through") if st.get("in_sync", True) else None,
-                             live_last_id=st.get("last_trade_id"))
+                             live_last_id=st.get("last_trade_id"),
+                             exchange_holes=self.store.verified_holes(symbol))

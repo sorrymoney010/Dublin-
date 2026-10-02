@@ -464,3 +464,16 @@ def test_walkforward_pipeline_source_never_overwrites_learner_priors():
     src = (Path(__file__).parents[1] / "scripts" / "backtest_walkforward.py").read_text()
     assert 'walkforward_pipeline_results.json' in src
     assert 'SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]' in src
+
+
+def test_exchange_side_hole_is_verified_and_does_not_break_coverage(tmp_path):
+    from dublin_bot.pipeline.backfill import fill_gaps
+    st = TickStore(tmp_path)
+    src = stream(30, skip_ids={1040, 1041})          # Kraken never published 1040-1041
+    st.append("BTC/USD", src[:20] + src[25:])        # we also lost 1020..1024 (fillable)
+    res = fill_gaps(st, FakeRest(src), "BTC/USD")
+    assert res == {"symbol": "BTC/USD", "gaps": 2, "filled": 1, "exchange_holes": 1, "open": 0}
+    assert st.verified_holes("BTC/USD") == {(1040, 1041)}
+    bb = BarBuilder(st)
+    runs = bb.coverage("BTC/USD", now=T0 + 7200)
+    assert len(runs) == 1                           # continuous despite the exchange hole

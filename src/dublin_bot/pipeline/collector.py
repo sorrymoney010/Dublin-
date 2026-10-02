@@ -25,7 +25,7 @@ from datetime import datetime
 from typing import Any, Callable, Iterable
 
 from . import PAIRS, SYMBOLS, canonical
-from .backfill import backfill_range
+from .backfill import backfill_range, verify_hole
 from .kraken_rest import KrakenPublic
 from .tickstore import Tick, TickStore
 
@@ -124,6 +124,12 @@ class TickCollector:
             if res["last_id"] is not None:
                 s["last_id"] = res["last_id"]
             filled = res["last_id"] is not None and res["last_id"] >= until_id - 1
+            if not filled:
+                # Did Kraken itself skip these ids? Then the stream is still continuous.
+                start = (res["last_id"] or lo) + 1
+                if verify_hole(self.client, sym, start, until_id - 1, float(s["last_ts"]) - 1):
+                    self.store.add_verified_hole(sym, start, until_id - 1)
+                    filled = True
             s["gaps_filled" if filled else "gaps_open"] += 1
             self.log(f"GAP {sym} ids {lo + 1}..{until_id - 1} "
                      f"{'filled' if filled else 'PARTIAL'} via REST ({res['written']} trades, "

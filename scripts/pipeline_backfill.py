@@ -3,6 +3,7 @@
 
     .venv/bin/python scripts/pipeline_backfill.py --days 120            # history
     .venv/bin/python scripts/pipeline_backfill.py --fill-gaps           # id holes only
+                     (holes Kraken itself never published are verified + recorded)
     .venv/bin/python scripts/pipeline_backfill.py --symbols SOL/USD --days 7
 
 Resumable: if the store already has ticks it continues after the newest one.
@@ -19,9 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from dublin_bot.pipeline import SYMBOLS, canonical  # noqa: E402
-from dublin_bot.pipeline.backfill import backfill_range  # noqa: E402
+from dublin_bot.pipeline.backfill import backfill_range, fill_gaps  # noqa: E402
 from dublin_bot.pipeline.kraken_rest import KrakenPublic  # noqa: E402
-from dublin_bot.pipeline.tickstore import TickStore, find_gaps  # noqa: E402
+from dublin_bot.pipeline.tickstore import TickStore  # noqa: E402
 
 
 def log(msg: str) -> None:
@@ -46,13 +47,8 @@ def main() -> None:
             log(f"skip {raw}: not in pipeline universe {SYMBOLS}")
             continue
         if a.fill_gaps:
-            ticks = store.read(sym)
-            gaps = find_gaps(ticks)
-            log(f"{sym}: {len(gaps)} id gap(s) in {len(ticks)} stored ticks")
-            for lo, hi, ts_before, _ts_after in gaps:
-                res = backfill_range(store, client, sym, ts_before, after_id=lo - 1,
-                                     until_id=hi + 1, max_pages=a.max_gap_pages, progress=log)
-                log(f"{sym}: gap {lo}-{hi} -> {res}")
+            res = fill_gaps(store, client, sym, max_pages=a.max_gap_pages, progress=log)
+            log(f"{sym}: {res}")
         else:
             since = time.time() - a.days * 86400
             last = store.last_tick(sym)
