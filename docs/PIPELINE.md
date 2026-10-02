@@ -88,3 +88,49 @@ tail -f logs/tick_collector.log                      # CONNECTED / GAP / RECONNE
 .venv/bin/python scripts/pipeline_backfill.py --days 30      # deeper history (slow, ~1 req/s)
 launchctl bootout gui/$(id -u)/com.mayo.kraken.ticks          # stop collector (bot falls back to REST)
 ```
+
+## Order-flow walk-forward study — results (2026-10-02)
+
+Run with `scripts/study_orderflow.py --data-dir <tick store>` on 120 days of
+tick-built bars per coin (BTC, ETH and SOL each about 120 days, no holes left after
+`--fill-gaps`; the verified Kraken exchange holes are recorded in `_holes.json`).
+Full output is in `data/orderflow_study_report.txt` and `data/orderflow_study_results.json`.
+Costs: taker 40+5 bps/side (90 bps round trip), maker 25 bps/side; stress 80+10 bps/side.
+Numbers are **net bps per trade**, out of sample, folds 1–4, with the live spec held fixed (view A).
+
+### regime @ 60m (baseline, no flow filter)
+
+| coin | trades | win % | mean | median | ex-best-2 | stress |
+|------|-------:|------:|-----:|-------:|----------:|-------:|
+| BTC  | 13 | 15 | +51  | −110 | −131 | −39 |
+| ETH  | 18 | 22 | +8   | −139 | −165 | −78 |
+| SOL  | 9  | 56 | +410 | +98  | +72  | +324 |
+| ALL  | 40 | 28 | +112 | −117 | −8   | +25 |
+
+Fold means: −135 / −89 / +393 / +176. The positive mean comes entirely from a few
+large trend winners: the median trade loses about 1.2% after fees, and without the best two
+trades the result is negative. Filters `ofi_pos`, `ofi_z_pos` and `flow3_pos` (ALL means
++123 / +120 / +120 on 38 trades) mostly just remove a couple of ETH trades. None beats
+baseline in 3 of 4 folds or has ex-best-2 > 0, so **none is promoted**.
+
+### meanrev (maker entry) @ 240m (baseline, no flow filter)
+
+| coin | trades | win % | mean | median | ex-best-2 | stress |
+|------|-------:|------:|-----:|-------:|----------:|-------:|
+| BTC  | 6  | 67  | +17  | +58  | −20  | −28 |
+| ETH  | 4  | 100 | +288 | +258 | +134 | +241 |
+| SOL  | 4  | 75  | +36  | +112 | −179 | −10 |
+| ALL  | 14 | 79  | +100 | +91  | +43  | +54 |
+
+Filters `ofi_pos`, `flow3_pos` and `ofi_rising` leave 8–13 trades, below the 30-trade
+minimum, and none beats baseline in 3 of 4 folds, so **none is promoted**. Even the baseline
+sample is too small (14 trades) to call it an edge.
+
+### Verdict
+
+Pre-registered promotion rules (all must hold, pooled over the 3 coins, view A, base costs):
+≥30 OOS trades; mean > 0 and above baseline; beats baseline in ≥3 of 4 folds;
+ex-best-2 mean > 0; stress mean > 0; positive on ≥2 coins; and view B (walk-forward
+selection) mean > 0. **No order-flow filter passed**, so `REGIME_FLOW_FILTER` and
+`MEANREV_FLOW_FILTER` stay empty and the live paper strategy is unchanged. Re-run the
+study once the Mac collector has a few more months of native tick history.
