@@ -41,6 +41,7 @@ class MeanReversion4hStrategy:
             "stop": float(s.meanrev_stop_pct),
             "tp": float(s.meanrev_take_profit_pct),
             "limit_offset": float(s.meanrev_limit_offset_pct),
+            "flt": str(getattr(s, "meanrev_flow_filter", "") or ""),
         }
 
     def enrich(self, bars: pd.DataFrame) -> pd.DataFrame:
@@ -80,4 +81,6 @@ class MeanReversion4hStrategy:
             why.append(f"rsi {rsi:.1f} > {p['rsi_os']:g}")
         if not price < ema:
             why.append(f"close >= ema{p['ema']}")
+        if p["flt"] and not sig["flt_ok"][i]:
+            why.append(f"order-flow filter {p['flt']} not met")
         return Signal(Action.WAIT, 10, "No meanrev entry: " + "; ".join(why) + f" ({txt})", price, atr)

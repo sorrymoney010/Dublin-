@@ -13,9 +13,14 @@ Evaluates three strategy families on BTC/ETH/SOL:
 Costs default to Kraken tier-1 TAKER 0.40%/side + 5 bps slippage/side
 (0.90% round trip). ``--fee-bps 25 --slip-bps 0`` models maker/limit fills.
 
-Data: data/kraken_<SYM>_<tf>m.csv (OHLC endpoint, ~720 bars) and, when present,
-data/kraken_<SYM>_<tf>m_trades.csv (trade-built deeper history). The longer
-of the two is used. Run scripts/fetch_kraken_history.py first.
+Data (``--source``):
+  * ``cache`` (default): data/kraken_<SYM>_<tf>m.csv (OHLC endpoint, ~720 bars)
+    and, when present, data/kraken_<SYM>_<tf>m_trades.csv (trade-built deeper
+    history). Run scripts/fetch_kraken_history.py first.
+  * ``pipeline``: the tick store (``--data-dir``, filled by
+    scripts/pipeline_backfill.py / tick_collector.py) aggregated by the same
+    ``dublin_bot.pipeline`` code the live strategies read, incl. order flow.
+Symbols default to the pipeline universe BTC/USD, ETH/USD, SOL/USD.
 
 Outputs a table to stdout and JSON to data/walkforward_results.json
 (the paper learner reads per-symbol OOS expectancy from it as a prior).
@@ -38,7 +43,7 @@ from dublin_bot.backtest_core import (  # noqa: E402
 )
 
 DATA = ROOT / "data"
-SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "PUMP/USD"]
+SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD"]  # pipeline universe (3 coins only)
 
 
 def load(symbol: str, tf: int) -> tuple[pd.DataFrame, str]:
@@ -65,6 +70,13 @@ def load(symbol: str, tf: int) -> tuple[pd.DataFrame, str]:
     return df, "+".join(srcs)
 
 
+def load_pipeline(symbol: str, tf: int, data_dir: str) -> tuple[pd.DataFrame, str]:
+    from dublin_bot.pipeline.history import load_pipeline_bars
+
+    df, _info = load_pipeline_bars(data_dir, symbol, tf)
+    return df, "pipeline"
+
+
 def fmt_row(cols: list, widths: list[int]) -> str:
     return " ".join(str(c).rjust(w) if i else str(c).ljust(w) for i, (c, w) in enumerate(zip(cols, widths, strict=False)))
 
@@ -79,12 +91,18 @@ def main() -> None:
     ap.add_argument("--folds", type=int, default=4)
     ap.add_argument("--equity", type=float, default=500.0)
     ap.add_argument("--out", default=str(DATA / "walkforward_results.json"))
+    ap.add_argument("--source", choices=["cache", "pipeline"], default="cache")
+    ap.add_argument("--data-dir", default=str(DATA), help="tick store root for --source pipeline")
     a = ap.parse_args()
 
     costs = Costs(fee_bps=a.fee_bps, slippage_bps=a.slip_bps, maker_bps=a.maker_bps)
     grid = default_grid()
     results: list[dict] = []
     widths = [8, 5, 11, 12, 6, 6, 8, 8, 7, 7, 6, 6, 8, 8]
+    if a.source == "pipeline" and Path(a.out).resolve() == (DATA / "walkforward_results.json").resolve():
+        # The live learner reads its priors from walkforward_results.json;
+        # never overwrite them from a different data source by accident.
+        a.out = str(DATA / "walkforward_pipeline_results.json")
     header = ["symbol", "tf", "family", "src", "days", "IS_n", "IS_bps", "IS_$/t",
               "OOS_n", "OOS_win", "OOSbps", "OOS$/t", "OOS_dd%", "FULL_bps"]
     print(f"costs: fee {a.fee_bps}bps/side + slippage {a.slip_bps}bps/side "
@@ -92,7 +110,7 @@ def main() -> None:
     print(fmt_row(header, widths))
     for tf in a.tfs:
         for sym in a.symbols:
-            raw, src = load(sym, tf)
+            raw, src = load(sym, tf) if a.source == "cache" else load_pipeline(sym, tf, a.data_dir)
             if len(raw) < 400:
                 print(f"{sym} {tf}m: only {len(raw)} bars — skipped")
                 continue
