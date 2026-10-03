@@ -161,7 +161,7 @@ Walk-forward selection inside each timeframe's grid: 240m 15 trades, mean +46 ·
 15m 237 trades, mean −50.
 
 **Verdict: nothing promoted.** Faster bars do produce a bigger sample, but the typical 1h/15m
-reversion move is smaller than the ~50–90 bps round-trip cost, so the edge turns negative (15m is
+reversion move is smaller than the ~70 bps round-trip cost (maker 25 bps in, taker 40+5 bps out on RSI or stop exits), so the edge turns negative (15m is
 negative on every coin and every fold). Loosening the 4h entry (rsi_os 43) reaches 30 trades but
 fails stress costs and is positive only on ETH. The live 4h sleeve stays as is, and its 14-trade
 sample is still too small to call an edge. No additional paper sleeve was added.
