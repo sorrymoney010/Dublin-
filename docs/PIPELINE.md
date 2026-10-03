@@ -134,3 +134,34 @@ ex-best-2 mean > 0; stress mean > 0; positive on ≥2 coins; and view B (walk-fo
 selection) mean > 0. **No order-flow filter passed**, so `REGIME_FLOW_FILTER` and
 `MEANREV_FLOW_FILTER` stay empty and the live paper strategy is unchanged. Re-run the
 study once the Mac collector has a few more months of native tick history.
+
+## Mean-reversion sample study — results (2026-10-02)
+
+`scripts/study_meanrev.py` (pre-registered: the design and promotion rules were committed in
+8a43af9 before the run) asks whether the live meanrev maker-entry logic gives a bigger,
+still-profitable out-of-sample sample on 1h or 15m bars, or in a small neighborhood of the live 4h
+settings. It covers 26 candidates: tf ∈ {240, 60, 15} × rsi_os ∈ {33, 38, 43} × rsi_exit ∈ {50, 55, 60},
+with live offset/stop/tp. It uses 120 days of tick-built bars for BTC, ETH and SOL. The OOS window is
+four common time folds (2026-07-26 → 2026-10-02). Full output is in `data/meanrev_study_report.txt`
+and `data/meanrev_study_results.json`.
+
+Pooled over the three coins (net bps per trade after fees; maker 25 bps/side, taker 40+5):
+
+| variant | trades | win % | mean | median | ex-best-2 | stress | folds > base | verdict |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| **240m os38/ex55 (live baseline)** | 14 | 79 | +100 | +91 | +43 | +54 | – | baseline |
+| 240m os43/ex50 (only 4h point with ≥30) | 30 | 70 | +28 | +40 | +3 | −17 | 2/4 | no (stress, folds, positive only on ETH) |
+| 240m other 7 points | 5–27 | 70–100 | +47…+206 | | | | ≤2/4 | no (n < 30, folds) |
+| 60m os33/ex60 (best 1h) | 41 | 66 | +2 | +26 | −9 | −43 | 1/4 | no |
+| 60m os38/ex55 (live params on 1h) | 74 | 60 | −21 | +14 | −27 | −66 | 1/4 | no |
+| 15m os38/ex55 (live params on 15m) | 228 | 26 | −55 | −30 | −57 | −100 | 0/4 | no |
+| 15m all 9 points | 126–379 | 10–30 | −52…−60 | | | | 0/4 | no |
+
+Walk-forward selection inside each timeframe's grid: 240m 15 trades, mean +46 · 60m 61 trades, mean −6 ·
+15m 237 trades, mean −50.
+
+**Verdict: nothing promoted.** Faster bars do produce a bigger sample, but the typical 1h/15m
+reversion move is smaller than the ~70 bps round-trip cost (maker 25 bps in, taker 40+5 bps out on RSI or stop exits), so the edge turns negative (15m is
+negative on every coin and every fold). Loosening the 4h entry (rsi_os 43) reaches 30 trades but
+fails stress costs and is positive only on ETH. The live 4h sleeve stays as is, and its 14-trade
+sample is still too small to call an edge. No additional paper sleeve was added.
