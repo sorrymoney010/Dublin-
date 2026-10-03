@@ -116,7 +116,27 @@ def main() -> int:
     if args.command in handlers:
         return handlers[args.command](settings)
 
-    result = TradingEngine(settings).run_cycle()
+    # One trading cycle writes the paper ledger: same guards as the loop.
+    from pathlib import Path
+
+    from .config import paper_live_choice_ok
+    from .instance import LEDGER_OWNER_ENV, InstanceLock, ledger_owner_ok
+
+    if not ledger_owner_ok():
+        print(f"REFUSE: not the ledger owner ({LEDGER_OWNER_ENV}!=1); only the Mac writes the paper ledger")
+        return 3
+    ok, why = paper_live_choice_ok(settings)
+    if not ok:
+        print(f"ABORT: {why}")
+        return 2
+    lock = InstanceLock(Path("logs/paper_trader.lock"))
+    if not lock.acquire(wait_seconds=0):
+        print(f"REFUSE: a paper loop is running (pid {lock.holder_pid()})")
+        return 3
+    try:
+        result = TradingEngine(settings).run_cycle()
+    finally:
+        lock.release()
     print(json.dumps(result.to_dict(), indent=2, default=str))
     return 0
 

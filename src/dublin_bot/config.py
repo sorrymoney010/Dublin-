@@ -133,7 +133,12 @@ class Settings(BaseSettings):
     learner_gate_enabled: bool = Field(default=True)
     # Paper/dry-run sizing from the paper ledger (cash + open cost basis,
     # seeded at STRATEGY_EQUITY_USD) instead of the real Kraken balance.
-    paper_use_ledger_equity: bool = Field(default=False)
+    # Default ON: paper mode must never need the private Balance endpoint.
+    paper_use_ledger_equity: bool = Field(default=True)
+    # Paper/dry-run never calls PRIVATE Kraken endpoints (Balance, TradesHistory,
+    # OpenOrders, ...). Two copies polling private endpoints with one key caused
+    # 1,511 "EGeneral:Temporary lockout" errors in the legacy box run.
+    paper_block_private_api: bool = Field(default=True)
     # ── Regime-switch trend sleeve (STRATEGY=regime_trend) ─────
     regime_lookback: int = Field(default=20, ge=2)
     regime_atr_mult: float = Field(default=3.0, gt=0)
@@ -196,8 +201,12 @@ class Settings(BaseSettings):
     #   gate; fee min-edge still applies and 4% TP clears MIN_EDGE_BPS=100).
     # Safety (budget cap, exchange stop, drawdown/daily-loss breakers) is
     # unchanged — aggression is in entry frequency, not in risk.
-    # Switch paper: STRATEGY=breakout|sr_flip|pattern|momentum|mean_reversion
-    strategy: str = Field(default="momentum")
+    # Default (and the only paper/live choice): regime_trend on >= 1h bars.
+    # momentum, every sub-1h sleeve and the other legacy strategies are
+    # RETIRED from paper/live (they lost after fees in every window); they stay
+    # importable for backtests only and need ALLOW_RETIRED_STRATEGIES=true.
+    strategy: str = Field(default="regime_trend")
+    allow_retired_strategies: bool = Field(default=False)
     # ── Momentum breakout sleeve knobs (STRATEGY=breakout) ─────
     # Universe scanned when strategy is breakout / momentum_breakout.
     # Map BTC/USD→XXBTZUSD etc. via the Kraken gateway (canonical form here).
@@ -310,13 +319,13 @@ class Settings(BaseSettings):
     min_order_notional_usd: float = Field(default=1.0, ge=1.0)
     # ── Fill-model cost assumptions (backtest + paper) ──────
     # These MUST mirror the real exchange fee schedule or every backtest is
-    # fiction. Kraken's "starter" tier on a ~$2.3k 30d volume account charges
-    # 80 bps taker / 40 bps maker — the old hardcoded 26 bps understated a
-    # round trip by ~1.1% and made losing strategies look profitable.
-    # Override via env (PAPER_TAKER_FEE_BPS etc.) once your tier improves;
-    # `TradeVolume` is the authoritative source.
-    paper_taker_fee_bps: float = Field(default=80.0, ge=0.0)
-    paper_maker_fee_bps: float = Field(default=40.0, ge=0.0)
+    # fiction. Kraken Pro tier-1 (< $10k 30d volume): 40 bps taker / 25 bps
+    # maker, plus 10 bps assumed slippage on taker fills. Same values as
+    # run_paper_mac.sh, the walk-forward and the studies.
+    # Override via env (PAPER_TAKER_FEE_BPS etc.); `TradeVolume` is the
+    # authoritative source.
+    paper_taker_fee_bps: float = Field(default=40.0, ge=0.0)
+    paper_maker_fee_bps: float = Field(default=25.0, ge=0.0)
     paper_slippage_bps: float = Field(default=10.0, ge=0.0)
     paper_min_spread_bps: float = Field(default=5.0, ge=0.0)
     # ── Advanced order execution (Kraken full API) ──────────
@@ -406,3 +415,26 @@ class Settings(BaseSettings):
             "strategy_equity_usd": self.strategy_equity_usd,
             "max_orders_per_day": self.max_orders_per_day,
         }
+
+
+# ── Paper/live strategy choices ──────────────────────────────────
+# Only these strategies may run in the paper or live loop. Everything else
+# (momentum, breakout@5m/15m, sr_flip, pattern, mean_reversion, ...) is
+# backtest-only. Timeframes below 60 minutes are retired for every sleeve.
+PAPER_LIVE_STRATEGIES = frozenset({"regime_trend", "regime"})
+MIN_PAPER_LIVE_TF_MINUTES = 60
+
+
+def paper_live_choice_ok(settings: "Settings") -> tuple[bool, str]:
+    """Is this configuration an allowed paper/live choice? (never raises)"""
+    if getattr(settings, "allow_retired_strategies", False):
+        return True, "retired strategies allowed (backtest/research override)"
+    name = str(getattr(settings, "strategy", "") or "").lower()
+    if name not in PAPER_LIVE_STRATEGIES:
+        return False, (f"strategy '{name}' is retired from paper/live "
+                       f"(allowed: {sorted(PAPER_LIVE_STRATEGIES)}; backtest-only otherwise)")
+    for field_name in ("timeframe_minutes", "meanrev_timeframe_minutes", "trendhold_timeframe_minutes"):
+        tf = getattr(settings, field_name, None)
+        if tf is not None and int(tf) < MIN_PAPER_LIVE_TF_MINUTES:
+            return False, f"{field_name}={tf} is a retired sub-1h timeframe"
+    return True, "ok"

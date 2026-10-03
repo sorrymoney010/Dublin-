@@ -397,6 +397,7 @@ def test_symbol_metadata_failure_remains_pending(tmp_path):
 
 
 def test_real_kraken_gateway_query_shape_and_symbol_metadata(tmp_path, gateway, fake_session):
+    gateway.settings.paper_block_private_api = False  # live-path query mechanics
     fake_session.routes["QueryOrders"] = {"error": [], "result": {"ORDER-1": exchange_order()}}
     monitor = make_monitor(tmp_path, {})
     monitor.trading_agent.gateway = SimpleNamespace(gateway=gateway)

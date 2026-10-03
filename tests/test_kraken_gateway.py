@@ -41,6 +41,8 @@ def make_settings(**overrides) -> Settings:
         symbol="BTC/USD",
         timeframe_minutes=60,
         lookback_bars=500,
+        # transport-level tests exercise private calls with fake keys
+        paper_block_private_api=False,
     )
     defaults.update(overrides)
     return Settings(**defaults)

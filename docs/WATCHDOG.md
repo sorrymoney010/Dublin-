@@ -49,3 +49,26 @@ Import only writes **closed** UTC days. A day `.gz` that already exists is merge
 touched (the collector's hourly compaction merges them later), and `_holes.json` is unioned.
 The manifest check passes when every listed day exists with either the same sha256 or a superset of
 its rows and id range.
+
+## Ops safety (paper loop)
+
+* **Single instance:** `scripts/paper_trader_loop.py` takes an exclusive `flock` on
+  `logs/paper_trader.lock`. The lock holds the pid and the kernel releases it when the process dies.
+  A second copy waits up to `PAPER_LOCK_WAIT_SECONDS` (20 s, which covers a `kickstart -k` overlap), then logs
+  `REFUSE: another paper loop holds …` and exits 3. The one-shot CLI cycle uses the same lock.
+* **One ledger writer:** the loop and the CLI cycle refuse to start unless `MAYO_LEDGER_OWNER=1`.
+  Only `scripts/run_paper_mac.sh` exports it, so the Mac is the only machine that writes the paper book.
+  The legacy box clone (`/workspace/mayo-bot`, stopped 2026-09-21) forked the ledger, and that cannot happen again.
+* **No private Kraken calls in paper:** `PAPER_BLOCK_PRIVATE_API=true` (default) makes every private
+  endpoint raise `PaperPrivateCallBlocked` before any HTTP request when `paper_trading` or
+  `dry_run` is on. `PAPER_USE_LEDGER_EQUITY=true` is now the default, so book equity comes from the ledger,
+  and the learner no longer polls `TradesHistory` in paper. The legacy box run logged 1,511
+  `EGeneral:Temporary lockout` errors on `Balance`.
+* **Paper fees:** defaults are now Kraken tier-1: taker 40 bps, maker 25 bps, slippage 10 bps (previously 80/40).
+  The Mac wrapper exports the same values.
+* **Retired strategies:** the paper/live loop accepts only `STRATEGY=regime_trend` (the new default,
+  previously `momentum`), and every sleeve needs a timeframe ≥ 60 min. `momentum`, `breakout` (5m/15m/60m),
+  `sr_flip`, `pattern`, `mean_reversion` and every sub-1h variant stay in the code for backtests only
+  (`ALLOW_RETIRED_STRATEGIES=true`). The loop logs `ABORT: … retired` and exits 2 otherwise.
+* **Log hygiene:** `paper_trader.log` lines are written once. stdout is only echoed to a TTY, because
+  launchd/nohup redirect stdout into the same file.
