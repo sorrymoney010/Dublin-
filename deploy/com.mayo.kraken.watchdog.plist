@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mayo.kraken.watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/musicmancheef/mayo-bot/scripts/run_watchdog_mac.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/musicmancheef/mayo-bot</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/musicmancheef/mayo-bot/logs/watchdog.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/musicmancheef/mayo-bot/logs/watchdog.err.log</string>
+</dict>
+</plist>

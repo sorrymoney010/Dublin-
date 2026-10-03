@@ -85,13 +85,17 @@ def verify_hole(client: KrakenPublic, symbol: str, lo: int, hi: int, ts_before: 
 
 
 def fill_gaps(store: TickStore, client: KrakenPublic, symbol: str, *, max_pages: int = 400,
-              progress: Callable[[str], None] | None = None) -> dict:
-    """Fill every id hole in the store from REST; record holes Kraken itself has."""
+              progress: Callable[[str], None] | None = None,
+              since_ts: float | None = None) -> dict:
+    """Fill every id hole in the store from REST; record holes Kraken itself has.
+
+    ``since_ts`` limits the scan to ticks at/after that time (cheap periodic runs).
+    """
     from .tickstore import find_gaps
 
     sym = canonical(symbol)
     known = store.verified_holes(sym)
-    gaps = [g for g in find_gaps(store.read(sym)) if (g[0], g[1]) not in known]
+    gaps = [g for g in find_gaps(store.read(sym, since_ts)) if (g[0], g[1]) not in known]
     filled = verified = still_open = 0
     for lo, hi, ts_before, _ts_after in gaps:
         backfill_range(store, client, sym, ts_before - 1, after_id=lo - 1, until_id=hi + 1,
