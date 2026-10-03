@@ -53,11 +53,12 @@ def attach_d1(d: pd.DataFrame, table: pd.DataFrame, tf_minutes: int) -> pd.DataF
     The value for an intraday bar is the latest daily row whose close_time is
     at or before that bar's CLOSE (no look-ahead)."""
     d = d.copy()
-    if table is None or not len(table) or "time" not in d:
+    opens = bar_open_times(d)
+    if table is None or not len(table) or opens is None:
         d["d1_riskon"] = np.nan
         d["d1_sma50"] = np.nan
         return d
-    bar_close = pd.to_numeric(d["time"], errors="coerce").to_numpy(float) + tf_minutes * 60
+    bar_close = opens + tf_minutes * 60
     ct = table["close_time"].to_numpy(float)
     idx = np.searchsorted(ct, bar_close, side="right") - 1
     ok = idx >= 0
@@ -68,6 +69,16 @@ def attach_d1(d: pd.DataFrame, table: pd.DataFrame, tf_minutes: int) -> pd.DataF
     d["d1_riskon"] = on
     d["d1_sma50"] = sma
     return d
+
+
+def bar_open_times(d: pd.DataFrame) -> np.ndarray | None:
+    """Bar-open epoch seconds from a ``time`` column or a DatetimeIndex."""
+    if "time" in d:
+        return pd.to_numeric(d["time"], errors="coerce").to_numpy(float)
+    if isinstance(d.index, pd.DatetimeIndex):
+        idx = d.index if d.index.tz is not None else d.index.tz_localize("UTC")
+        return (idx.asi8 // 10**9).astype(float)
+    return None
 
 
 def d1_mask(d: pd.DataFrame) -> np.ndarray:
@@ -136,6 +147,22 @@ def _r(x) -> float | None:
         return round(x, 8) if math.isfinite(x) else None
     except (TypeError, ValueError):
         return None
+
+
+def live_d1(strategy, d: pd.DataFrame, tf_minutes: int) -> pd.DataFrame:
+    """Attach D1 for the strategy's current symbol (live/paper strategies)."""
+    flt = getattr(strategy, "daily_filter", None) or default_filter()
+    return flt.attach(d, str(strategy.settings.symbol), tf_minutes)
+
+
+def d1_reason(d: pd.DataFrame, i: int = -1) -> str:
+    if "d1_riskon" not in d:
+        return "D1 off"
+    v = d["d1_riskon"].iloc[i]
+    sma = d["d1_sma50"].iloc[i] if "d1_sma50" in d else float("nan")
+    if not (isinstance(v, float) and math.isfinite(v)):
+        return "D1 unknown (daily data unavailable/warming up) — entries blocked"
+    return f"D1 {'risk-on' if v > 0.5 else 'risk-off'} (sma50_d={sma:.6g})"
 
 
 _DEFAULT: DailyFilter | None = None

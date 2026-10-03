@@ -25,6 +25,18 @@ def isolate_runtime_files(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
 
+def _offline_daily(symbol: str):
+    raise ConnectionError("tests are offline: daily OHLC not available")
+
+
+@pytest.fixture(autouse=True)
+def offline_daily_filter(monkeypatch):
+    """The live daily (D1) filter must never hit Kraken from a test: it fails closed."""
+    from dublin_bot import daily_filter
+
+    monkeypatch.setattr(daily_filter, "_DEFAULT", daily_filter.DailyFilter(fetch=_offline_daily))
+
+
 class FakeResponse:
     def __init__(self, payload: Any, status_code: int = 200) -> None:
         self._payload = payload

@@ -92,7 +92,8 @@ def test_regime_strategy_matches_backtest_signals():
     bars = df.drop(columns=["time"])
     bars.index = pd.date_range("2026-01-01", periods=len(bars), freq="h", tz="UTC")
     s = Settings(_env_file=None, strategy="regime_trend", stop_loss_pct=0.03,
-                 take_profit_pct=0.25, regime_lookback=20, regime_atr_mult=3.0)
+                 take_profit_pct=0.25, regime_lookback=20, regime_atr_mult=3.0,
+                 regime_daily_filter=False)  # base-signal parity; D1 parity tested separately
     strat = build_strategy(s)
     assert type(strat).__name__ == "RegimeTrendStrategy"
     d = add_indicators(bars)

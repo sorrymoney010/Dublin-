@@ -67,6 +67,8 @@ def main() -> None:
     from dublin_bot.engine import TradingEngine
     from dublin_bot.instance import LEDGER_OWNER_ENV, InstanceLock, ledger_owner_ok
     from dublin_bot.meanrev_sleeve import MeanRevSleeve, sleeve_active
+    from dublin_bot.trendhold_sleeve import TrendHoldSleeve
+    from dublin_bot.trendhold_sleeve import sleeve_active as trendhold_active
 
     # Only the ledger-owner machine (the Mac wrapper) may write the paper book.
     if not ledger_owner_ok():
@@ -126,6 +128,17 @@ def main() -> None:
         f"stop={settings.meanrev_stop_pct:.2%} tp={settings.meanrev_take_profit_pct:.2%} "
         f"limit=-{settings.meanrev_limit_offset_pct:.2%} valid={settings.meanrev_limit_valid_bars}bar "
         f"max_pos={settings.max_concurrent_positions} (shared)"
+    )
+
+    th_on, th_why = trendhold_active(settings)
+    log(
+        f"SLEEVES trendhold_4h={'on' if th_on else 'off'} ({th_why}) "
+        f"key=trendhold@{settings.trendhold_timeframe_minutes}m symbols={','.join(settings.trendhold_symbols)} "
+        f"size={settings.trendhold_position_fraction:.0%}/coin ema{settings.trendhold_ema_fast}>"
+        f"ema{settings.trendhold_ema_slow} exit=close<ema{settings.trendhold_ema_slow} stop=none "
+        f"| D1 regime={settings.regime_daily_filter} meanrev={settings.meanrev_daily_filter} "
+        f"trendhold={settings.trendhold_daily_filter} | caps max_pos={settings.max_concurrent_positions} "
+        f"exposure<={settings.max_exposure_fraction:.0%} (shared, all sleeves)"
     )
 
     if getattr(settings, "pipeline_enabled", False):
@@ -222,6 +235,24 @@ def main() -> None:
                 )
             except Exception as exc:  # noqa: BLE001
                 log(f"ERROR sleeve=meanrev_4h {type(exc).__name__}: {exc}")
+                traceback.print_exc()
+
+        # Third PAPER sleeve (4h trend-hold, market entries). Isolated like meanrev.
+        if th_on:
+            try:
+                res = TrendHoldSleeve(settings).run_cycle()
+                d = res.to_dict()
+                acts = ",".join(f"{a['event']}:{a['symbol']}" for a in d["actions"]) or "none"
+                syms = " | ".join(f"{k}: {v}" for k, v in d["symbols"].items())
+                log(f"CYCLE sleeve=trendhold_4h active={d['active']} actions={acts} errors={len(d['errors'])} "
+                    f"| {syms}"[:900])
+                for err in d["errors"]:
+                    log(f"WARN sleeve=trendhold_4h {err}"[:300])
+                (ROOT / "logs" / "last_cycle_trendhold.json").write_text(
+                    json.dumps(d, default=str, indent=2), encoding="utf-8"
+                )
+            except Exception as exc:  # noqa: BLE001
+                log(f"ERROR sleeve=trendhold_4h {type(exc).__name__}: {exc}")
                 traceback.print_exc()
 
         if getattr(settings, "pipeline_enabled", False):

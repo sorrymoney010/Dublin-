@@ -42,6 +42,7 @@ class MeanReversion4hStrategy:
             "tp": float(s.meanrev_take_profit_pct),
             "limit_offset": float(s.meanrev_limit_offset_pct),
             "flt": str(getattr(s, "meanrev_flow_filter", "") or ""),
+            "d1": bool(getattr(s, "meanrev_daily_filter", True)),
         }
 
     def enrich(self, bars: pd.DataFrame) -> pd.DataFrame:
@@ -58,7 +59,13 @@ class MeanReversion4hStrategy:
             return Signal(Action.WAIT, 0, f"Not enough bars for meanrev sleeve ({n} < {MIN_BARS})", 0.0)
         d = self.enrich(bars)
         p = self.params()
+        if p["d1"] and not in_position:  # D1 gates entries only, never exits
+            from dublin_bot.daily_filter import live_d1
+            d = live_d1(self, d, int(self.settings.timeframe_minutes))
+        else:
+            p = {**p, "d1": False}
         sig = meanrev_signals(d, p)
+        self.last_frame = d
         i = len(d) - 1
         price = float(d["close"].iloc[i])
         rsi = float(sig["rsi"][i])
@@ -83,4 +90,7 @@ class MeanReversion4hStrategy:
             why.append(f"close >= ema{p['ema']}")
         if p["flt"] and not sig["flt_ok"][i]:
             why.append(f"order-flow filter {p['flt']} not met")
+        if p["d1"] and not sig["d1_ok"][i]:
+            from dublin_bot.daily_filter import d1_reason
+            why.append(d1_reason(d, i))
         return Signal(Action.WAIT, 10, "No meanrev entry: " + "; ".join(why) + f" ({txt})", price, atr)

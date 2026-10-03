@@ -172,6 +172,28 @@ class Settings(BaseSettings):
     # Optional order-flow entry filter for the 4h sleeve (see regime_flow_filter).
     meanrev_flow_filter: str = Field(default="")
     meanrev_state_path: Path = Path("logs/meanrev_sleeve.json")
+    # ── Daily risk-on filter (D1) on ENTRIES ──────────────────────
+    # close_d > SMA50_d and SMA50_d rising over 5 days, closed UTC daily bars
+    # (Kraken public daily OHLC). Gates entries only, never forces an exit;
+    # unknown daily data blocks entries (fail closed). ON by default: the
+    # pre-registered walk-forward (docs/PIPELINE.md, data/d1_trendhold_report.txt)
+    # did not find it hurting out of sample.
+    regime_daily_filter: bool = Field(default=True)
+    meanrev_daily_filter: bool = Field(default=True)
+    # ── 4h trend-hold PAPER sleeve (third sleeve) ─────────────────
+    # Entry after a 4h close with D1 on, close > EMA100 and EMA20 > EMA100
+    # (market, next cycle); exit at the first 4h close below EMA100. No hard
+    # stop. Fixed 25% of the paper book per coin; one position per coin across
+    # ALL sleeves (SleeveRegistry); total exposure capped by
+    # max_exposure_fraction (0.75 in run_paper_mac.sh). Paper only.
+    trendhold_sleeve_enabled: bool = Field(default=True)
+    trendhold_timeframe_minutes: int = Field(default=240, ge=60)
+    trendhold_symbols: list[str] = Field(default_factory=lambda: ["BTC/USD", "ETH/USD", "SOL/USD"])
+    trendhold_position_fraction: float = Field(default=0.25, gt=0, le=0.34)
+    trendhold_ema_fast: int = Field(default=20, ge=2)
+    trendhold_ema_slow: int = Field(default=100, ge=10)
+    trendhold_daily_filter: bool = Field(default=True)
+    trendhold_state_path: Path = Path("logs/trendhold_sleeve.json")
     # ── Market-data pipeline (Data -> Ticks -> Bars -> Technicals) ──
     # When enabled, gateway.get_bars() for BTC/ETH/SOL at 1/15/60/240m serves
     # tick-built bars (with order-flow columns) from PIPELINE_DATA_DIR, written

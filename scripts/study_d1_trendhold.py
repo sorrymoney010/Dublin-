@@ -126,6 +126,7 @@ def book_sim(frames: dict, trades: dict, start: int, end: int | None, frac: floa
              for s, tr in trades.items()}
     fee, slip = costs.fee_bps / 1e4, costs.slippage_bps / 1e4
     cash, pos, curve, closed = equity0, {}, [], []
+    realized_curve: list[float] = []  # cash + cost basis of open lots (no mark-to-market)
 
     def equity_at(t, field):
         return cash + sum(q * float(px[s].at[t, field]) for s, (q, _tr, _n) in pos.items() if t in px[s].index)
@@ -152,6 +153,7 @@ def book_sim(frames: dict, trades: dict, start: int, end: int | None, frac: floa
                 cash -= notional
                 pos[s] = (q, tr[t], notional)
         curve.append((t, equity_at(t, "close")))
+        realized_curve.append(cash + sum(n for _q, _tr, n in pos.values()))
     # mark open positions at the last close, net of exit costs
     if curve:
         t_last = curve[-1][0]
@@ -161,10 +163,16 @@ def book_sim(frames: dict, trades: dict, start: int, end: int | None, frac: floa
                            "net_bps": round((val / notional - 1) * 1e4, 1), "open_at_end": True})
             cash += val
         curve[-1] = (t_last, cash)
+        realized_curve[-1] = cash
     eq = np.array([e for _, e in curve]) if curve else np.array([equity0])
     peak = np.maximum.accumulate(eq)
+    rc = np.array([equity0] + realized_curve)
+    rpeak = np.maximum.accumulate(rc)
     return {"return_pct": round((eq[-1] / equity0 - 1) * 100, 2),
             "max_dd_pct": round(float(((eq - peak) / peak).min()) * 100, 2),
+            # drawdown of closed-trade equity only (what a realized-PnL curve shows);
+            # the mark-to-market max_dd_pct above is the honest risk number.
+            "realized_only_dd_pct": round(float(((rc - rpeak) / rpeak).min()) * 100, 2),
             "trades": len(closed), "trade_stats": stats([c["net_bps"] / 1e4 for c in closed]),
             "closed": closed, "first": curve[0][0] if curve else None, "last": curve[-1][0] if curve else None}
 
@@ -243,17 +251,18 @@ def report(res: dict) -> str:
                  f"{fmt(dcs['oos_sum_d1'])}, D1 worse in {dcs['folds_d1_worse']}/4 folds) => default {dcs['default'].upper()}")
         L.append("")
     b = res["part_b"]
-    L.append("== trend-hold@240m book ($500)            return%  maxDD%  trades  win%  mean  median")
+    L.append("== trend-hold@240m book ($500)            return%  maxDD%  trades  win%  mean  median  realizedDD%")
     for k in ("oos_25pct_d1", "oos_33pct_d1", "oos_25pct_d1_stress", "oos_25pct_noD1", "is_25pct_d1", "is_25pct_noD1"):
         x = b[k]
         ts = x["trade_stats"]
         win = None if ts["win"] is None else ts["win"] * 100
         L.append(f"   {k:<36} {x['return_pct']:>7} {x['max_dd_pct']:>7} {x['trades']:>7} {fmt(win):>5} "
-                 f"{fmt(ts['mean']):>5} {fmt(ts['median']):>7}")
+                 f"{fmt(ts['mean']):>5} {fmt(ts['median']):>7} {x['realized_only_dd_pct']:>9}")
     for k in ("buy_hold_oos", "buy_hold_is"):
         x = b[k]
         L.append(f"   {k:<36} {x['return_pct']:>7} {x['max_dd_pct']:>7}   coins {x['coin_price_change_pct']}")
     L.append("   audit claim (OOS, +D1, 1/3 per coin, 1m fills): +20.3% / maxDD -4.7%")
+    L.append("   maxDD% = mark-to-market (honest); realizedDD% = closed-trade equity only (the audit's -4.7% basis)")
     L.append("   OOS per coin (+D1): " + "  ".join(f"{s} n={v['n']} mean={fmt(v['mean'])} med={fmt(v['median'])}"
                                                    for s, v in b["oos_per_coin_trade_stats_d1"].items()))
     return "\n".join(L) + "\n"
