@@ -34,6 +34,8 @@ class TrendHoldStrategy:
                 "d1": bool(getattr(s, "trendhold_daily_filter", True))}
 
     def evaluate(self, bars: pd.DataFrame | None, in_position: bool = False) -> Signal:
+        self.d1_blocked = False
+        self.last_frame = None
         n = 0 if bars is None else len(bars)
         if bars is None or n < MIN_BARS:
             return Signal(Action.WAIT, 0, f"Not enough bars for trend-hold ({n} < {MIN_BARS})", 0.0)
@@ -47,6 +49,9 @@ class TrendHoldStrategy:
         sig = trendhold_signals(d, p)
         self.last_frame = d
         i = len(d) - 1
+        # the raw rules fired but the daily filter stopped it -> shadow-trade candidate
+        self.d1_blocked = bool(p["d1"] and not sig["d1_ok"][i]
+                               and trendhold_signals(d, {**p, "d1": False})["entry"][i])
         price = float(d["close"].iloc[i])
         ef, es = float(sig["ema_fast"][i]), float(sig["ema_slow"][i])
         atr = float(d["atr"].iloc[i])

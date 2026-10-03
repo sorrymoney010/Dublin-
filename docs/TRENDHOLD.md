@@ -90,7 +90,7 @@ negative. Most of the edge comes from a few large trend wins.
 - **Size.** 25% of the $500 paper book per coin (`TRENDHOLD_POSITION_FRACTION`, at most
   0.34), times the learner size multiplier. It is capped by the room left under the
   total exposure cap and by free cash.
-- **Universe.** BTC/USD, ETH/USD and SOL/USD (`TRENDHOLD_SYMBOLS`).
+- **Universe.** BTC/USD, ETH/USD and SOL/USD only. This is fixed in code and does not depend on `UNIVERSE_ALLOWLIST`; `TRENDHOLD_SYMBOLS` can only narrow it.
 - **State.** `logs/trendhold_sleeve.json`. The last cycle is written to
   `logs/last_cycle_trendhold.json`. Each cycle writes a `CYCLE sleeve=trendhold_4h ...`
   line to the paper log.
@@ -104,6 +104,11 @@ negative. Most of the edge comes from a few large trend wins.
 | `MAX_POSITION_FRACTION` | **0.25** (unchanged) | |
 | `MAX_EXPOSURE_FRACTION` | **0.75** in `run_paper_mac.sh` (was 0.50) | This is the **only limit change**. It lets three 25% positions coexist. Exposure counts every lot at market plus pending orders. The code default stays 0.50 for non-paper use. |
 | Daily-loss breaker, drawdown breaker, cooldown | — | Shared `RiskManager` + `SessionState`. |
+
+The shared order cooldown (`COOLDOWN_MINUTES`, default 10) still applies. When several
+coins signal on the same 4h close, they enter one after another, roughly one cooldown
+apart, within the same 4h bar. They do not all enter at that bar's open as the backtest
+assumes.
 
 ### Out-of-sample result vs buy-and-hold (Aug 3 → Oct 2 2026, $500 book)
 

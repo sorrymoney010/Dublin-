@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Canonical tradeable basket. Fixed and independent of the *currently selected*
@@ -128,7 +128,9 @@ class Settings(BaseSettings):
     # trades is benched for learner_bench_hours, then gets one probation trade
     # at reduced size. Weak/negative-but-unproven names trade at reduced size.
     learner_priors_path: Path = Path("data/walkforward_results.json")
-    learner_min_sample: int = Field(default=8, ge=2)
+    # No bench before 30 closed trades per strategy+coin (audit policy). Values
+    # below the floor (e.g. an old LEARNER_MIN_SAMPLE=8 in an env file) are raised.
+    learner_min_sample: int = Field(default=30, ge=2)
     learner_bench_hours: float = Field(default=72.0, gt=0)
     learner_gate_enabled: bool = Field(default=True)
     # Paper/dry-run sizing from the paper ledger (cash + open cost basis,
@@ -375,6 +377,11 @@ class Settings(BaseSettings):
     )
     trailing_stop: bool = Field(default=False)                 # trail SL to peak
     journal_path: Path = Path("logs/decisions.jsonl")
+
+    @field_validator("learner_min_sample", mode="after")
+    @classmethod
+    def _learner_floor(cls, v: int) -> int:
+        return max(int(v), 30)
 
     @model_validator(mode="after")
     def validate_safety(self) -> "Settings":

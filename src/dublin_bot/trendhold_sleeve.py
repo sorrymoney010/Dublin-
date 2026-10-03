@@ -44,8 +44,10 @@ from .risk import RiskManager
 from .sleeve_registry import SleeveRegistry
 from .state import StateStore
 from .strategies.trendhold_strategy import TrendHoldStrategy
+from .telemetry import blocked_entry, sleeve_decision, trade_detail
 
 SLEEVE = "trendhold_4h"
+TRENDHOLD_COINS = ("BTC/USD", "ETH/USD", "SOL/USD")
 
 
 def sleeve_active(settings: Settings) -> tuple[bool, str]:
@@ -58,7 +60,7 @@ def sleeve_active(settings: Settings) -> tuple[bool, str]:
 
 class TrendHoldSleeve:
     def __init__(self, settings: Settings, *, gateway=None, audit: AuditLog | None = None,
-                 now_fn: Callable[[], float] = time.time, trade_log=None) -> None:
+                 now_fn: Callable[[], float] = time.time) -> None:
         self.base_settings = settings
         tf = int(settings.trendhold_timeframe_minutes)
         self.settings = settings.model_copy(update={"timeframe_minutes": tf, "strategy": SLEEVE})
@@ -79,7 +81,6 @@ class TrendHoldSleeve:
         self.registry = SleeveRegistry()
         self.portfolio = PaperPortfolio(PAPER_BOOK)
         self.state_store = StateStore(Path(settings.session_state_path))
-        self.trade_log = trade_log
         from .learner import LearningAgent
         self.learner = LearningAgent(
             settings.learner_path, min_trades=settings.learner_min_trades,
@@ -96,11 +97,9 @@ class TrendHoldSleeve:
             sym = str(sym).strip().upper()
             if sym and sym not in out:
                 out.append(sym)
-        allow = self.settings.universe_allowlist
-        if allow:
-            allowed = {x.upper() for x in allow}
-            out = [s for s in out if s in allowed]
-        return out
+        # Fixed to BTC/ETH/SOL (the tested set) independent of UNIVERSE_ALLOWLIST,
+        # which is the primary engine's scan basket.
+        return [s for s in out if s in TRENDHOLD_COINS]
 
     def _load_state(self) -> dict:
         try:
@@ -197,6 +196,7 @@ class TrendHoldSleeve:
                 res.symbols[sym] = "holding (no 4h bar closed since fill)"
                 continue
             sig = self.strategy.evaluate(bars, in_position=True)
+            sleeve_decision(self, sym, sig, bars, in_position=True, d1_enabled=False)
             if sig.action is not Action.SELL:
                 res.symbols[sym] = sig.reason[:140]
                 continue
@@ -221,8 +221,12 @@ class TrendHoldSleeve:
             st["positions"].pop(sym)
             meta = self.learner.pop_entry(sym) or {}
             try:
+                detail = trade_detail(pos, exit_signal_px=float(sig.price), exit_fill_px=fill.price,
+                                      exit_fee=fill.fee, exit_maker=False, reason="below_ema100",
+                                      bars=bars, now=now, qty=sell_qty, cost_basis=cost_basis)
                 self.learner.record_trade(sym, realized, meta.get("regime") or "trend",
-                                          notional=cost_basis, strategy=self.strategy_key)
+                                          notional=cost_basis, strategy=self.strategy_key, ts=now,
+                                          detail=detail)
             except Exception:
                 pass
             self.risk.update_scale_from_trade(realized, state)
@@ -232,14 +236,6 @@ class TrendHoldSleeve:
             net_bps = realized / cost_basis * 1e4 if cost_basis > 0 else 0.0
             self._event(st, res, "exit", sym, reason="below_ema100", price=fill.price, qty=sell_qty,
                         realized=round(realized, 6), net_bps=round(net_bps, 1))
-            if self.trade_log is not None:
-                try:
-                    self.trade_log.close(sleeve=self.strategy_key, symbol=sym, pos=pos, exit_px=fill.price,
-                                         exit_signal_px=float(sig.price), exit_fee=fill.fee, exit_maker=False,
-                                         reason="below_ema100", realized=realized, cost_basis=cost_basis,
-                                         qty=sell_qty, now=now)
-                except Exception:
-                    pass
             res.symbols[sym] = f"EXIT below_ema100 @ {fill.price:.6g} realized ${realized:+.2f} ({net_bps:+.0f} bps)"
 
     # ── new entries ────────────────────────────────────────────
@@ -267,8 +263,12 @@ class TrendHoldSleeve:
             closed_at = bar_open + self.tf_seconds
             bar_iso = _iso(bar_open)
             sig = self.strategy.evaluate(bars, in_position=False)
+            sleeve_decision(self, sym, sig, bars, in_position=False,
+                            d1_enabled=bool(self.settings.trendhold_daily_filter))
             if sig.action is not Action.BUY:
                 res.symbols[sym] = sig.reason[:160]
+                if getattr(self.strategy, "d1_blocked", False):
+                    res.blocked.append(blocked_entry(self, sym, sig, bars, sig.reason, gate="d1"))
                 continue
             if st["last_signal_bar"].get(sym) == bar_iso:
                 res.symbols[sym] = f"signal bar {bar_iso} already handled"
@@ -280,6 +280,8 @@ class TrendHoldSleeve:
             if self._try_buy(st, res, sym, sig, bar_iso, lots, state, now):
                 mine.add(sym)
                 held_all.add(sym)
+            else:
+                res.blocked.append(blocked_entry(self, sym, sig, bars, res.symbols.get(sym, "blocked")))
 
     def room(self, lots: dict[str, float], equity: float) -> tuple[float, float, int]:
         """(exposure_usd incl. pending, cap_usd, open_slots_used) across ALL sleeves."""
@@ -325,8 +327,6 @@ class TrendHoldSleeve:
             verdict = self.learner.gate(sym, "trend")
             if not verdict.allow:
                 res.symbols[sym] = f"BUY blocked: learner bench {verdict.key}: {verdict.reason}"[:160]
-                res.blocked.append({"symbol": sym, "gate": "learner", "reason": verdict.reason,
-                                    "price": float(t["ask"]), "signal_bar": bar_iso})
                 return False
             size_mult = float(verdict.size_mult)
         price = float(t["ask"])

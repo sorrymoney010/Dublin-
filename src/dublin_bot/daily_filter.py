@@ -95,7 +95,8 @@ _PAIR = {"BTC/USD": "XBTUSD", "ETH/USD": "ETHUSD", "SOL/USD": "SOLUSD"}
 def _rest_daily(symbol: str) -> pd.DataFrame:
     from .pipeline.kraken_rest import KrakenPublic
     pair = _PAIR.get(symbol.upper(), symbol.replace("/", ""))
-    rows = KrakenPublic(min_interval=0.0).ohlc(pair, 1440)
+    # few retries: a Kraken hiccup must not stall the paper loop (stale same-day cache / fail closed)
+    rows = KrakenPublic(min_interval=0.0, timeout=10.0).ohlc(pair, 1440, retries=2)
     return pd.DataFrame({"time": [int(r[0]) for r in rows], "close": [float(r[4]) for r in rows]})
 
 
