@@ -37,6 +37,10 @@ def main() -> None:
     ap.add_argument("--fill-gaps", action="store_true", help="only fill trade-id holes")
     ap.add_argument("--pause", type=float, default=1.0, help="min seconds between requests")
     ap.add_argument("--max-gap-pages", type=int, default=400)
+    ap.add_argument("--since-hours", type=float, default=None,
+                    help="with --fill-gaps: only scan the last N hours")
+    ap.add_argument("--no-compact", action="store_true",
+                    help="leave compaction to the collector (used by the watchdog)")
     a = ap.parse_args()
 
     store = TickStore(a.data_dir)
@@ -47,7 +51,9 @@ def main() -> None:
             log(f"skip {raw}: not in pipeline universe {SYMBOLS}")
             continue
         if a.fill_gaps:
-            res = fill_gaps(store, client, sym, max_pages=a.max_gap_pages, progress=log)
+            since = time.time() - a.since_hours * 3600 if a.since_hours else None
+            res = fill_gaps(store, client, sym, max_pages=a.max_gap_pages, progress=log,
+                            since_ts=since)
             log(f"{sym}: {res}")
         else:
             since = time.time() - a.days * 86400
@@ -58,7 +64,7 @@ def main() -> None:
                 log(f"{sym}: resuming after trade_id {after}")
             res = backfill_range(store, client, sym, since, after_id=after, progress=log)
             log(f"{sym}: {res}")
-        done = store.compact(sym)
+        done = [] if a.no_compact else store.compact(sym)
         if done:
             log(f"{sym}: compacted {len(done)} day file(s)")
 
