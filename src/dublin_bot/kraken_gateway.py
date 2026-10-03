@@ -54,6 +54,7 @@ from .errors import (
     BrokerError,
     InvalidRequestError,
     RateLimitError,
+    PaperPrivateCallBlocked,
     SafetyLockError,
     TransientBrokerError,
     classify_kraken_error,
@@ -288,6 +289,12 @@ class KrakenGateway:
         return base64.b64encode(mac.digest()).decode()
 
     def _private(self, endpoint: str, params: dict | None = None) -> dict:
+        st = getattr(self, "settings", None)
+        if (st is not None and getattr(st, "paper_block_private_api", True)
+                and (getattr(st, "paper_trading", False) or getattr(st, "dry_run", False))):
+            raise PaperPrivateCallBlocked(
+                f"private Kraken endpoint '{endpoint}' blocked: paper/dry-run mode never "
+                "calls private endpoints (PAPER_BLOCK_PRIVATE_API)")
         if not self.has_credentials:
             raise AuthenticationError(
                 "Kraken credentials required for private endpoints"

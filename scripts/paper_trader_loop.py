@@ -31,8 +31,14 @@ signal.signal(signal.SIGTERM, _stop)
 
 
 def log(msg: str) -> None:
+    """Append one line to logs/paper_trader.log (exactly once).
+
+    launchd/nohup redirect stdout into the same file, so echoing to stdout
+    wrote every line twice. Only echo when attached to a terminal.
+    """
     line = f"[{datetime.now(timezone.utc).isoformat()}] {msg}"
-    print(line, flush=True)
+    if sys.stdout.isatty():
+        print(line, flush=True)
     LOG.parent.mkdir(parents=True, exist_ok=True)
     with LOG.open("a", encoding="utf-8") as fh:
         fh.write(line + "\n")
@@ -53,12 +59,32 @@ def _as_dict(result):
     return getattr(result, "__dict__", {"raw": str(result)})
 
 
+LOCK = ROOT / "logs" / "paper_trader.lock"
+
+
 def main() -> None:
-    from dublin_bot.config import Settings
+    from dublin_bot.config import Settings, paper_live_choice_ok
     from dublin_bot.engine import TradingEngine
+    from dublin_bot.instance import LEDGER_OWNER_ENV, InstanceLock, ledger_owner_ok
     from dublin_bot.meanrev_sleeve import MeanRevSleeve, sleeve_active
 
+    # Only the ledger-owner machine (the Mac wrapper) may write the paper book.
+    if not ledger_owner_ok():
+        log(f"REFUSE: not the ledger owner ({LEDGER_OWNER_ENV}!=1). Only the Mac "
+            "(scripts/run_paper_mac.sh) writes the paper ledger; this copy will not start.")
+        sys.exit(3)
+    lock = InstanceLock(LOCK)
+    if not lock.acquire(wait_seconds=float(os.environ.get("PAPER_LOCK_WAIT_SECONDS", "20"))):
+        log(f"REFUSE: another paper loop holds {LOCK} (pid {lock.holder_pid()}); "
+            "single instance only — exiting.")
+        sys.exit(3)
+
     settings = Settings()
+    ok_choice, why_choice = paper_live_choice_ok(settings)
+    if not ok_choice:
+        log(f"ABORT: {why_choice}")
+        lock.release()
+        sys.exit(2)
     live = (
         settings.allow_live_trading
         and not settings.paper_trading
@@ -215,6 +241,7 @@ def main() -> None:
             time.sleep(1)
 
     log("STOP paper loop")
+    lock.release()
 
 
 if __name__ == "__main__":

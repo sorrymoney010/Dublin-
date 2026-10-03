@@ -79,7 +79,8 @@ def test_mr_holds_in_position_when_still_oversold():
 
 def test_build_strategy_factory_selects_mr():
     assert isinstance(build_strategy(Settings(strategy="mean_reversion")), MeanReversionStrategy)
-    # Default strategy is now momentum (aggressive, more frequent entries);
-    # mean-reversion is still selectable explicitly.
-    assert isinstance(build_strategy(Settings()), TrendBreakoutStrategy)
+    # Default strategy is regime_trend (momentum is retired to backtest-only);
+    # mean-reversion / momentum are still constructible explicitly.
+    from dublin_bot.strategies.regime_strategy import RegimeTrendStrategy
+    assert isinstance(build_strategy(Settings(_env_file=None)), RegimeTrendStrategy)
     assert isinstance(build_strategy(Settings(strategy="momentum")), TrendBreakoutStrategy)

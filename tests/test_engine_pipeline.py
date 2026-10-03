@@ -250,6 +250,7 @@ def test_ledger_persists_across_engine_restart(settings, fake_session):
 
 def test_recovery_confirms_an_order_that_actually_landed(settings, fake_session):
     """The ambiguous-submission case resolves by querying the exchange."""
+    settings.paper_block_private_api = False  # live-path reconciliation mechanics
     engine = build_engine(settings, fake_session)
     record = engine.ledger.reserve(
         key="orphan", symbol="BTC/USD", side="buy", notional_usd=6.25,

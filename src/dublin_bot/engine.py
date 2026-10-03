@@ -879,7 +879,10 @@ class TradingEngine:
         # Ingest REAL closed-trade P&L from Kraken so the learner's coin bias
         # reflects live results, not just paper fills.
         try:
-            self.learner.sync_from_exchange(self.gateway)
+            # Paper/dry-run: the learner is fed by paper fills only; never poll
+            # the private TradesHistory endpoint.
+            if not (self.settings.paper_trading or self.settings.dry_run):
+                self.learner.sync_from_exchange(self.gateway)
         except Exception as exc:
             self.audit.record(AuditEvent.BROKER_ERROR,
                               {"operation": "learner_sync", "error": str(exc)},

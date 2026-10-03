@@ -6,6 +6,10 @@ export PAPER_TRADING=true
 export DRY_RUN=true
 export ALLOW_LIVE_TRADING=false
 export LIVE_RISK_ACKNOWLEDGEMENT=
+# This Mac is the ONLY paper-ledger writer; any other copy refuses to start.
+export MAYO_LEDGER_OWNER=1
+# Paper never calls private Kraken endpoints (book equity comes from the ledger).
+export PAPER_BLOCK_PRIVATE_API=true
 # Strategy picked by walk-forward (docs/WALKFORWARD.md, data/walkforward_report.txt):
 # regime-switch trend sleeve on 1h bars — ADX/vol gated, flat in chop, chandelier exit.
 # Edge is marginal and outlier-dependent; this is a paper experiment, not a proven edge.
@@ -23,6 +27,7 @@ export RISK_PER_TRADE=0.01
 # Paper fill model = Kraken tier-1 (taker 0.40%/side, maker 0.25%/side) + 10bps slippage.
 export PAPER_TAKER_FEE_BPS=40
 export PAPER_MAKER_FEE_BPS=25
+export PAPER_SLIPPAGE_BPS=10
 # Adaptive learner gate (bench negative-expectancy symbol/regime after 8 closed trades).
 export LEARNER_GATE_ENABLED=true
 export LEARNER_MIN_SAMPLE=8

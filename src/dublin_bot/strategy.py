@@ -171,7 +171,7 @@ def build_strategy(settings: Settings):
     """Factory: pick the active strategy from config.
 
     Supported names:
-    - ``momentum`` (default): RSI band + hard regime EMA + ADX sit-out + fee min-edge
+    - ``momentum`` (RETIRED, backtest-only): RSI band + hard regime EMA + ADX sit-out + fee min-edge
     - ``mean_reversion``: oversold stretch reversion
     - ``sr_flip``: support/resistance flip reclaim
     - ``pattern`` / ``elliott_lite``: rule-based OHLC patterns (double bottom / flag)

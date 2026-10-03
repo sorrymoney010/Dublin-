@@ -97,3 +97,7 @@ def classify_kraken_error(errors: list[str]) -> BrokerError:
             if code.startswith(prefix):
                 return exc_type(joined)
     return BrokerError(joined)
+
+
+class PaperPrivateCallBlocked(AuthenticationError):
+    """A private Kraken endpoint was requested while in paper/dry-run mode."""
