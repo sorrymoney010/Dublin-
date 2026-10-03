@@ -70,10 +70,13 @@ class SleeveResult:
     actions: list[dict] = field(default_factory=list)
     symbols: dict[str, str] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    # entry signals that a gate blocked (learner bench, risk, ...) -> shadow log
+    blocked: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {"sleeve": self.sleeve, "active": self.active, "reason": self.reason,
-                "actions": self.actions, "symbols": self.symbols, "errors": self.errors}
+                "actions": self.actions, "symbols": self.symbols, "errors": self.errors,
+                "blocked": self.blocked}
 
 
 def sleeve_active(settings: Settings) -> tuple[bool, str]:

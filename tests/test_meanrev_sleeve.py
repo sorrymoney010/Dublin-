@@ -32,7 +32,7 @@ def _settings(**kw) -> Settings:
         paper_taker_fee_bps=40.0, paper_maker_fee_bps=25.0, paper_slippage_bps=10.0,
         cooldown_minutes=0, max_orders_per_day=0, learner_priors_path="no-priors.json",
         universe_allowlist=["BTC/USD", "ETH/USD", "SOL/USD"], max_concurrent_positions=3,
-        min_dollar_volume=0.0,
+        min_dollar_volume=0.0, meanrev_daily_filter=False,  # D1 covered in test_d1_trendhold.py
     )
     base.update(kw)
     return Settings(**base)

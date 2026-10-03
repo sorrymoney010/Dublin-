@@ -36,6 +36,19 @@ export LEARNER_BENCH_HOURS=72
 # BTC/ETH/SOL (walk-forward meanrev_mk@240m; small sample — experiment only).
 # Shares the $500 book, max 3 positions and the risk caps with regime_trend.
 export MEANREV_SLEEVE_ENABLED=true
+# Daily risk-on filter (close_d > SMA50_d, SMA50 rising 5d) on ENTRIES of both
+# sleeves; never forces exits (data/d1_trendhold_report.txt).
+export REGIME_DAILY_FILTER=true
+export MEANREV_DAILY_FILTER=true
+# Third PAPER sleeve: 4h trend-hold (D1 on, close>EMA100, EMA20>EMA100; exit
+# first 4h close < EMA100; no stop), 25% of the book per coin. One position per
+# coin across ALL sleeves; max 3 positions; total exposure cap 75% (was 50%:
+# raised only so three 25% positions fit — per-position cap stays 25%).
+export TRENDHOLD_SLEEVE_ENABLED=true
+export TRENDHOLD_POSITION_FRACTION=0.25
+export MAX_CONCURRENT_POSITIONS=3
+export MAX_POSITION_FRACTION=0.25
+export MAX_EXPOSURE_FRACTION=0.75
 # Market-data pipeline: bars for BTC/ETH/SOL come from the local tick store
 # (written by com.mayo.kraken.ticks / scripts/tick_collector.py) with Kraken
 # REST OHLC as fallback for missing/short/stale history. docs/PIPELINE.md.

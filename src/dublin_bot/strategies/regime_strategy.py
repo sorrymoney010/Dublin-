@@ -42,6 +42,7 @@ class RegimeTrendStrategy:
             "adx_exit": float(getattr(s, "adx_exit_below", 20.0)),
             "stop": float(getattr(s, "stop_loss_pct", 0.03)),
             "flt": str(getattr(s, "regime_flow_filter", "") or ""),
+            "d1": bool(getattr(s, "regime_daily_filter", True)),
         }
 
     def evaluate(self, bars: pd.DataFrame, in_position: bool = False) -> Signal:
@@ -50,7 +51,13 @@ class RegimeTrendStrategy:
             return Signal(Action.WAIT, 0, f"Not enough bars for regime sleeve ({n} < 260)", 0.0)
         d = add_indicators(bars.sort_index())
         p = self.params()
+        if p["d1"] and not in_position:  # D1 gates entries only, never exits
+            from dublin_bot.daily_filter import live_d1
+            d = live_d1(self, d, int(self.settings.timeframe_minutes))
+        else:
+            p = {**p, "d1": False}
         sig = regime_signals(d, p)
+        self.last_frame = d
         i = len(d) - 1
         price = float(d["close"].iloc[i])
         atr = float(d["atr"].iloc[i])
@@ -92,4 +99,7 @@ class RegimeTrendStrategy:
                 why.append(f"no {p['lookback']}-bar high break")
             if p["flt"] and not sig["flt_ok"][i]:
                 why.append(f"order-flow filter {p['flt']} not met")
+        if p["d1"] and not sig["d1_ok"][i]:
+            from dublin_bot.daily_filter import d1_reason
+            why.append(d1_reason(d, i))
         return Signal(Action.WAIT, 10, f"No regime entry [{reg}]: " + "; ".join(why), price, atr)
