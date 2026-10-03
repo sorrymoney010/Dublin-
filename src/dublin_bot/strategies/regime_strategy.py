@@ -46,6 +46,8 @@ class RegimeTrendStrategy:
         }
 
     def evaluate(self, bars: pd.DataFrame, in_position: bool = False) -> Signal:
+        self.d1_blocked = False
+        self.last_frame = None
         if bars is None or len(bars) < 260:
             n = 0 if bars is None else len(bars)
             return Signal(Action.WAIT, 0, f"Not enough bars for regime sleeve ({n} < 260)", 0.0)
@@ -59,6 +61,9 @@ class RegimeTrendStrategy:
         sig = regime_signals(d, p)
         self.last_frame = d
         i = len(d) - 1
+        # the raw rules fired but the daily filter stopped it -> shadow-trade candidate
+        self.d1_blocked = bool(p["d1"] and not sig["d1_ok"][i]
+                               and regime_signals(d, {**p, "d1": False})["entry"][i])
         price = float(d["close"].iloc[i])
         atr = float(d["atr"].iloc[i])
         atr = atr if math.isfinite(atr) and atr > 0 else None

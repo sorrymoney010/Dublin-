@@ -21,12 +21,40 @@ from pathlib import Path
 from typing import Any
 
 # ── adaptive gating knobs (overridable per LearningAgent instance) ──────────
-ROLLING_WINDOW = 20          # closed trades per symbol / regime kept for expectancy
-MIN_SAMPLE = 8               # closed trades needed before a bench can trigger
-PRIOR_MAX_WEIGHT = 5.0       # backtest prior counts as at most N pseudo-trades
+ROLLING_WINDOW = 50          # closed trades per symbol / regime kept for expectancy (>= MIN_SAMPLE)
+MIN_SAMPLE = 30              # closed trades per strategy+coin needed before a bench can trigger
+PRIOR_MAX_WEIGHT = 2.0       # backtest prior counts as at most N pseudo-trades
 BENCH_HOURS = 72.0           # benched symbol/regime sits out this long, then probation
-PROBATION_SIZE = 0.25        # size multiplier for the first trade after a bench
+PROBATION_SIZE = 0.5         # size multiplier for the first trade after a bench
 WEAK_EDGE_BPS = 25.0         # 0 <= expectancy < this → "weak" → reduced size
+SIZE_MIN, SIZE_MAX = 0.5, 1.0  # every allowed entry is sized within these multipliers
+BENCH_CONFIDENCE = 0.90      # bench only if the one-sided 90% UPPER bound of mean net bps < 0
+
+
+def t_quantile(p: float, df: int) -> float:
+    """One-sided Student-t quantile (Cornish-Fisher; plenty for df >= 5)."""
+    from statistics import NormalDist
+
+    z = NormalDist().inv_cdf(p)
+    if df <= 0:
+        return float("inf")
+    g1 = (z ** 3 + z) / 4.0
+    g2 = (5 * z ** 5 + 16 * z ** 3 + 3 * z) / 96.0
+    g3 = (3 * z ** 7 + 19 * z ** 5 + 17 * z ** 3 - 15 * z) / 384.0
+    return z + g1 / df + g2 / df ** 2 + g3 / df ** 3
+
+
+def mean_bounds(xs: list[float], conf: float = BENCH_CONFIDENCE) -> tuple[float | None, float | None, float | None]:
+    """(mean, one-sided lower bound, one-sided upper bound) at ``conf``."""
+    n = len(xs)
+    if n == 0:
+        return None, None, None
+    m = sum(xs) / n
+    if n < 2:
+        return m, None, None
+    sd = math.sqrt(sum((x - m) ** 2 for x in xs) / (n - 1))
+    half = t_quantile(conf, n - 1) * sd / math.sqrt(n)
+    return m, m - half, m + half
 
 
 @dataclass
@@ -66,6 +94,7 @@ class GateDecision:
     prior_n: float = 0.0
     prior_bps: float | None = None
     blended_bps: float | None = None
+    ucb90_bps: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         def r(x):
@@ -75,6 +104,7 @@ class GateDecision:
             "state": self.state, "reason": self.reason, "live_n": self.live_n,
             "live_bps": r(self.live_bps), "prior_n": r(self.prior_n),
             "prior_bps": r(self.prior_bps), "blended_bps": r(self.blended_bps),
+            "ucb90_bps": r(self.ucb90_bps),
         }
 
 
@@ -87,8 +117,8 @@ class LearningAgent:
         self.min_trades = min_trades
         self.enabled = enabled
         self.strategy_key = strategy_key
-        self.window = int(window)
         self.min_sample = int(min_sample)
+        self.window = max(int(window), self.min_sample)  # the bench test must see >= min_sample
         self.bench_hours = float(bench_hours)
         self.coins: dict[str, CoinStats] = {}
         self.last_regime: str = "unknown"
@@ -120,8 +150,11 @@ class LearningAgent:
         # so two sleeves sharing learner.json are scored and benched separately.
         # Legacy unscoped entries belong to the strategy that saved the file.
         legacy_key = str(data.get("strategy_key") or self.strategy_key)
+        # One-time policy migration: a bench placed on fewer closed trades than
+        # min_sample (the old policy benched after 8) is dropped on load.
         self.benches = {self._scoped(k, legacy_key): v
-                        for k, v in (data.get("benches") or {}).items()}
+                        for k, v in (data.get("benches") or {}).items()
+                        if int((v or {}).get("trades_at_bench", 0) or 0) >= self.min_sample}
         self.last_decisions = {self._scoped(k, legacy_key): v
                                for k, v in (data.get("last_decisions") or {}).items()}
         self.open_entries = dict(data.get("open_entries") or {})
@@ -209,7 +242,7 @@ class LearningAgent:
     # ── recording outcomes ────────────────────────────────────
     def record_trade(self, symbol: str, pnl: float, regime: str = "unknown", *,
                      notional: float | None = None, strategy: str | None = None,
-                     ts: float | None = None) -> None:
+                     ts: float | None = None, detail: dict | None = None) -> None:
         """Record a closed trade's realized P&L for ``symbol`` under ``regime``.
 
         ``notional`` (cost basis of the lot) lets the learner track size-free
@@ -222,13 +255,16 @@ class LearningAgent:
         net_bps = None
         if notional is not None and notional > 0 and math.isfinite(float(pnl)):
             net_bps = float(pnl) / float(notional) * 1e4
+        ts_f = float(ts if ts is not None else time.time())
         c.history.append({
             "pnl": round(float(pnl), 6),
             "net_bps": None if net_bps is None else round(net_bps, 2),
             "regime": regime,
-            "ts": float(ts if ts is not None else time.time()),
+            "ts": ts_f,
             "strategy": strategy or self.strategy_key,
         })
+        if detail is not None:
+            self._write_closed_trade(sym, c.history[-1], detail)
         c.history = c.history[-200:]
         c.trades += 1
         if pnl > 0:
@@ -332,6 +368,7 @@ class LearningAgent:
         live, total = self._live(symbol, regime)
         d.live_n = len(live)
         d.live_bps = (sum(live) / len(live)) if live else None
+        _m, _lo, d.ucb90_bps = mean_bounds(live)
         prior = self.priors.get(key)
         w = 0.0
         if prior:
@@ -352,17 +389,18 @@ class LearningAgent:
                 d.reason = f"bench expired; probation trade at {PROBATION_SIZE:g}x size"
                 return d
             # A probation trade has closed: re-judge on the rolling window.
-            if d.live_bps is not None and d.live_bps < 0 and d.live_n >= self.min_sample:
+            if self._should_bench(d):
                 self._bench(key, now, total, f"still negative after probation "
-                                             f"({d.live_bps:.0f}bps over {d.live_n})")
+                                             f"({d.live_bps:.0f}bps, 90% upper bound "
+                                             f"{d.ucb90_bps:.0f}bps over {d.live_n})")
                 d.allow, d.size_mult, d.state = False, 0.0, "benched"
                 d.reason = self.benches[self._sk(key)]["reason"]
                 return d
             self.benches.pop(self._sk(key), None)
 
-        if d.live_n >= self.min_sample and d.live_bps is not None and d.live_bps < 0:
-            self._bench(key, now, total, f"expectancy {d.live_bps:.0f}bps/trade after fees "
-                                         f"over last {d.live_n} closed trades")
+        if self._should_bench(d):
+            self._bench(key, now, total, f"expectancy {d.live_bps:.0f}bps/trade after fees, 90% upper "
+                                         f"bound {d.ucb90_bps:.0f}bps < 0 over last {d.live_n} closed trades")
             d.allow, d.size_mult, d.state = False, 0.0, "benched"
             d.reason = self.benches[self._sk(key)]["reason"]
             return d
@@ -379,7 +417,12 @@ class LearningAgent:
         else:
             d.state, d.size_mult = "ok", 1.0
             d.reason = f"edge {d.blended_bps:.0f}bps (live n={d.live_n}, prior n={d.prior_n:g})"
+        d.size_mult = min(SIZE_MAX, max(SIZE_MIN, float(d.size_mult)))
         return d
+
+    def _should_bench(self, d: GateDecision) -> bool:
+        """Bench only on enough evidence: n >= min_sample AND the 90% upper bound < 0."""
+        return (d.live_n >= self.min_sample and d.ucb90_bps is not None and d.ucb90_bps < 0)
 
     def _bench(self, key: str, now: float, total: int, reason: str) -> None:
         self.benches[self._sk(key)] = {
@@ -423,15 +466,52 @@ class LearningAgent:
         except OSError:
             pass
 
-    def note_entry(self, symbol: str, *, regime: str, notional: float) -> None:
-        """Remember the entry regime + cost basis so the exit is booked correctly."""
+    def note_entry(self, symbol: str, *, regime: str, notional: float, **extra) -> None:
+        """Remember the entry regime + cost basis (+ fill details for the trade log)."""
         if not self.enabled:
             return
         self.open_entries[symbol.upper().strip()] = {
             "regime": regime, "notional": float(notional), "ts": time.time(),
-            "strategy": self.strategy_key,
+            "strategy": self.strategy_key, **extra,
         }
         self.save()
+
+    def _write_closed_trade(self, sym: str, h: dict, detail: dict) -> None:
+        """Rich row in ``closed_trades.jsonl`` (same symbol/ts/pnl key the scorecard dedups on)."""
+        from .telemetry import append_jsonl, git_hash, iso
+
+        row = {"symbol": sym, "ts": h["ts"], "pnl": h["pnl"], "net_bps": h["net_bps"],
+               "sleeve": h["strategy"], "regime": h["regime"], "source": "fill",
+               "closed_at": iso(h["ts"]), "git": git_hash()}
+        for k, v in detail.items():
+            row.setdefault(k, v)
+        fees = [detail.get("entry_fee"), detail.get("exit_fee")]
+        if all(isinstance(f, (int, float)) for f in fees):
+            row.setdefault("fees_usd", round(float(fees[0]) + float(fees[1]), 6))
+        try:
+            ep, ef = float(detail["entry_signal_px"]), float(detail["entry_fill_px"])
+            row.setdefault("entry_slip_bps", round((ef / ep - 1) * 1e4, 2))
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            pass
+        try:
+            xp, xf = float(detail["exit_signal_px"]), float(detail["exit_fill_px"])
+            row.setdefault("exit_slip_bps", round((1 - xf / xp) * 1e4, 2))
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            pass
+        append_jsonl(self.path.parent / "closed_trades.jsonl", row)
+
+    def snapshot(self, symbol: str, regime: str | None = None) -> dict:
+        """Cheap read-only learner state for decision logs (never benches or writes)."""
+        sym = symbol.upper().strip()
+        live, total = self._live(sym, regime)
+        m, _lo, hi = mean_bounds(live)
+        b = self.benches.get(self._sk(sym))
+
+        def r(x):
+            return None if x is None else round(float(x), 1)
+        return {"key": f"{self.strategy_key}::{sym}", "live_n": len(live), "total_n": total,
+                "mean_bps": r(m), "ucb90_bps": r(hi), "min_sample": self.min_sample,
+                "benched_until": (b or {}).get("until"), "enabled": self.enabled}
 
     def pop_entry(self, symbol: str) -> dict | None:
         return self.open_entries.pop(symbol.upper().strip(), None)

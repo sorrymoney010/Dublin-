@@ -251,3 +251,10 @@ def test_three_sleeves_fit_under_shared_caps():
     for line in ("MAX_CONCURRENT_POSITIONS=3", "MAX_EXPOSURE_FRACTION=0.75", "TRENDHOLD_SLEEVE_ENABLED=true",
                  "REGIME_DAILY_FILTER=true", "MEANREV_DAILY_FILTER=true"):
         assert line in wrapper
+
+
+def test_trendhold_universe_is_btc_eth_sol_regardless_of_allowlist():
+    bars, ticks = _world()
+    sl = _th(FakeGateway(bars, ticks), universe_allowlist=["PUMP/USD", "BTC/USD"],
+             trendhold_symbols=["BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD"])
+    assert sl.universe() == ["BTC/USD", "ETH/USD", "SOL/USD"]

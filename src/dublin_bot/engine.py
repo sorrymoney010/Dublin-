@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import pandas as pd
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -866,10 +867,55 @@ class TradingEngine:
                 )
         return signal
 
+    def _collect_telemetry(self, signal: Signal, risk: RiskDecision, bars: pd.DataFrame, gates: dict) -> None:
+        """Decision snapshot + shadow-trade candidate for the paper loop. Never raises."""
+        try:
+            from .telemetry import bar_open_ts, d1_state, indicator_snapshot
+
+            key = self.strategy_key()
+            sym = self.settings.symbol
+            self._exit_reason = signal.reason[:120] if signal.action is Action.SELL else ""
+            frame = getattr(self.strategy, "last_frame", None)
+            raw = getattr(self, "_raw_signal", None)
+            mq = gates.get("market_quality") if isinstance(gates.get("market_quality"), dict) else {}
+            bo = bar_open_ts(bars)
+            self.decision_ctx = {
+                "strategy": key, "symbol": sym, "action": signal.action.value, "reason": signal.reason,
+                "bar_open": bo, "tf_minutes": int(self.settings.timeframe_minutes),
+                "indicators": indicator_snapshot(frame),
+                "d1": d1_state(frame, bool(getattr(self.settings, "regime_daily_filter", False))),
+                "quote": {"bid": mq.get("bid"), "ask": mq.get("ask")},
+                "learner": self.learner.snapshot(sym) if self.learner.enabled else {"enabled": False},
+                "risk": {"approved": bool(risk.approved), "reason": str(risk.reason)[:200]},
+                "raw_action": raw.action.value if raw is not None else None,
+            }
+            blocked_reason, gate = None, None
+            if raw is not None and raw.action is Action.BUY and not (signal.action is Action.BUY and risk.approved):
+                blocked_reason = risk.reason if signal.action is Action.BUY else signal.reason
+            elif raw is not None and raw.action is not Action.BUY and getattr(self.strategy, "d1_blocked", False):
+                blocked_reason, gate = raw.reason, "d1"
+            if blocked_reason is not None and bo is not None:
+                from .telemetry import _gate_name
+                params = dict(self.strategy.params()) if hasattr(self.strategy, "params") else {}
+                params.setdefault("tp", float(getattr(self.settings, "take_profit_pct", 0.0) or 0.0) or None)
+                self.shadow_candidates.append({
+                    "symbol": sym, "gate": gate or _gate_name(str(blocked_reason)),
+                    "reason": str(blocked_reason)[:240], "signal_px": float(raw.price),
+                    "signal_bar_open": bo, "tf_minutes": int(self.settings.timeframe_minutes),
+                    "strategy": key, "params": {k: v for k, v in params.items() if v is not None},
+                })
+        except Exception:
+            pass
+
     def run_cycle(self) -> CycleResult:
 
         gates: dict[str, object] = {}
         self.last_cycle_gates = gates  # exposed for the paper loop's log line
+        # Telemetry for the paper loop (decision snapshot + shadow-trade candidates).
+        self.shadow_candidates: list[dict] = []
+        self.decision_ctx: dict = {}
+        self._raw_signal = None
+        self._cycle_bars = None
         # Snapshot the active symbol at cycle start so any temporary swap (e.g.
         # the DCA sleeve pointing one execution at PUMP/USD) is fully undone by
         # the end of the cycle, independent of in-cycle rotation.
@@ -993,6 +1039,8 @@ class TradingEngine:
             # loop into exit-only mode and prevent new BTC entries.
             in_position = self._bot_qty.get(self.settings.symbol, 0.0) > 1e-9
             signal = self.strategy.evaluate(bars, in_position=in_position)
+            self._raw_signal = signal if not in_position else None
+            self._cycle_bars = bars
             self.audit.record(AuditEvent.SIGNAL, {
                 "action": signal.action.value, "score": signal.score,
                 "reason": signal.reason, "price": signal.price,
@@ -1179,6 +1227,8 @@ class TradingEngine:
             "equity": equity, "orders_today": state.orders_today,
         })
 
+        self._collect_telemetry(signal, risk, bars, gates)
+
         order_id: str | None = None
         bar_timestamp = str(bars.index[-1]) if len(bars) else datetime.now(timezone.utc).isoformat()
 
@@ -1238,7 +1288,14 @@ class TradingEngine:
                 self.dca.record_buy(self._dca_state)
             elif order_id is not None:
                 try:
-                    self.learner.note_entry(sym, regime=self._entry_regime, notional=buy_notional)
+                    extra: dict = {"signal_px": float(signal.price), "entry_maker": False,
+                                   "filled_at": time.time(), "signal_bar": bar_timestamp}
+                    if self.settings.paper_trading or self.settings.dry_run:
+                        bp = self.paper_portfolio.snapshot().positions.get(sym)
+                        if bp is not None:
+                            extra["entry"] = float(bp.entry_price)
+                            extra["entry_fee"] = float(bp.fees_paid)
+                    self.learner.note_entry(sym, regime=self._entry_regime, notional=buy_notional, **extra)
                 except Exception:
                     pass
         elif signal.action is Action.SELL and in_position and risk.approved:
@@ -1438,11 +1495,22 @@ class TradingEngine:
                         )
                         # Self-learning: feed the closed-trade outcome back in.
                         entry_meta = self.learner.pop_entry(self.settings.symbol) or {}
+                        now_ts = time.time()
+                        try:
+                            from .telemetry import trade_detail
+                            detail = trade_detail(
+                                entry_meta, exit_signal_px=signal_price or None, exit_fill_px=fill.price,
+                                exit_fee=fill.fee, exit_maker=False,
+                                reason=getattr(self, "_exit_reason", "") or "signal",
+                                bars=getattr(self, "_cycle_bars", None), now=now_ts,
+                                qty=quantity, cost_basis=cost_basis)
+                        except Exception:
+                            detail = {}
                         self.learner.record_trade(
                             self.settings.symbol, realized,
                             entry_meta.get("regime") or self.learner.last_regime,
                             notional=cost_basis or entry_meta.get("notional"),
-                            strategy=entry_meta.get("strategy"),
+                            strategy=entry_meta.get("strategy"), ts=now_ts, detail=detail,
                         )
                         # Adaptive risk: update win/loss streak + scale from
                         # the realized P&L of this closed trade (audit #6).

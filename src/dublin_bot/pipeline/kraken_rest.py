@@ -70,7 +70,7 @@ class KrakenPublic:
                       side=str(r[3])[:1], ord_type=str(r[4])[:1]) for r in rows if len(r) >= 7]
         return ticks, str(res.get("last", ""))
 
-    def ohlc(self, pair: str, interval: int) -> list[list]:
-        res = self.get("OHLC", {"pair": pair, "interval": interval})
+    def ohlc(self, pair: str, interval: int, *, retries: int = 8) -> list[list]:
+        res = self.get("OHLC", {"pair": pair, "interval": interval}, retries=retries)
         key = next((k for k in res if k != "last"), None)
         return res.get(key, []) if key else []

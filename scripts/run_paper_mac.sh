@@ -30,7 +30,7 @@ export PAPER_MAKER_FEE_BPS=25
 export PAPER_SLIPPAGE_BPS=10
 # Adaptive learner gate (bench negative-expectancy symbol/regime after 8 closed trades).
 export LEARNER_GATE_ENABLED=true
-export LEARNER_MIN_SAMPLE=8
+export LEARNER_MIN_SAMPLE=30
 export LEARNER_BENCH_HOURS=72
 # Second PAPER sleeve: 4h mean reversion with post-only limit entries on
 # BTC/ETH/SOL (walk-forward meanrev_mk@240m; small sample — experiment only).

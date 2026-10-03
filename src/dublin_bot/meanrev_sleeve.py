@@ -47,6 +47,7 @@ from .config import Settings
 from .fills import FillModel
 from .market_quality import MarketGuard, MarketQuality
 from .models import Action
+from .telemetry import blocked_entry, sleeve_decision, trade_detail
 from .paper import PaperPortfolio
 from .risk import RiskManager
 from .sleeve_registry import SleeveRegistry
@@ -265,6 +266,7 @@ class MeanRevSleeve:
                     "entry": limit, "qty": qty, "entry_fee": fee, "filled_at": now,
                     "stop": limit * (1 - sp), "tp": limit * (1 + tp),
                     "regime": order.get("regime", "unknown"), "signal_bar": order.get("signal_bar"),
+                    "signal_px": order.get("signal_px"), "entry_maker": True,
                 }
                 st["pending"].pop(sym)
                 try:
@@ -313,6 +315,8 @@ class MeanRevSleeve:
                     closed_at = bars.index[-1].timestamp() + self.tf_seconds
                     if closed_at > float(pos["filled_at"]):
                         sig = self.strategy.evaluate(bars, in_position=True)
+                        sleeve_decision(self, sym, sig, bars, in_position=True,
+                                        d1_enabled=bool(self.settings.meanrev_daily_filter))
                         if sig.action is Action.SELL:
                             exit_reason = "reverted"
                         res.symbols[sym] = sig.reason[:120]
@@ -341,8 +345,17 @@ class MeanRevSleeve:
             st["positions"].pop(sym)
             meta = self.learner.pop_entry(sym) or {}
             try:
+                try:
+                    xbars = self._bars(sym)
+                except Exception:
+                    xbars = None
+                detail = trade_detail(pos, exit_signal_px=(float(pos["tp"]) if exit_reason == "tp" else last),
+                                      exit_fill_px=price, exit_fee=fee, exit_maker=(exit_reason == "tp"),
+                                      reason=exit_reason, bars=xbars, now=now, qty=sell_qty,
+                                      cost_basis=cost_basis)
                 self.learner.record_trade(sym, realized, meta.get("regime") or pos.get("regime", "unknown"),
-                                          notional=cost_basis, strategy=self.strategy_key)
+                                          notional=cost_basis, strategy=self.strategy_key, ts=now,
+                                          detail=detail)
             except Exception:
                 pass
             self.risk.update_scale_from_trade(realized, state)
@@ -383,8 +396,12 @@ class MeanRevSleeve:
             expires_at = closed_at + int(s.meanrev_limit_valid_bars) * self.tf_seconds
             bar_iso = _iso(bar_open)
             sig = self.strategy.evaluate(bars, in_position=False)
+            sleeve_decision(self, sym, sig, bars, in_position=False,
+                            d1_enabled=bool(s.meanrev_daily_filter))
             if sig.action is not Action.BUY:
                 res.symbols[sym] = sig.reason[:140]
+                if getattr(self.strategy, "d1_blocked", False) and st["last_order_bar"].get(sym) != bar_iso:
+                    res.blocked.append(blocked_entry(self, sym, sig, bars, sig.reason, gate="d1"))
                 continue
             if st["last_order_bar"].get(sym) == bar_iso:
                 res.symbols[sym] = f"signal bar {bar_iso} already handled"
@@ -396,6 +413,8 @@ class MeanRevSleeve:
                                      lots, state, equity, now, max_n)
             if placed:
                 mine.add(sym)
+            else:
+                res.blocked.append(blocked_entry(self, sym, sig, bars, res.symbols.get(sym, "blocked")))
 
     def _try_place(self, st, res, sym, sig, bars, bar_iso, expires_at,
                    lots, state, equity, now, max_n) -> bool:
@@ -487,6 +506,7 @@ class MeanRevSleeve:
             "limit": limit, "qty": qty, "notional": round(qty * limit, 6),
             "signal_bar": bar_iso, "placed_at": now, "expires_at": expires_at,
             "regime": regime, "size_mult": size_mult, "reason": sig.reason[:200],
+            "signal_px": float(sig.price),
         }
         st["last_order_bar"][sym] = bar_iso
         self._event(st, res, "limit_placed", sym, limit=limit, qty=qty,

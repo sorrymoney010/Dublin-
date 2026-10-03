@@ -328,7 +328,7 @@ def test_learner_bench_for_regime_sleeve_does_not_bench_meanrev(tmp_path):
     assert reg.gate("BTC/USD", now=1e9).allow is False
     mr = LearningAgent(tmp_path / "l.json", strategy_key="meanrev_mk@240m", min_sample=2)
     assert mr.gate("BTC/USD", now=1e9 + 1).allow is True
-    assert LearningAgent(tmp_path / "l.json", strategy_key="regime@60m").gate(
+    assert LearningAgent(tmp_path / "l.json", strategy_key="regime@60m", min_sample=2).gate(
         "BTC/USD", now=1e9 + 2).allow is False
 
 
@@ -336,7 +336,7 @@ def test_legacy_unscoped_bench_keeps_applying_to_its_strategy(tmp_path):
     p = tmp_path / "l.json"
     p.write_text(json.dumps({"strategy_key": "regime@60m",
                              "benches": {"ETH/USD": {"until": 2e9, "since": 1e9,
-                                                     "trades_at_bench": 8, "reason": "old"}}}))
+                                                     "trades_at_bench": 30, "reason": "old"}}}))
     assert LearningAgent(p, strategy_key="regime@60m").gate("ETH/USD", now=1.5e9).allow is False
     assert LearningAgent(p, strategy_key="meanrev_mk@240m").gate("ETH/USD", now=1.5e9).allow is True
 

@@ -25,6 +25,16 @@ def isolate_runtime_files(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
 
+@pytest.fixture(autouse=True)
+def fresh_decision_log():
+    """The decision-snapshot de-dup cache is process-global; isolate tests."""
+    from dublin_bot.telemetry import DECISIONS
+
+    DECISIONS._last.clear()
+    yield
+    DECISIONS._last.clear()
+
+
 def _offline_daily(symbol: str):
     raise ConnectionError("tests are offline: daily OHLC not available")
 

@@ -179,10 +179,16 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001 — logging only
             log(f"LEARNER meanrev summary unavailable: {type(exc).__name__}: {exc}")
 
+    from dublin_bot.loop_telemetry import LoopTelemetry
+    telemetry = LoopTelemetry(settings, logs_dir=ROOT / "logs", log=log)
+    log("TELEMETRY decision_snapshots.jsonl shadow_signals.jsonl equity.jsonl closed_trades.jsonl "
+        "(public data only)")
+
     while _running:
         try:
             engine = TradingEngine(settings)
             result = engine.run_once()
+            telemetry.engine(engine)
             payload = _as_dict(result)
             # run_once → DecisionRecord.to_dict(); run_cycle → CycleResult.to_dict()
             decision = payload if isinstance(payload, dict) and "signal" in payload else None
@@ -224,6 +230,7 @@ def main() -> None:
             try:
                 res = MeanRevSleeve(settings).run_cycle()
                 d = res.to_dict()
+                telemetry.sleeve(d)
                 acts = ",".join(f"{a['event']}:{a['symbol']}" for a in d["actions"]) or "none"
                 syms = " | ".join(f"{k}: {v}" for k, v in d["symbols"].items())
                 log(f"CYCLE sleeve=meanrev_4h active={d['active']} actions={acts} errors={len(d['errors'])} "
@@ -242,6 +249,7 @@ def main() -> None:
             try:
                 res = TrendHoldSleeve(settings).run_cycle()
                 d = res.to_dict()
+                telemetry.sleeve(d)
                 acts = ",".join(f"{a['event']}:{a['symbol']}" for a in d["actions"]) or "none"
                 syms = " | ".join(f"{k}: {v}" for k, v in d["symbols"].items())
                 log(f"CYCLE sleeve=trendhold_4h active={d['active']} actions={acts} errors={len(d['errors'])} "
@@ -254,6 +262,8 @@ def main() -> None:
             except Exception as exc:  # noqa: BLE001
                 log(f"ERROR sleeve=trendhold_4h {type(exc).__name__}: {exc}")
                 traceback.print_exc()
+
+        telemetry.tick()
 
         if getattr(settings, "pipeline_enabled", False):
             try:
