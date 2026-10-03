@@ -21,6 +21,7 @@ from typing import Any, Callable, Iterable
 import numpy as np
 import pandas as pd
 
+from .daily_filter import d1_mask
 from .technicals import add_technicals, atr, ema, flow_filter_mask, rsi
 
 
@@ -75,9 +76,13 @@ def regime_signals(d: pd.DataFrame, p: dict) -> dict[str, np.ndarray]:
     )
     flt_ok = flow_filter_mask(d, p.get("flt"))
     entry = entry & flt_ok
+    # Daily risk-on filter (entries only; exits are never forced by it).
+    d1_ok = d1_mask(d) if p.get("d1") else np.ones(len(d), dtype=bool)
+    entry = entry & d1_ok
     chandelier = hh22 - float(p.get("atr_mult", 3.0)) * atr
     return {"adx_on": adx_on, "entry": entry, "vol_ok": vol_ok, "prior_high": prior_high,
-            "chandelier": chandelier, "chandelier_exit": close < chandelier, "flt_ok": flt_ok}
+            "chandelier": chandelier, "chandelier_exit": close < chandelier, "flt_ok": flt_ok,
+            "d1_ok": d1_ok}
 
 
 def meanrev_signals(d: pd.DataFrame, p: dict) -> dict[str, np.ndarray]:
@@ -97,9 +102,30 @@ def meanrev_signals(d: pd.DataFrame, p: dict) -> dict[str, np.ndarray]:
     ema_a = ema.to_numpy(float)
     rsi = d["rsi"].to_numpy(float)
     flt_ok = flow_filter_mask(d, p.get("flt"))
-    entry = (rsi <= float(p.get("rsi_os", 38.0))) & (close < ema_a) & flt_ok
+    d1_ok = d1_mask(d) if p.get("d1") else np.ones(len(d), dtype=bool)
+    entry = (rsi <= float(p.get("rsi_os", 38.0))) & (close < ema_a) & flt_ok & d1_ok
     exit_ = (rsi >= float(p.get("rsi_exit", 55.0))) | (close >= ema_a)
-    return {"entry": entry, "exit": exit_, "ema": ema_a, "rsi": rsi, "flt_ok": flt_ok}
+    return {"entry": entry, "exit": exit_, "ema": ema_a, "rsi": rsi, "flt_ok": flt_ok,
+            "d1_ok": d1_ok}
+
+
+def trendhold_signals(d: pd.DataFrame, p: dict) -> dict[str, np.ndarray]:
+    """Trend-hold family (shared by the backtester and the live paper sleeve).
+
+    * entry on a CLOSED bar: close > EMA(slow) AND EMA(fast) > EMA(slow)
+      [AND the daily risk-on filter when ``d1``]; fill at the next bar's open
+    * exit: the first close below EMA(slow); fill at the next bar's open
+    * no hard stop / take-profit (``stop``=0)
+    """
+    fast, slow = int(p.get("ema_fast", 20)), int(p.get("ema_slow", 100))
+    ef = (d["ema20"] if fast == 20 and "ema20" in d else _ema(d["close"], fast)).to_numpy(float)
+    es = _ema(d["close"], slow).to_numpy(float)
+    close = d["close"].to_numpy(float)
+    warm = np.arange(len(d)) >= slow  # EMA(slow) needs ~slow bars before it means anything
+    d1_ok = d1_mask(d) if p.get("d1") else np.ones(len(d), dtype=bool)
+    entry = warm & (close > es) & (ef > es) & d1_ok
+    exit_ = close < es
+    return {"entry": entry, "exit": exit_, "ema_fast": ef, "ema_slow": es, "d1_ok": d1_ok}
 
 
 def classify_adx_regime(bars: pd.DataFrame, enter: float = 25.0, exit_: float = 20.0) -> str:
@@ -185,8 +211,9 @@ def simulate(d: pd.DataFrame, spec: Spec, costs: Costs) -> list[Trade]:
     vol_avg = d["volume"].shift(1).rolling(lb).mean().to_numpy(float)
     rsig = regime_signals(d, p) if spec.name == "regime" else None
     msig = meanrev_signals(d, p) if spec.name == "meanrev" else None
+    tsig = trendhold_signals(d, p) if spec.name == "trendhold" else None
 
-    warm = 210
+    warm = int(p.get("warm", 210))
     trades: list[Trade] = []
     i = warm
     while i < n - 1:
@@ -205,6 +232,8 @@ def simulate(d: pd.DataFrame, spec: Spec, costs: Costs) -> list[Trade]:
             # RSI washed out AND below slow EMA (shared with the live
             # MeanReversion4hStrategy via ``meanrev_signals``).
             sig = bool(msig["entry"][i])
+        elif spec.name == "trendhold":
+            sig = bool(tsig["entry"][i])
         else:
             raise ValueError(spec.name)
         if not sig or not math.isfinite(atr[i]):
@@ -223,7 +252,13 @@ def simulate(d: pd.DataFrame, spec: Spec, costs: Costs) -> list[Trade]:
             entry = min(o[e], limit)
         else:
             entry = o[e]
-        if spec.name in ("regime", "meanrev"):
+        if spec.name == "trendhold":
+            # No hard stop / TP in the tested spec. stop_frac only feeds
+            # risk-based sizing in ``metrics``; the study sizes by notional.
+            stop_frac = float(p.get("stop", 0.0)) or 0.25
+            stop = entry * (1 - float(p.get("stop", 0.0))) if p.get("stop") else -math.inf
+            tp = entry * (1 + float(p["tp"])) if p.get("tp") else math.inf
+        elif spec.name in ("regime", "meanrev"):
             stop_frac = p.get("stop", 0.03)
             stop = entry * (1 - stop_frac)
             tp = entry * (1 + p.get("tp", 0.25))
@@ -257,6 +292,8 @@ def simulate(d: pd.DataFrame, spec: Spec, costs: Costs) -> list[Trade]:
                 sig_exit, reason = True, "below_ema50"
             elif spec.name == "meanrev" and msig["exit"][j]:
                 sig_exit, reason = True, "reverted"
+            elif spec.name == "trendhold" and tsig["exit"][j]:
+                sig_exit, reason = True, "below_ema100"
             elif spec.name == "regime":
                 # Stateless chandelier (same rule the live RegimeTrendStrategy
                 # uses): close below 22-bar highest high - k*ATR → exit.
