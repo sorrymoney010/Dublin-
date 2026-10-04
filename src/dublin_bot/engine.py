@@ -149,6 +149,8 @@ class TradingEngine:
         else:
             self._bot_qty_path = Path("logs/bot_positions.json")
         self._bot_qty: dict[str, float] = self._load_bot_qty()
+        # Symbols added in this process before the paper book shows them.
+        self._bot_qty_inflight: set[str] = set()
         # Drop lots the exchange no longer holds before any strategy call, so a
         # stale phantom lot can never freeze the bot into exit-only WAIT.
         self._reconcile_bot_qty()
@@ -317,7 +319,9 @@ class TradingEngine:
                     float(p.get("quantity", 0.0)) * float(p.get("entry_price", 0.0))
                     for p in data.get("positions", [])
                 )
-                return max(cash + basis, 0.0)
+                from .book_risk import futures_equity_addon
+                return max(cash + basis, 0.0) + futures_equity_addon(
+                    getattr(s, "futures_ledger_path", None))
             except (OSError, ValueError, TypeError):
                 return float(s.strategy_equity_usd)
         return self.gateway.account_equity()
@@ -325,7 +329,9 @@ class TradingEngine:
     def _open_bot_position_count(self) -> int:
         """Held lots (every sleeve) plus other sleeves' resting paper orders."""
         held = {sym for sym, qty in self._bot_qty.items() if float(qty) > 1e-9}
-        return len(held) + len(set(self._foreign_pending()) - held)
+        from .book_risk import futures_position_count
+        return len(held) + len(set(self._foreign_pending()) - held) + futures_position_count(
+            getattr(self.settings, "futures_ledger_path", None))
 
     # ── multi-sleeve paper ownership (see sleeve_registry) ────
     def _sleeve_registry(self):
@@ -365,6 +371,27 @@ class TradingEngine:
             ordered = [c for c in ordered if c in allow]
         return ordered
 
+    def _paper_trail_hit(self, symbol: str, entry: float, last: float, opened_at: str, bars) -> bool:
+        """True when the persisted ATR trail says to cash out. Stops/TP win first."""
+        from .trailing import maintain, sleeve_trail_enabled
+        if not sleeve_trail_enabled(self.settings, "primary"):
+            return False
+        atr_v = 0.0
+        try:
+            if bars is not None and len(bars):
+                if "atr" in getattr(bars, "columns", []):
+                    atr_v = float(bars["atr"].iloc[-1])
+                elif "high" in bars and "low" in bars and "close" in bars:
+                    from .technicals import atr as atr_fn
+                    atr_v = float(atr_fn(bars, 14).iloc[-1])
+        except Exception:
+            atr_v = 0.0
+        try:
+            return maintain(self.settings, "primary", symbol, "long", entry, last,
+                            str(opened_at or ""), atr_v) == "trail"
+        except Exception:
+            return False
+
     def _paper_protective_would_exit(self, symbol: str, bars) -> str | None:
         """Return 'stop' / 'tp' if paper sleeve levels are hit, else None."""
         if not (self.settings.paper_trading or self.settings.dry_run):
@@ -399,6 +426,8 @@ class TradingEngine:
             return "stop"
         if last >= entry * (1.0 + tp_pct):
             return "tp"
+        if self._paper_trail_hit(symbol, entry, last, getattr(pos, "opened_at", ""), bars):
+            return "trail"
         return None
 
     def _select_symbol_breakout(self) -> None:
@@ -1341,7 +1370,9 @@ class TradingEngine:
             self.risk.update_scale_from_trade(cycle_pnl, state)
         else:
             self.risk.update_scale(state)
-        self.state_store.save(state)
+        self.state_store.save(
+            state, keep_disk_accounting=bool(self.settings.paper_trading or self.settings.dry_run),
+        )
         record = DecisionRecord(
             symbol=self.settings.symbol,
             signal=signal,
@@ -1486,13 +1517,19 @@ class TradingEngine:
                             bid=float(ticker.get("bid", 0.0)) if ticker.get("bid") else None,
                             ask=float(ticker.get("ask", 0.0)) if ticker.get("ask") else None,
                         )
-                        realized = self.paper_portfolio.record_sell(
-                            symbol=self.settings.symbol,
-                            quantity=quantity,
-                            fill_price=fill.price,
-                            fee=fill.fee,
-                            when=datetime.now(timezone.utc).isoformat(),
-                        )
+                        try:
+                            realized = self.paper_portfolio.record_sell(
+                                symbol=self.settings.symbol,
+                                quantity=quantity,
+                                fill_price=fill.price,
+                                fee=fill.fee,
+                                when=datetime.now(timezone.utc).isoformat(),
+                            )
+                        except ValueError as exc:
+                            if "No open paper position" not in str(exc):
+                                raise
+                            # The fast exit watcher already booked this close.
+                            return order_id, risk
                         # Self-learning: feed the closed-trade outcome back in.
                         entry_meta = self.learner.pop_entry(self.settings.symbol) or {}
                         now_ts = time.time()
@@ -1514,10 +1551,11 @@ class TradingEngine:
                         )
                         # Adaptive risk: update win/loss streak + scale from
                         # the realized P&L of this closed trade (audit #6).
-                        self.risk.update_scale_from_trade(realized, state)
-                        state.realized_pnl_today += realized
-                        state.current_equity = self.paper_portfolio.snapshot().equity
-                        state.peak_equity = max(state.peak_equity, state.current_equity)
+                        from .state import record_close_pnl
+                        record_close_pnl(
+                            self.state_store.path, realized, self._account_equity(),
+                            self.settings, state,
+                        )
         except PrecisionError as exc:
             self.ledger.fail(key, f"precision: {exc}")
             self.audit.record(AuditEvent.ORDER_REJECTED,
@@ -1737,6 +1775,15 @@ class TradingEngine:
                 signal.atr,
                 signal.stop_price,
             )
+        if self._paper_trail_hit(sym, entry, last, getattr(pos, "opened_at", ""), bars):
+            return Signal(
+                Action.SELL,
+                99,
+                f"Paper trailing take-profit: last={last:.8g} entry={entry:.8g}",
+                last,
+                signal.atr,
+                signal.stop_price,
+            )
         return signal
 
     def _load_bot_qty(self) -> dict[str, float]:
@@ -1898,11 +1945,22 @@ class TradingEngine:
         # __init__). Live uses logs/bot_positions.json. Live must never read
         # the paper file — keeping the ledgers separate prevents a paper buy
         # from freezing the live bot into exit-only mode.
+        if self.settings.paper_trading or self.settings.dry_run:
+            from .sleeve_sync import save_paper_bot_qty
+            save_paper_bot_qty(
+                self._bot_qty_path, self._bot_qty, self.paper_portfolio,
+                equity=float(self.settings.strategy_equity_usd),
+                in_flight=self._bot_qty_inflight,
+            )
+            self._bot_qty_inflight.clear()
+            return
         self._bot_qty_path.parent.mkdir(parents=True, exist_ok=True)
         self._bot_qty_path.write_text(json.dumps(self._bot_qty), encoding="utf-8")
 
     def _record_bot_buy(self, symbol: str, qty: float) -> None:
         self._bot_qty[symbol] = self._bot_qty.get(symbol, 0.0) + qty
+        if self.settings.paper_trading or self.settings.dry_run:
+            self._bot_qty_inflight.add(symbol)
         self._save_bot_qty()
 
     def _record_bot_sell(self, symbol: str, qty: float | None = None) -> None:
@@ -1998,7 +2056,11 @@ class TradingEngine:
                 # new entries until valuation is available again.
                 return float("inf")
             total += quantity * price
-        return total
+        from .book_risk import futures_exposure_usd
+        extra = futures_exposure_usd(getattr(self.settings, "futures_ledger_path", None))
+        if extra == float("inf"):
+            return float("inf")
+        return total + extra
 
     def live_price(self, symbol: str | None = None) -> float | None:
         """Best available price: real-time WS feed if connected, else REST.
